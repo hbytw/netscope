@@ -6,6 +6,9 @@ app/tmpdata/
 # ---------- 依赖 ----------
 node_modules/
 tools/verify/node_modules/
+__pycache__/
+*.pyc
+*.pyo
 
 # ---------- 调试/临时产物 ----------
 tools/verify/shot-*.png
