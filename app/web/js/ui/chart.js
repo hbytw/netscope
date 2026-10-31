@@ -201,7 +201,22 @@ export function areaChart(canvas, opts = {}) {
     }
     const top = niceMax(maxV * 1.12) || 1;
 
-    const xAt = (idx) => padL + (len <= 1 ? plotW / 2 : (idx / (len - 1)) * plotW);
+    // 真实时间轴（可选）：model.stamps 为与数据点一一对应的秒级时间戳，
+    // model.timeWindow 为 [起始秒, 结束秒]。提供后按真实时间定位 X 轴，
+    // 混合粒度（历史桶 + 实时细粒度）也能正确排布，窗口右移即整条曲线滚动。
+    const stamps = Array.isArray(model.stamps) && model.stamps.length === len ? model.stamps : null;
+    const win = Array.isArray(model.timeWindow) && model.timeWindow.length === 2 ? model.timeWindow : null;
+    const tMin = win ? Number(win[0]) : (stamps ? stamps[0] : 0);
+    const tMax = win ? Number(win[1]) : (stamps ? stamps[len - 1] : 1);
+    const tSpan = (tMax - tMin) || 1;
+
+    const xAt = (idx) => {
+      if (stamps) {
+        const t = Number(stamps[idx]) || tMin;
+        return padL + ((t - tMin) / tSpan) * plotW;
+      }
+      return padL + (len <= 1 ? plotW / 2 : (idx / (len - 1)) * plotW);
+    };
     const yAt = (v) => padT + plotH - (v / top) * plotH;
 
     // 网格 + Y 轴（在面积之下绘制，作为底纹）
@@ -261,8 +276,11 @@ export function areaChart(canvas, opts = {}) {
       ctx.strokeStyle = hexA(c, 0.95);
       ctx.lineWidth = 1.6;
       ctx.lineJoin = 'round';
-      ctx.shadowColor = hexA(c, 0.5);
-      ctx.shadowBlur = 7;
+      // 点数较多时关闭描边阴影（阴影绘制代价随点数线性放大）
+      if (len <= 400) {
+        ctx.shadowColor = hexA(c, 0.5);
+        ctx.shadowBlur = 7;
+      }
       ctx.stroke();
       ctx.restore();
 
@@ -296,7 +314,19 @@ export function areaChart(canvas, opts = {}) {
     ctx.textBaseline = 'top';
     const tickCount = Math.min(6, len);
     for (let k = 0; k < tickCount; k++) {
-      const idx = tickCount === 1 ? 0 : Math.round((k / (tickCount - 1)) * (len - 1));
+      let idx;
+      if (stamps) {
+        // 真实时间轴：按时间等分取刻度，标签落在最接近该时刻的数据点上
+        const t = tMin + tSpan * (tickCount === 1 ? 0.5 : k / (tickCount - 1));
+        idx = 0;
+        let bd = Infinity;
+        for (let i = 0; i < len; i++) {
+          const d = Math.abs(stamps[i] - t);
+          if (d < bd) { bd = d; idx = i; }
+        }
+      } else {
+        idx = tickCount === 1 ? 0 : Math.round((k / (tickCount - 1)) * (len - 1));
+      }
       const lbl = labels[idx] ?? '';
       if (!lbl) continue;
       let x = xAt(idx);

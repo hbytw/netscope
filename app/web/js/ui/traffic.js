@@ -30,6 +30,7 @@ export async function mount(host, ctx) {
   let stacked = false;
   let data = null;
   let domains = [];
+  let liveBuf = [];   // 2 秒粒度实时点（覆盖最近约 30 分钟，用于细粒度滚动显示）
   let conns = [];
   let destroyed = false;
   let unsub = null;
@@ -319,42 +320,63 @@ export async function mount(host, ctx) {
   cleanups.push(() => urlSearch.removeEventListener('input', () => {}));
 
   /* ---------- 渲染 ---------- */
-  function seriesLabels() {
-    if (!data) return [];
-    return (data.series || []).map((p) => {
-      const dt = new Date(p.t * 1000);
-      if (range === '7d') return `${dt.getMonth() + 1}/${dt.getDate()}`;
-      return `${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')}`;
-    });
+  const RANGE_SEC = { '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800 };
+
+  function fmtPointTime(t) {
+    const dt = new Date(t * 1000);
+    if (range === '7d') return `${dt.getMonth() + 1}/${dt.getDate()}`;
+    return `${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')}`;
+  }
+
+  // 合并「历史桶」与「实时 2 秒细粒度点」，按真实时间排序。
+  // 历史桶被实时点覆盖的部分不再重复绘制，避免同一时段两种粒度叠加。
+  function mergedPoints() {
+    const bucketSec = Number(data?.bucketSec) || 30;
+    const now = Math.floor(Date.now() / 1000);
+    const useLive = range !== '7d';
+    const live = useLive && liveBuf.length ? liveBuf.slice() : [];
+    const liveFrom = live.length ? live[0].t : Infinity;
+    const hist = (data?.series || []).filter((p) => p.t + bucketSec <= liveFrom);
+    const all = hist.concat(live);
+    all.sort((a, b) => a.t - b.t);
+    const dur = RANGE_SEC[range] || 3600;
+    const winStart = now - dur;
+    return { all: all.filter((p) => p.t >= winStart - bucketSec), bucketSec, winStart, winEnd: now };
   }
 
   function renderMain() {
     if (!data) return;
-    const labels = seriesLabels();
-    const bucketSec = Number(data.bucketSec) || 30;
+    const { all, bucketSec, winStart, winEnd } = mergedPoints();
+    if (!all.length) return;
+    const labels = all.map((p) => fmtPointTime(p.t));
+    const stamps = all.map((p) => p.t);
     let series;
     if (stacked) {
-      // 后端 series.byCat 是「字节/桶」→ 换算成「字节/秒」，与全站字节单位一致
+      // 后端 series.byCat 是「字节/桶」→ 换算成「字节/秒」；实时点已是字节/秒
       const cats = (data.byCategory || []).filter((c) => Number(c.down || 0) > 0);
       series = cats.map((c) => ({
         name: c.label,
         color: c.color || CATEGORY_COLOR[c.key] || '#94a3b8',
-        values: (data.series || []).map((p) => Math.round(((p.byCat && p.byCat[c.key]) || 0) / bucketSec))
+        values: all.map((p) => {
+          const v = (p.byCat && p.byCat[c.key]) || 0;
+          return p.live ? Math.round(v) : Math.round(v / bucketSec);
+        })
       }));
     } else {
       // 后端 series.up/down 是 bit/s → ÷8 得到字节/秒
       series = [
-        { name: '下行', color: '#22d3ee', values: (data.series || []).map((p) => Math.round((p.down || 0) / 8)) },
-        { name: '上行', color: '#7c5cff', values: (data.series || []).map((p) => Math.round((p.up || 0) / 8)) }
+        { name: '下行', color: '#22d3ee', values: all.map((p) => Math.round((p.down || 0) / 8)) },
+        { name: '上行', color: '#7c5cff', values: all.map((p) => Math.round((p.up || 0) / 8)) }
       ];
     }
-    const model = { labels, series, stacked, unit: 'bytes' };
+    // stamps + timeWindow：真实时间轴，时间窗口右移 → 整条曲线持续向前滚动
+    const model = { labels, stamps, timeWindow: [winStart, winEnd], series, stacked, unit: 'bytes' };
     if (!charts.main) charts.main = areaChart(mainCanvas, model);
     else charts.main.update(model);
-    renderMainLegend();
+    renderMainLegend(all);
   }
 
-  function renderMainLegend() {
+  function renderMainLegend(points) {
     mainLegend.innerHTML = '';
     if (!data) return;
     if (stacked) {
@@ -367,9 +389,10 @@ export async function mount(host, ctx) {
       });
     } else {
       // series.up/down 是 bit/s 速率：展示区间均值（累加速率无物理意义）
-      const n = (data.series || []).length || 1;
-      const avgUp = (data.series || []).reduce((a, p) => a + (p.up || 0), 0) / n;
-      const avgDown = (data.series || []).reduce((a, p) => a + (p.down || 0), 0) / n;
+      const pts = points || [];
+      const n = pts.length || 1;
+      const avgUp = pts.reduce((a, p) => a + (p.up || 0), 0) / n;
+      const avgDown = pts.reduce((a, p) => a + (p.down || 0), 0) / n;
       [
         { name: '下行均值', color: '#22d3ee', val: formatBps(avgDown) },
         { name: '上行均值', color: '#7c5cff', val: formatBps(avgUp) }
@@ -638,41 +661,28 @@ export async function mount(host, ctx) {
   cleanups.push(unsubSettings);
 
   /* ---------- SSE 增量更新（2 秒实时） ---------- */
-  // tick.trendPoint 是 2 秒粒度的实时速率（bit/s），与 series 的 up/down 单位一致。
-  // 策略：同一 30 秒桶内「更新最后一点」，跨桶时才追加新点 —— 既 2 秒实时，又不会像
-  // 之前那样每 2 秒 push 一个点导致尾部拉平、时间轴重复刻度。
+  // tick.trendPoint 是 2 秒粒度的实时速率（bit/s），与 series 的 up/down 同单位。
+  // 这里累积成 liveBuf，与历史桶按真实时间合并绘制：
+  //   · 曲线整体随时间窗口右移而向前滚动
+  //   · 尾部约 30 分钟为 2 秒细粒度，实时跳动
   const onTick = (ev) => {
     const t = ev.detail;
-    if (destroyed || !t || !data || !Array.isArray(data.series) || !data.series.length) return;
-    const tp = t.trendPoint || null;
+    if (destroyed || !t) return;
+    const tp = t.trendPoint;
     if (!tp) return;
-    const bucketSec = Number(data.bucketSec) || 30;
     const now = Number(tp.t || t.ts || 0) || Math.floor(Date.now() / 1000);
-    const bucketStart = Math.floor(now / bucketSec) * bucketSec;
-    const last = data.series[data.series.length - 1];
-
-    if (bucketStart > last.t) {
-      // 跨入新桶：追加一个实时点（byCat 先留空，堆叠模式用 tick.categories 补齐）
-      data.series.push({ t: bucketStart, up: tp.up || 0, down: tp.down || 0, byCat: {} });
-      if (data.series.length > 240) data.series.shift();
-    } else {
-      // 同桶：直接更新最后一点的实时速率
-      last.up = tp.up || 0;
-      last.down = tp.down || 0;
-    }
-
-    // 堆叠模式：用 tick.categories（各分类当前 bit/s）换算成字节/桶，更新最后一点
-    if (stacked && Array.isArray(t.categories) && t.categories.length) {
-      const tail = data.series[data.series.length - 1];
-      const bc = {};
+    const pt = { t: now, up: tp.up || 0, down: tp.down || 0, byCat: {}, live: true };
+    if (Array.isArray(t.categories)) {
       t.categories.forEach((c) => {
-        const k = c.key;
-        if (!k) return;
-        bc[k] = Math.round(((c.downBps || 0) * bucketSec) / 8);
+        if (!c || !c.key) return;
+        pt.byCat[c.key] = Math.round((c.downBps || 0) / 8);   // bit/s → 字节/秒
       });
-      tail.byCat = bc;
     }
-    renderMain();
+    const last = liveBuf[liveBuf.length - 1];
+    if (last && last.t >= now) liveBuf[liveBuf.length - 1] = pt;
+    else liveBuf.push(pt);
+    if (liveBuf.length > 1800) liveBuf.shift();               // 保留约 1 小时上限
+    if (data) renderMain();
   };
   document.addEventListener('gl:tick', onTick);
   cleanups.push(() => document.removeEventListener('gl:tick', onTick));
