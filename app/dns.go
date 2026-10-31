@@ -273,10 +273,12 @@ type domIPEntry struct {
 }
 
 type txtTrack struct {
-	times    []int64
-	labelLen int64
-	last     int64
-	srcIP    string
+	times []int64
+	// lens 与 times 一一对应的子域标签长度：均值只在窗口内求和，
+	// 避免「累计全部历史」导致 avg 单调虚高、持续误报。
+	lens  []int64
+	last  int64
+	srcIP string
 }
 
 // TXTSuspect TXT 隧道嫌疑。
@@ -307,11 +309,14 @@ type DNSResolver struct {
 	devRecent map[string]*devRecentEntry // 设备 IP -> 最近查询域名
 	qTimes    []int64
 	lastTrim  int64
+	// flowCtx 采集侧发布的当前流向上下文（emit 期间有效）：
+	// 用于把设备级 DNS 回退限制在「走代理、目的为代理服务器」的连接上。
+	flowCtx FlowContext
 }
 
 // NewDNSResolver 创建解析器。
 func NewDNSResolver(a *App) *DNSResolver {
-	return &DNSResolver{
+	d := &DNSResolver{
 		app:       a,
 		ipMap:     map[uint32]*ipEntry{},
 		ipLong:    map[uint32]*ipEntry{},
@@ -320,6 +325,11 @@ func NewDNSResolver(a *App) *DNSResolver {
 		txt:       map[string]*txtTrack{},
 		devRecent: map[string]*devRecentEntry{},
 	}
+	// 订阅采集侧的流向上下文（emit 前后各一次，空上下文表示当前无 flow）
+	if a != nil && a.ct != nil {
+		a.ct.SetFlowHook(d.onFlowContext)
+	}
+	return d
 }
 
 // HandleRecord 处理一条 DNS 日志记录。
@@ -387,15 +397,19 @@ func (d *DNSResolver) handleQuery(rec dnsRecord, now int64) {
 			if len(d.txt) >= txtTrackCap {
 				d.evictTxtLocked()
 			}
-			tr = &txtTrack{srcIP: rec.SrcIP}
+			tr = &txtTrack{}
 			d.txt[base] = tr
 		}
 		tr.times = append(tr.times, now)
+		tr.lens = append(tr.lens, int64(avgLabelLen(rec.Name)))
 		if len(tr.times) > 200 {
 			tr.times = tr.times[len(tr.times)-200:]
+			tr.lens = tr.lens[len(tr.lens)-200:]
 		}
-		tr.labelLen += int64(avgLabelLen(rec.Name))
 		tr.last = now
+		if rec.SrcIP != "" {
+			tr.srcIP = rec.SrcIP // 来源设备每次 TXT 查询都更新
+		}
 	}
 	d.mu.Unlock()
 	// 黑名单命中交给研判层（在锁外调用，避免与研判层的锁顺序形成环）
@@ -541,7 +555,13 @@ func (d *DNSResolver) ReverseLookup(ip string, now int64) (domain, cat, label st
 }
 
 // RecentForDevice 设备最近一次 DNS 查询（代理连接按目的 IP 无法归因时的设备级回退）。
-// 仅返回 TTL（10min）内的记录，避免长时间误归因。
+//
+// 限制（避免把无法按 IP 归因的裸 IP/DoH 流量乱挂到设备最后一次查询上）：
+//   - 仅返回 TTL（10min）内的记录，避免长时间误归因；
+//   - 分类一致性：记住的分类为空/other 时不覆盖端口启发式分类；
+//   - 流向限制：采集侧提供了连接上下文（FlowContext）时，只对走代理的连接生效——
+//     代理连接的目的地是代理服务器/隧道，本就无法按目的 IP 归因，只能回退到设备最近查询；
+//     直连/内网连接不适用（那会把裸 IP 流量误归到上一次查询的域名）。
 func (d *DNSResolver) RecentForDevice(ip string, now int64) (domain, cat, label string, ok bool) {
 	ip = strings.TrimSpace(ip)
 	if ip == "" {
@@ -549,20 +569,43 @@ func (d *DNSResolver) RecentForDevice(ip string, now int64) (domain, cat, label 
 	}
 	d.mu.RLock()
 	ent := d.devRecent[ip]
+	ctx := d.flowCtx
 	d.mu.RUnlock()
-	if ent == nil || now-ent.at > devRecentTTL {
+	if ent == nil {
 		return "", "", "", false
 	}
-	if ent.domain == "" {
+	if now-ent.at > devRecentTTL {
 		return "", "", "", false
 	}
-	if ent.cat == "" {
-		ent.cat = "other"
+	// 复制到局部变量后再返回：不在读锁外写共享条目（避免数据竞争）
+	domain, cat, label = ent.domain, ent.cat, ent.label
+	if domain == "" {
+		return "", "", "", false
 	}
-	if ent.label == "" {
-		ent.label = ent.domain
+	if cat == "" {
+		cat = "other"
 	}
-	return ent.domain, ent.cat, ent.label, true
+	if label == "" {
+		label = domain
+	}
+	// 分类一致性：记住的分类没有信息量时交给端口启发式分类
+	if cat == "other" {
+		return "", "", "", false
+	}
+	// 流向限制：有连接上下文时只对代理连接生效
+	if ctx.DeviceIP != "" {
+		if ctx.DeviceIP != ip || ctx.Path != "proxy" {
+			return "", "", "", false
+		}
+	}
+	return domain, cat, label, true
+}
+
+// onFlowContext 接收采集侧发布的流向上下文（emit 期间有效）。
+func (d *DNSResolver) onFlowContext(ctx FlowContext) {
+	d.mu.Lock()
+	d.flowCtx = ctx
+	d.mu.Unlock()
 }
 
 // evictIPLongLocked 长 TTL 反查索引超限时按最近使用淘汰 10%。
@@ -705,7 +748,7 @@ func (d *DNSResolver) SuspectTXT(now int64) []TXTSuspect {
 	}
 	var out []TXTSuspect
 	for base, tr := range d.txt {
-		// 缩窗
+		// 缩窗（times 与 lens 同步裁剪，均值只统计窗口内样本）
 		cut := now - 60
 		idx := 0
 		for idx < len(tr.times) && tr.times[idx] < cut {
@@ -713,6 +756,7 @@ func (d *DNSResolver) SuspectTXT(now int64) []TXTSuspect {
 		}
 		if idx > 0 {
 			tr.times = append([]int64(nil), tr.times[idx:]...)
+			tr.lens = append([]int64(nil), tr.lens[idx:]...)
 		}
 		if len(tr.times) == 0 {
 			if tr.last < now-300 {
@@ -721,7 +765,14 @@ func (d *DNSResolver) SuspectTXT(now int64) []TXTSuspect {
 			continue
 		}
 		cnt := len(tr.times)
-		avg := float64(tr.labelLen) / float64(maxInt(cnt, 1))
+		var sum int64
+		for i, l := range tr.lens {
+			if i >= cnt {
+				break
+			}
+			sum += l
+		}
+		avg := float64(sum) / float64(maxInt(cnt, 1))
 		if cnt > 20 || avg > 40 {
 			out = append(out, TXTSuspect{Domain: base, Count: cnt, AvgLabel: avg, SrcIP: tr.srcIP})
 		}
@@ -1019,15 +1070,15 @@ func (a *App) readDNSLogFrom(offset int64) (int64, error) {
 	reader := bufio.NewReaderSize(f, 64*1024)
 	for {
 		line, err := reader.ReadString('\n')
-		if len(line) > 0 {
-			consumed += int64(len(line))
-			trimmed := strings.TrimRight(line, "\r\n")
-			if rec, ok := parseDNSLine(trimmed); ok {
-				a.dns.HandleRecord(rec, now)
-			}
-		}
 		if err != nil {
+			// 末行不完整（还没等到换行）：不计入 consumed，也不解析，
+			// 等下一轮补齐换行后再读，避免该条 DNS 记录被永久跳过。
 			break
+		}
+		consumed += int64(len(line))
+		trimmed := strings.TrimRight(line, "\r\n")
+		if rec, ok := parseDNSLine(trimmed); ok {
+			a.dns.HandleRecord(rec, now)
 		}
 	}
 	return consumed, nil

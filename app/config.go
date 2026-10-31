@@ -24,7 +24,8 @@ import (
 )
 
 // Version 服务版本号（api.md / hello 帧使用）。
-const Version = "1.0.0"
+// 单一来源：编译期注入（-ldflags "-X main.buildVersion=…"）优先，其次内嵌的 version.txt。
+var Version = AppVersion()
 
 // 默认密码：部署脚本未生成配置时使用，首次启动会打印提示。
 // 默认管理员密码。
@@ -168,8 +169,9 @@ func (c *Config) SetPassword(oldPwd, newPwd string) error {
 	if !c.VerifyPassword(oldPwd) {
 		return errors.New("原密码不正确")
 	}
-	if len(strings.TrimSpace(newPwd)) < 4 {
-		return errors.New("新密码至少 4 位")
+	// 与前端保持一致的最短长度（前端 settings.js 同样按 8 位校验）
+	if len(strings.TrimSpace(newPwd)) < 8 {
+		return errors.New("新密码至少 8 位")
 	}
 	c.mu.Lock()
 	c.PasswordHash = hashPassword(c.Salt, newPwd)

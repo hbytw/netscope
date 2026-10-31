@@ -2,12 +2,15 @@ package main
 
 // 研判层：端口扫描 / 高危端口外联 / 黑名单域名 / DNS 隧道 / 流量异常 / 设备事件 / 策略命中。
 //
-// 去重：同一类型 + 同一设备 10 分钟内只产生一条事件。
-// 风险分：近 1 小时事件加权（critical 0.4 / warn 0.2 / info 0.05），封顶 1.0。
-// 事件写到 store（最多 500 条）并通过 SSE alert 实时推送。
+// 去重：同一类型 + 同一设备 + 同一目标（域名/IP/端口）10 分钟内只产生一条事件；
+//       高等级事件（critical）不会被同窗口内的低等级事件抑制。
+// 风险分：按设备聚合的近 1 小时滑动窗口加权（critical 0.4 / warn 0.2 / info 0.05），封顶 1.0；
+//         不受 store 事件表 500 条上限影响，窗口内无事件的设备风险显式清零。
+// 事件写到 store（最多 500 条）并通过 SSE alert 实时推送；告警开关关闭时不产生任何事件。
 
 import (
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -30,17 +33,45 @@ type riskReason struct {
 	LastTs int64
 }
 
+// dedupeEntry 去重记录：最近一次事件时间 + 事件等级。
+type dedupeEntry struct {
+	Ts   int64
+	Rank int // critical 3 / warn 2 / info 1
+}
+
+// riskEvent 风险滑动窗口内的一次事件（按设备聚合）。
+type riskEvent struct {
+	Ts     int64
+	Type   string
+	Weight float64
+}
+
+const (
+	// riskWindowSec 风险分统计窗口（近 1 小时）。
+	riskWindowSec = 3600
+	// riskWindowMax 单设备窗口内最多保留的事件数（超出丢弃最旧）。
+	riskWindowMax = 200
+	// netsCacheSec ZeroTier/VPN 网段快照缓存时长。
+	netsCacheSec = 10
+)
+
 // Security 研判器。
 type Security struct {
 	app *App
 
-	mu      sync.Mutex
-	scan    map[string]map[int]int64 // 设备 -> 目的端口 -> 首次出现时间
-	dedupe  map[string]int64         // 去重键 -> 最近事件时间
-	hourly  map[string]*hourAgg
-	risk    map[string]float64
-	reasons map[string]map[string]*riskReason
-	level   string
+	mu         sync.Mutex
+	scan       map[string]map[int]int64 // 设备 -> 目的端口 -> 首次出现时间
+	dedupe     map[string]dedupeEntry   // 去重键（type|设备|目标） -> 最近事件
+	hourly     map[string]*hourAgg
+	risk       map[string]float64
+	reasons    map[string]map[string]*riskReason
+	riskWin    map[string][]riskEvent // 设备 -> 近 1 小时事件（风险滑动窗口）
+	riskSeeded bool                   // 风险窗口是否已用 store 历史事件初始化
+	level      string
+
+	netMu  sync.Mutex
+	nets   []ipNet // ZeroTier/VPN 网段快照
+	netsAt int64
 
 	wlMu sync.RWMutex
 	wl   map[string]bool // 告警白名单：type|target -> true
@@ -51,10 +82,11 @@ func NewSecurity(a *App) *Security {
 	return &Security{
 		app:     a,
 		scan:    map[string]map[int]int64{},
-		dedupe:  map[string]int64{},
+		dedupe:  map[string]dedupeEntry{},
 		hourly:  map[string]*hourAgg{},
 		risk:    map[string]float64{},
 		reasons: map[string]map[string]*riskReason{},
+		riskWin: map[string][]riskEvent{},
 		level:   "low",
 		wl:      map[string]bool{},
 	}
@@ -122,7 +154,7 @@ func (s *Security) OnFlow(d FlowDelta, now int64, dstForeign bool) {
 			h = &hourAgg{Hour: hour}
 			s.hourly[d.DeviceIP] = h
 		}
-		if !isPrivateIPStr(d.DstIP) {
+		if !isPrivateOrCGNAT(d.DstIP) {
 			h.UpTotal += d.UpDelta
 			h.DownTotal += d.DownDelta
 			if dstForeign {
@@ -130,10 +162,18 @@ func (s *Security) OnFlow(d FlowDelta, now int64, dstForeign bool) {
 			}
 		}
 	}
-	// 端口扫描：只统计「公网目的」的新连接，排除内网/ZeroTier/VPN 网段与 ZT 控制端口。
-	// ZeroTier 是 P2P：设备会同时连接多个 ZT 对等体的不同端口（9993 + 随机端口，目的在内网），
-	// 若把内网多端口也算进来会误判为端口扫描，因此这里仅对公网目的计数。
-	scanFlow := d.New && !isPrivateIPStr(d.DstIP) && d.DPort != 9993 && d.DPort != 9994
+	// 端口扫描：只统计「直连公网目的」的新连接。
+	// 排除口径（与事件文案保持一致）：
+	//   - 流向非 direct（proxy / ZeroTier / VPN / 内网）；
+	//   - 目的地址为内网或 CGNAT(100.64.0.0/10)；
+	//   - 目的地址落在 ZeroTier/VPN 网段（接口网段 + 经虚拟接口可达的远端路由网段）；
+	//   - ZeroTier 控制端口 9993/9994。
+	// ZeroTier 是 P2P：设备会同时连接多个 ZT 对等体的不同端口（9993 + 随机端口），
+	// 若把这些也算进来会误判为端口扫描，因此这里仅对直连公网目的计数。
+	scanFlow := d.New && scanPathDirect(d.Path) &&
+		!isPrivateOrCGNAT(d.DstIP) &&
+		!s.isVirtualDst(d.DstIP, now) &&
+		d.DPort != 9993 && d.DPort != 9994
 	if scanFlow {
 		if s.scan[d.DeviceIP] == nil {
 			s.scan[d.DeviceIP] = map[int]int64{}
@@ -184,19 +224,21 @@ func (s *Security) OnFlow(d FlowDelta, now int64, dstForeign bool) {
 			s.emit(Event{
 				Ts: now, Severity: "warn", Type: "port_scan",
 				Title: "疑似端口扫描：" + d.DeviceIP,
-				Detail: fmt.Sprintf("60 秒内新连接 %d 个不同公网端口（阈值 %d；已排除内网/ZeroTier/VPN 目的）",
+				Detail: fmt.Sprintf("60 秒内新连接 %d 个不同公网端口（阈值 %d；仅统计直连公网目的，"+
+					"已排除代理/ZeroTier/VPN/内网流向、内网与 CGNAT 地址）",
 					portCount, threshold),
 				DeviceIP:   d.DeviceIP,
 				DeviceName: s.deviceName(d.DeviceIP),
 				Evidence: map[string]interface{}{
 					"ports": portCount, "portList": portList, "windowSec": 60,
 					"threshold": threshold, "sample": sample,
-					"excluded": "私有/ZeroTier/VPN 目的地址与 9993/9994 控制端口不计入",
+					"excluded": "仅统计直连（path=direct）公网目的；代理/ZeroTier/VPN/内网流向、" +
+						"内网与 CGNAT(100.64.0.0/10) 地址、ZeroTier/VPN 网段与 9993/9994 控制端口均不计入",
 				},
 			})
 		}
 	}
-	if badPorts[d.DPort] && !isPrivateIPStr(d.DstIP) {
+	if badPorts[d.DPort] && !isPrivateOrCGNAT(d.DstIP) {
 		s.emit(Event{
 			Ts: now, Severity: "info", Type: "bad_port",
 			Title:      "高危端口外联：" + d.DeviceIP,
@@ -216,6 +258,100 @@ func (s *Security) scanPortsThreshold() int {
 		}
 	}
 	return n
+}
+
+// scanPathDirect 判断连接流向是否可能构成端口扫描。
+// 只有直连（path=direct）或流向未知（空）才计入；
+// proxy / ZeroTier / VPN / 内网（lan）流向一律排除（这些流量多端口属正常行为）。
+func scanPathDirect(path string) bool {
+	switch path {
+	case "", "direct":
+		return true
+	}
+	return false
+}
+
+// isPrivateOrCGNAT 判断是否内网地址（RFC1918 / CGNAT 100.64.0.0/10 / 回环 / 链路本地）。
+// 注：conntrack.go 的 isPrivateIPStr 只含 RFC1918 等，CGNAT 在研判层补齐，
+// 否则 100.64.x.x（运营商级 NAT）会被当成公网目的而误判。
+func isPrivateOrCGNAT(s string) bool {
+	if isPrivateIPStr(s) {
+		return true
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(s))
+	if err != nil || !addr.Is4() {
+		return false
+	}
+	v := addr.As4()
+	return v[0] == 100 && v[1] >= 64 && v[1] <= 127
+}
+
+// isVirtualDst 判断目的 IP 是否落在 ZeroTier/VPN 网段。
+func (s *Security) isVirtualDst(ip string, now int64) bool {
+	v, ok := parseIPv4Str(strings.TrimSpace(ip))
+	if !ok {
+		return false
+	}
+	for _, n := range s.virtualNets(now) {
+		if v&n.mask == n.net {
+			return true
+		}
+	}
+	return false
+}
+
+// virtualNets ZeroTier/VPN 网段快照（10s 缓存，避免每条流量都解析路由表）。
+// 网段来源：虚拟接口自身网段 + 经虚拟接口可达的远端路由网段。
+func (s *Security) virtualNets(now int64) []ipNet {
+	s.netMu.Lock()
+	defer s.netMu.Unlock()
+	if s.netsAt > 0 && now-s.netsAt < netsCacheSec {
+		return s.nets
+	}
+	var nets []ipNet
+	if s.app != nil {
+		for _, f := range s.app.interfaces() {
+			if f.CIDR == "" {
+				continue
+			}
+			switch f.Network {
+			case "zerotier", "vpn":
+				if n, ok := ipNetFromCIDR(f.CIDR, f.Network, f.Name); ok {
+					nets = append(nets, n)
+				}
+			}
+		}
+		for _, line := range s.app.routeLines() {
+			fields := strings.Fields(line)
+			if len(fields) < 3 || fields[0] == "default" || strings.Contains(fields[0], ":") {
+				continue
+			}
+			cidr := fields[0]
+			if !strings.Contains(cidr, "/") {
+				continue
+			}
+			dev := ""
+			for i := 0; i < len(fields)-1; i++ {
+				if fields[i] == "dev" {
+					dev = fields[i+1]
+					break
+				}
+			}
+			if dev == "" {
+				continue
+			}
+			kind, _ := ifaceKind(dev)
+			if kind != "zerotier" && kind != "vpn" {
+				continue
+			}
+			if n, ok := ipNetFromCIDR(cidr, kind, dev); ok {
+				nets = append(nets, n)
+			}
+		}
+	}
+	s.nets = nets
+	s.netsAt = now
+	return nets
 }
 
 // OnBlacklistDomain 命中内置黑名单域名。
@@ -314,29 +450,40 @@ func (s *Security) OnThreatIP(ip, devIP string, tr ThreatRule, now int64) {
 	})
 }
 
-// emit 去重后落库并推送。
+// emit 去重后落库并推送（统一事件出口）。
+// 告警开关关闭时不产生任何事件（契约：alerts 关闭 → 不做研判、不产生事件），
+// 数据面（流量/DNS/设备上下线）同样受此开关约束。
 func (s *Security) emit(ev Event) bool {
 	if ev.Evidence == nil {
 		ev.Evidence = map[string]interface{}{}
+	}
+	// 告警开关：关闭后不再产生/推送任何事件
+	if !s.alertsEnabled() {
+		return false
 	}
 	// 告警白名单：同 type + 同设备/域名/目标 → 不再产生新事件（历史事件保留）
 	if s.whitelisted(ev) {
 		return false
 	}
-	key := ev.Type + "|" + ev.DeviceIP
+	// 去重键含目标（域名/IP/端口）：同一设备访问不同恶意目标应各自产生事件
+	key := ev.Type + "|" + ev.DeviceIP + "|" + eventTargetKey(ev)
 	if ev.DeviceIP == "" {
-		key = ev.Type + "|" + ev.Title
+		key = ev.Type + "|" + ev.Title + "|" + eventTargetKey(ev)
 	}
+	rank := severityRank(ev.Severity)
 	s.mu.Lock()
-	if last, ok := s.dedupe[key]; ok && ev.Ts-last < 600 {
-		s.mu.Unlock()
-		return false
+	if last, ok := s.dedupe[key]; ok && ev.Ts-last.Ts < 600 {
+		// 同窗口内低等级事件不抑制高等级事件（critical 不被 warn 压掉）
+		if rank <= last.Rank {
+			s.mu.Unlock()
+			return false
+		}
 	}
-	s.dedupe[key] = ev.Ts
+	s.dedupe[key] = dedupeEntry{Ts: ev.Ts, Rank: rank}
 	// 去重表上限
 	if len(s.dedupe) > 2000 {
-		for k, ts := range s.dedupe {
-			if ev.Ts-ts > 600 {
+		for k, e := range s.dedupe {
+			if ev.Ts-e.Ts > 600 {
 				delete(s.dedupe, k)
 			}
 		}
@@ -344,8 +491,72 @@ func (s *Security) emit(ev Event) bool {
 	s.mu.Unlock()
 	if s.app != nil {
 		s.app.emitEvent(ev)
+		s.addRiskEvent(ev)
 	}
 	return true
+}
+
+// alertsEnabled 统一告警开关判断（事件出口统一把关）。
+//   - alert.enable：设置页「启用安全告警」，关闭即不产生任何事件；
+//   - alerts：安全告警功能开关（依赖总开关与采集开关），关闭同样不产生事件。
+//
+// 总开关未启用时不额外限制（此时不会有采集数据，保留演示/单测路径行为）。
+func (s *Security) alertsEnabled() bool {
+	if s.app == nil || s.app.store == nil {
+		return true
+	}
+	st := s.app.store.Settings()
+	if !st.Alert.Enable {
+		return false
+	}
+	if st.Enabled && !st.Alerts {
+		return false
+	}
+	return true
+}
+
+// severityRank 事件等级（critical 3 / warn 2 / info 1）。
+func severityRank(sev string) int {
+	switch sev {
+	case "critical":
+		return 3
+	case "warn":
+		return 2
+	default:
+		return 1
+	}
+}
+
+// severityWeight 事件风险权重（critical 0.4 / warn 0.2 / info 0.05）。
+func severityWeight(sev string) float64 {
+	switch sev {
+	case "critical":
+		return 0.4
+	case "warn":
+		return 0.2
+	default:
+		return 0.05
+	}
+}
+
+// eventTargetKey 事件去重目标：域名 / 目标 IP / 端口。
+// 没有目标信息的事件（如端口扫描按设备聚合）返回空串，保持按设备去重。
+func eventTargetKey(ev Event) string {
+	parts := make([]string, 0, 3)
+	for _, k := range []string{"domain", "dstIp", "target", "ip"} {
+		if v, ok := ev.Evidence[k].(string); ok {
+			if v = strings.TrimSpace(v); v != "" {
+				parts = append(parts, k+"="+v)
+			}
+		}
+	}
+	switch p := ev.Evidence["port"].(type) {
+	case int:
+		parts = append(parts, fmt.Sprintf("port=%d", p))
+	case float64:
+		parts = append(parts, fmt.Sprintf("port=%d", int(p)))
+	}
+	return strings.Join(parts, ",")
 }
 
 // Analyze 周期性研判（每 5s）：流量异常、DNS 隧道、风险分。
@@ -353,11 +564,7 @@ func (s *Security) Analyze(now int64) {
 	if s.app == nil {
 		return
 	}
-	enable := true
-	if s.app.store != nil {
-		enable = s.app.store.Settings().Alert.Enable
-	}
-	if enable {
+	if s.alertsEnabled() {
 		s.checkAnomaly(now)
 		s.checkDNSTunnel(now)
 	}
@@ -426,57 +633,112 @@ func (s *Security) checkDNSTunnel(now int64) {
 	}
 }
 
-// updateRisk 依据近 1 小时事件重算设备风险与全局等级。
-func (s *Security) updateRisk(now int64) {
+// addRiskEvent 记录一条事件到设备风险滑动窗口（近 1 小时）。
+func (s *Security) addRiskEvent(ev Event) {
+	if ev.DeviceIP == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	win := append(s.riskWin[ev.DeviceIP], riskEvent{
+		Ts:     ev.Ts,
+		Type:   ev.Type,
+		Weight: severityWeight(ev.Severity),
+	})
+	// 单设备窗口上限（超出丢弃最旧）
+	if len(win) > riskWindowMax {
+		win = win[len(win)-riskWindowMax:]
+	}
+	s.riskWin[ev.DeviceIP] = win
+}
+
+// seedRiskWindow 首次运行时用 store 中的历史事件初始化风险窗口（重启后风险不丢）。
+func (s *Security) seedRiskWindow(now int64) {
+	if s.app == nil || s.app.store == nil {
+		return
+	}
 	events, _ := s.app.store.Events(500, "", "", "all")
-	reasons := map[string]map[string]*riskReason{}
-	risk := map[string]float64{}
-	cut := now - 3600
+	cut := now - riskWindowSec
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, e := range events {
 		if e.Ts < cut || e.DeviceIP == "" {
 			continue
 		}
-		var w float64
-		switch e.Severity {
-		case "critical":
-			w = 0.4
-		case "warn":
-			w = 0.2
-		default:
-			w = 0.05
+		s.riskWin[e.DeviceIP] = append(s.riskWin[e.DeviceIP], riskEvent{
+			Ts:     e.Ts,
+			Type:   e.Type,
+			Weight: severityWeight(e.Severity),
+		})
+	}
+	s.riskSeeded = true
+}
+
+// updateRisk 依据近 1 小时事件重算设备风险与全局等级。
+// 风险来自「按设备聚合的滑动窗口」（内存），不再受 store 事件表 500 条上限影响；
+// 本轮窗口内已无事件的设备风险显式置零（表外设备不再残留旧分）。
+func (s *Security) updateRisk(now int64) {
+	if s.app == nil {
+		return
+	}
+	s.mu.Lock()
+	seeded := s.riskSeeded
+	s.mu.Unlock()
+	if !seeded {
+		s.seedRiskWindow(now)
+	}
+	cut := now - riskWindowSec
+	s.mu.Lock()
+	risk := map[string]float64{}
+	reasons := map[string]map[string]*riskReason{}
+	prev := s.risk
+	hasCritical := false
+	for dev, win := range s.riskWin {
+		kept := make([]riskEvent, 0, len(win))
+		rm := map[string]*riskReason{}
+		sum := 0.0
+		for _, ev := range win {
+			if ev.Ts < cut {
+				continue
+			}
+			kept = append(kept, ev)
+			sum += ev.Weight
+			r := rm[ev.Type]
+			if r == nil {
+				r = &riskReason{Type: ev.Type}
+				rm[ev.Type] = r
+			}
+			r.Count++
+			if ev.Ts > r.LastTs {
+				r.LastTs = ev.Ts
+			}
+			if ev.Weight >= 0.4 {
+				hasCritical = true
+			}
 		}
-		risk[e.DeviceIP] += w
-		if reasons[e.DeviceIP] == nil {
-			reasons[e.DeviceIP] = map[string]*riskReason{}
+		if len(kept) == 0 {
+			// 窗口内已无事件：删除并清零
+			delete(s.riskWin, dev)
+			continue
 		}
-		r := reasons[e.DeviceIP][e.Type]
-		if r == nil {
-			r = &riskReason{Type: e.Type}
-			reasons[e.DeviceIP][e.Type] = r
+		s.riskWin[dev] = kept
+		if sum > 1 {
+			sum = 1
 		}
-		r.Count++
-		if e.Ts > r.LastTs {
-			r.LastTs = e.Ts
+		risk[dev] = sum
+		reasons[dev] = rm
+	}
+	// 上一轮有风险、本轮窗口已空 → 显式置零
+	for dev := range prev {
+		if _, ok := risk[dev]; !ok {
+			risk[dev] = 0
+			reasons[dev] = nil
 		}
 	}
 	maxRisk := 0.0
-	hasCritical := false
-	for dev, v := range risk {
-		if v > 1 {
-			v = 1
-		}
-		risk[dev] = v
+	for _, v := range risk {
 		if v > maxRisk {
 			maxRisk = v
-		}
-		if s.app.devs != nil {
-			s.app.devs.SetRisk(dev, v)
-		}
-	}
-	for _, e := range events {
-		if e.Ts >= cut && e.Severity == "critical" {
-			hasCritical = true
-			break
 		}
 	}
 	level := "low"
@@ -485,11 +747,16 @@ func (s *Security) updateRisk(now int64) {
 	} else if maxRisk >= 0.35 {
 		level = "guard"
 	}
-	s.mu.Lock()
 	s.risk = risk
 	s.reasons = reasons
 	s.level = level
 	s.mu.Unlock()
+	// 同步到设备状态（风险清零也要下发，避免界面残留旧分）
+	if s.app.devs != nil {
+		for dev, v := range risk {
+			s.app.devs.SetRisk(dev, v)
+		}
+	}
 }
 
 // prune 清理过期的扫描窗口与小时累计。
@@ -512,8 +779,8 @@ func (s *Security) prune(now int64) {
 		}
 	}
 	if len(s.dedupe) > 3000 {
-		for k, ts := range s.dedupe {
-			if now-ts > 600 {
+		for k, e := range s.dedupe {
+			if now-e.Ts > 600 {
 				delete(s.dedupe, k)
 			}
 		}
@@ -584,9 +851,11 @@ func (s *Security) ResetRuntime() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.scan = map[string]map[int]int64{}
-	s.dedupe = map[string]int64{}
+	s.dedupe = map[string]dedupeEntry{}
 	s.hourly = map[string]*hourAgg{}
 	s.risk = map[string]float64{}
 	s.reasons = map[string]map[string]*riskReason{}
+	s.riskWin = map[string][]riskEvent{}
+	s.riskSeeded = false
 	s.level = "low"
 }

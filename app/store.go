@@ -177,6 +177,7 @@ type trafficLine struct {
 // Store 线程安全的状态存储。
 type Store struct {
 	mu        sync.Mutex
+	saveMu    sync.Mutex // 写盘串行化（防止并发写坏 state.json）
 	dir       string
 	statePath string
 
@@ -249,14 +250,30 @@ func (s *Store) Load() error {
 	s.settings.DataDir = s.dir
 
 	if st.Devices != nil {
-		s.devices = st.Devices
+		// 过滤 nil 元素：state.json 被截断/手工编辑后可能出现 "ip": null，
+		// 直接保留会在后续解引用时 panic（启动即崩，连 /healthz 都起不来）
+		devs := make(map[string]*DeviceMeta, len(st.Devices))
+		for ip, m := range st.Devices {
+			if m == nil {
+				continue
+			}
+			devs[ip] = m
+		}
+		s.devices = devs
 	}
 	for _, p := range st.Policies {
 		if p != nil {
 			s.policies = append(s.policies, p)
 		}
 	}
-	s.events = st.Events
+	// 事件同样过滤 nil
+	evs := make([]*Event, 0, len(st.Events))
+	for _, e := range st.Events {
+		if e != nil {
+			evs = append(evs, e)
+		}
+	}
+	s.events = evs
 	if len(s.events) > maxEvents {
 		s.events = s.events[:maxEvents]
 	}
@@ -284,6 +301,11 @@ const maxEvents = 500
 
 // Save 原子写入 state.json。
 func (s *Store) Save() error {
+	// 写盘串行化：定时保存与 HTTP 触发的保存可能并发，
+	// 同时 O_TRUNC 同一个 tmp 文件会造成 state.json 截断/损坏
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+
 	s.mu.Lock()
 	st := persistedState{
 		Settings:     s.settings,
@@ -349,7 +371,14 @@ func (s *Store) Save() error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.statePath)
+	if err := os.Rename(tmp, s.statePath); err != nil {
+		return err
+	}
+	// 落盘成功后才清脏标记：失败时保留 dirty，让定时保存重试（否则本次变更永久丢失）
+	s.mu.Lock()
+	s.dirty = false
+	s.mu.Unlock()
+	return nil
 }
 
 // SaveIfDirty 仅在脏时写盘（30s 定时调用）。

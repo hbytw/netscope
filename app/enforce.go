@@ -29,6 +29,12 @@ const (
 	chainFwd  = "UBM_FWD"
 	chainIn   = "UBM_IN"
 	ipsetName = "ubm_block"
+
+	// tcHandleRoot / tcHandleIfb 本程序创建的 tc 根队列句柄。
+	// 刻意避开用户自有 QoS 常用句柄（luci-app-sqm 一般用 1:），
+	// 删除时按句柄比对，确保不会误删用户自己的队列。
+	tcHandleRoot = "10:"
+	tcHandleIfb  = "20:"
 )
 
 // EnforceStatus /api/enforce/status 契约。
@@ -63,6 +69,7 @@ type Enforcer struct {
 	limitsAt   map[string]int64
 	dnsDomains map[string]bool
 	domainIPs  map[string][]uint32
+	dnsDesired map[string]bool  // 期望封堵的域名集合（含尚未解析成功的）
 	pending    map[string]int64 // 待重试域名 -> 下次重试时间
 
 	policyActive map[string]bool
@@ -71,6 +78,7 @@ type Enforcer struct {
 	tcIngressOwned bool
 	tcIfbRootOwned bool
 	ifbOwned       bool
+	tcLimited      map[string]bool // 本程序已下发 class/filter 的设备
 	chainsReady    bool
 }
 
@@ -86,8 +94,10 @@ func NewEnforcer(a *App) *Enforcer {
 		limitsAt:     map[string]int64{},
 		dnsDomains:   map[string]bool{},
 		domainIPs:    map[string][]uint32{},
+		dnsDesired:   map[string]bool{},
 		pending:      map[string]int64{},
 		policyActive: map[string]bool{},
+		tcLimited:    map[string]bool{},
 	}
 }
 
@@ -109,6 +119,78 @@ func (e *Enforcer) ensureChains() error {
 	}
 	e.chainsReady = true
 	return nil
+}
+
+// dryRunMode 演示/试运行模式：外部命令只记录不执行，无法核验系统状态。
+func (e *Enforcer) dryRunMode() bool {
+	return e.app == nil || e.app.cfg.Demo || e.app.cfg.DryRun
+}
+
+// iptablesDump 读取当前 iptables 规则表（供自有链/规则核对）。
+// ok=false 表示无法核验（iptables 不可用 / 演示模式）。
+func (e *Enforcer) iptablesDump() (string, bool) {
+	if e.dryRunMode() {
+		return "", false
+	}
+	out, err := e.app.shellQuietOutput("iptables -S 2>/dev/null")
+	if err != nil {
+		return "", false
+	}
+	return out, true
+}
+
+// chainsPresent 判断自有链是否存在于 iptables 规则表中。
+func chainsPresent(out string) bool {
+	return strings.Contains(out, "-N "+chainFwd) && strings.Contains(out, "-N "+chainIn)
+}
+
+// rulesPresent 判断当前期望的规则是否都还在（链存在 + 规则存在）。
+// OpenWrt 防火墙重载（iptables-restore 冲刷整表）后链与规则会一起消失。
+func (e *Enforcer) rulesPresent(out string) bool {
+	if !chainsPresent(out) {
+		return false // 自有链已被冲刷
+	}
+	fwd := iptablesChainRules(out, chainFwd)
+	in := iptablesChainRules(out, chainIn)
+	for _, ip := range sortedKeysBool(e.blocked) {
+		// 断网规则在 UBM_FWD，DNS 拦截规则在 UBM_IN
+		if !ruleHasIP(fwd, "-s ", ip) || !ruleHasIP(in, "-s ", ip) {
+			return false
+		}
+	}
+	for _, ip := range sortedKeysBool(e.dstBlocks) {
+		if !ruleHasIP(fwd, "-d ", ip) {
+			return false
+		}
+	}
+	if len(e.dnsDomains) > 0 && !strings.Contains(out, "--match-set "+ipsetName+" dst") {
+		return false
+	}
+	return true
+}
+
+// iptablesChainRules 从 `iptables -S` 输出中取出指定链的规则行。
+func iptablesChainRules(out, chain string) []string {
+	var rules []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "-A "+chain+" ") {
+			continue
+		}
+		rules = append(rules, line)
+	}
+	return rules
+}
+
+// ruleHasIP 判断链规则中是否存在指定源/目的 IP 的规则。
+// iptables 会把单主机地址归一化成 /32，这里两种写法都匹配。
+func ruleHasIP(rules []string, flag, ip string) bool {
+	for _, r := range rules {
+		if strings.Contains(r, flag+ip+"/32") || strings.Contains(r, flag+ip+" ") {
+			return true
+		}
+	}
+	return false
 }
 
 // rebuildDeviceRules 用当前状态完整重建自有链（幂等，天然可回滚）。
@@ -146,34 +228,77 @@ func (e *Enforcer) rebuildDeviceRules() ([]string, error) {
 
 // ---------------- tc 限速 ----------------
 
-// classMinor 设备 IP -> tc class minor（/24 用末位，其他用哈希）。
+// classMinor 设备 IP -> tc class minor（对完整 IP 做哈希，映射到 100..65535）。
+// 注：不能用 IP 末位字节，否则跨网段同末位字节的设备会共用同一个 class（限速串到别的设备）。
 func classMinor(ip string) int {
-	if v, ok := parseIPv4Str(ip); ok {
-		return 100 + int(v&0xff)
-	}
 	h := uint32(2166136261)
 	for i := 0; i < len(ip); i++ {
 		h ^= uint32(ip[i])
 		h *= 16777619
 	}
-	return 100 + int(h%40000)
+	return 100 + int(h%65436) // 100..65535
+}
+
+// tcRootHandles 返回 dev 上各根队列的句柄集合（解析 tc qdisc show）。
+// 用于判断某个队列是否由本程序创建（句柄 = tcHandleRoot/tcHandleIfb）。
+func (e *Enforcer) tcRootHandles(dev string) map[string]bool {
+	handles := map[string]bool{}
+	if e.dryRunMode() {
+		return handles
+	}
+	out, err := e.app.shellQuietOutput("tc qdisc show dev " + dev + " 2>/dev/null")
+	if err != nil {
+		return handles
+	}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, " root ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		for i, f := range fields {
+			if f == "root" && i > 0 {
+				handles[fields[i-1]] = true
+			}
+		}
+	}
+	return handles
+}
+
+// tcIngressExists 判断 dev 上是否已有 ingress 队列（用户 sqm 等可能自带，不能重复 add）。
+func (e *Enforcer) tcIngressExists(dev string) bool {
+	if e.dryRunMode() {
+		return false
+	}
+	out, err := e.app.shellQuietOutput("tc qdisc show dev " + dev + " 2>/dev/null")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(out, " ingress ")
 }
 
 // rebuildTC 按当前 limits 重建限速配置。
+// 根队列句柄固定为 tcHandleRoot/tcHandleIfb（与用户自有 QoS 常用句柄区分），
+// 删除时按句柄比对，确保不误删 luci-app-sqm 等用户配置。
+// 失败时不直接删除用户队列，由调用方用旧状态重新下发恢复。
 func (e *Enforcer) rebuildTC() ([]string, error) {
 	var applied []string
 	if len(e.limits) == 0 {
-		e.teardownTC(true)
+		e.teardownTC(false)
 		return applied, nil
 	}
 	cmds := []string{}
 	// 下行：br-lan 出口 htb
 	if !e.tcRootOwned {
-		cmds = append(cmds, "tc qdisc add dev br-lan root handle 1: htb default 1")
+		if e.tcRootHandles("br-lan")[tcHandleRoot] {
+			e.tcRootOwned = true // 已存在且句柄一致，视为本程序创建
+		} else {
+			cmds = append(cmds, "tc qdisc add dev br-lan root handle "+tcHandleRoot+" htb default 1")
+		}
 	}
 	cmds = append(cmds,
-		"tc class replace dev br-lan parent 1: classid 1:1 htb rate 1000000kbit ceil 1000000kbit",
-		"tc filter del dev br-lan parent 1: prio 10 2>/dev/null")
+		"tc class replace dev br-lan parent "+tcHandleRoot+" classid "+tcHandleRoot+"1 htb rate 1000000kbit ceil 1000000kbit",
+		"tc filter del dev br-lan parent "+tcHandleRoot+" prio 10 2>/dev/null")
 	downIPs := make([]string, 0, len(e.limits))
 	for ip, l := range e.limits {
 		if l.Down > 0 {
@@ -185,8 +310,8 @@ func (e *Enforcer) rebuildTC() ([]string, error) {
 		l := e.limits[ip]
 		minor := classMinor(ip)
 		cmds = append(cmds,
-			fmt.Sprintf("tc class replace dev br-lan parent 1: classid 1:%d htb rate %dkbit ceil %dkbit", minor, l.Down, l.Down),
-			fmt.Sprintf("tc filter add dev br-lan parent 1: protocol ip prio 10 u32 match ip dst %s/32 flowid 1:%d", ip, minor))
+			fmt.Sprintf("tc class replace dev br-lan parent %s classid %s%d htb rate %dkbit ceil %dkbit", tcHandleRoot, tcHandleRoot, minor, l.Down, l.Down),
+			fmt.Sprintf("tc filter add dev br-lan parent %s protocol ip prio 10 u32 match ip dst %s/32 flowid %s%d", tcHandleRoot, ip, tcHandleRoot, minor))
 	}
 	// 上行：ifb0
 	upIPs := make([]string, 0, len(e.limits))
@@ -198,31 +323,54 @@ func (e *Enforcer) rebuildTC() ([]string, error) {
 	sort.Strings(upIPs)
 	if len(upIPs) > 0 {
 		if !e.ifbOwned {
-			cmds = append(cmds, "ip link add ifb0 type ifb 2>/dev/null; ip link set ifb0 up")
+			if e.linkExists("ifb0") {
+				// 已存在（上次运行遗留或用户自建）：复用该设备，但撤销时不删除它
+				logf("ifb0 已存在且非本程序创建：复用该设备，撤销时不会删除")
+			} else {
+				cmds = append(cmds, "ip link add ifb0 type ifb 2>/dev/null; ip link set ifb0 up")
+			}
 		}
-		if !e.tcIngressOwned {
-			cmds = append(cmds, "tc qdisc add dev br-lan handle ffff: ingress 2>/dev/null")
+		if !e.tcIngressOwned && !e.tcIngressExists("br-lan") {
+			// 已有 ingress 队列（用户 sqm 等自带）时不重复添加，也不接管
+			cmds = append(cmds, "tc qdisc add dev br-lan handle ffff: ingress")
 		}
 		if !e.tcIfbRootOwned {
-			cmds = append(cmds, "tc qdisc add dev ifb0 root handle 2: htb default 1 2>/dev/null")
+			if e.tcRootHandles("ifb0")[tcHandleIfb] {
+				e.tcIfbRootOwned = true
+			} else {
+				cmds = append(cmds, "tc qdisc add dev ifb0 root handle "+tcHandleIfb+" htb default 1")
+			}
 		}
 		cmds = append(cmds,
-			"tc class replace dev ifb0 parent 2: classid 2:1 htb rate 1000000kbit ceil 1000000kbit",
+			"tc class replace dev ifb0 parent "+tcHandleIfb+" classid "+tcHandleIfb+"1 htb rate 1000000kbit ceil 1000000kbit",
 			"tc filter del dev br-lan parent ffff: prio 11 2>/dev/null",
-			"tc filter del dev ifb0 parent 2: prio 11 2>/dev/null")
+			"tc filter del dev ifb0 parent "+tcHandleIfb+" prio 11 2>/dev/null")
 		for _, ip := range upIPs {
 			l := e.limits[ip]
 			minor := classMinor(ip)
 			cmds = append(cmds,
 				fmt.Sprintf("tc filter add dev br-lan parent ffff: protocol ip prio 11 u32 match ip src %s/32 action mirred egress redirect dev ifb0", ip),
-				fmt.Sprintf("tc class replace dev ifb0 parent 2: classid 2:%d htb rate %dkbit ceil %dkbit", minor, l.Up, l.Up),
-				fmt.Sprintf("tc filter add dev ifb0 parent 2: protocol ip prio 11 u32 match ip dst %s/32 flowid 2:%d", ip, minor))
+				fmt.Sprintf("tc class replace dev ifb0 parent %s classid %s%d htb rate %dkbit ceil %dkbit", tcHandleIfb, tcHandleIfb, minor, l.Up, l.Up),
+				fmt.Sprintf("tc filter add dev ifb0 parent %s protocol ip prio 11 u32 match ip dst %s/32 flowid %s%d", tcHandleIfb, ip, tcHandleIfb, minor))
 		}
 	}
+	// 取消限速的设备：删除本程序创建的 class（只删自己下发的）
+	for ip := range e.tcLimited {
+		if _, ok := e.limits[ip]; ok {
+			continue
+		}
+		e.app.shellQuiet(fmt.Sprintf("tc class del dev br-lan classid %s%d 2>/dev/null", tcHandleRoot, classMinor(ip)))
+		e.app.shellQuiet(fmt.Sprintf("tc class del dev ifb0 classid %s%d 2>/dev/null", tcHandleIfb, classMinor(ip)))
+	}
+	// 记录本轮限速设备（失败回滚时据此清理本次新增的 class）
+	limited := make(map[string]bool, len(e.limits))
+	for ip := range e.limits {
+		limited[ip] = true
+	}
+	e.tcLimited = limited
 	for _, c := range cmds {
 		if _, err := e.app.shell(c); err != nil {
-			// 回滚：删除本次创建的队列，绝不留下坏队列
-			e.teardownTC(true)
+			// 失败：不误删用户自有队列，旧状态由调用方（applyDeviceState）重新下发恢复
 			return applied, fmt.Errorf("下发 tc 限速失败（%s）: %w", c, err)
 		}
 		applied = append(applied, c)
@@ -241,24 +389,51 @@ func (e *Enforcer) rebuildTC() ([]string, error) {
 	return applied, nil
 }
 
-// teardownTC 清理限速配置。force=true 时无条件尝试删除（reset 用）。
+// teardownTC 清理限速配置。
+// 只删除本程序创建的队列与 class（先用 tc qdisc show 比对句柄），
+// 绝不误删用户自有 QoS（luci-app-sqm 等的 br-lan 根队列 / ifb0）。
 func (e *Enforcer) teardownTC(force bool) {
-	if force || e.tcRootOwned {
+	// force=true 用于"一键清空/撤销"场景；删除动作一律按句柄比对，
+	// 不再像旧实现那样无条件删除 br-lan 根队列与 ifb0。
+	_ = force
+	// 本程序下发过的设备 class
+	for ip := range e.tcLimited {
+		e.app.shellQuiet(fmt.Sprintf("tc class del dev br-lan classid %s%d 2>/dev/null", tcHandleRoot, classMinor(ip)))
+		e.app.shellQuiet(fmt.Sprintf("tc class del dev ifb0 classid %s%d 2>/dev/null", tcHandleIfb, classMinor(ip)))
+	}
+	e.tcLimited = map[string]bool{}
+	// br-lan 根队列：句柄一致（本程序的 10:）才删除
+	if e.dryRunMode() || e.tcRootHandles("br-lan")[tcHandleRoot] {
 		e.app.shellQuiet("tc qdisc del dev br-lan root 2>/dev/null")
-		e.tcRootOwned = false
 	}
-	if force || e.tcIngressOwned {
+	e.tcRootOwned = false
+	// ingress 队列：只有本程序创建（用户自有的 ffff: ingress 不动）
+	if e.tcIngressOwned {
 		e.app.shellQuiet("tc qdisc del dev br-lan handle ffff: ingress 2>/dev/null")
-		e.tcIngressOwned = false
 	}
-	if force || e.tcIfbRootOwned {
+	e.tcIngressOwned = false
+	// ifb0 根队列：句柄一致（本程序的 20:）才删除
+	if e.dryRunMode() || e.tcRootHandles("ifb0")[tcHandleIfb] {
 		e.app.shellQuiet("tc qdisc del dev ifb0 root 2>/dev/null")
-		e.tcIfbRootOwned = false
 	}
-	if force || e.ifbOwned {
+	e.tcIfbRootOwned = false
+	// ifb0 设备：只有本程序创建的才删除（用户自建的 ifb0 不动）
+	if e.ifbOwned && (e.dryRunMode() || e.linkExists("ifb0")) {
 		e.app.shellQuiet("ip link del ifb0 2>/dev/null")
-		e.ifbOwned = false
 	}
+	e.ifbOwned = false
+}
+
+// linkExists 判断网卡是否存在（用于只删除本程序创建的 ifb0）。
+func (e *Enforcer) linkExists(name string) bool {
+	if e.dryRunMode() {
+		return true
+	}
+	out, err := e.app.shellQuietOutput("ip link show " + name + " 2>/dev/null")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(out, name)
 }
 
 // teardownIptables 清空自有链（uninstall/reset 用），不碰他人规则。
@@ -283,9 +458,23 @@ func (e *Enforcer) teardownIptables() error {
 
 // applyDeviceState 应用「断网设备 / 封禁目标 IP / 限速」期望状态；失败回滚到旧状态。
 // 同时维护各条目的首次下发时间（封禁列表展示用）。
+//
+// 每轮都会核对自有链与规则是否真实存在：OpenWrt 防火墙重载会用 iptables-restore
+// 冲刷整表，若只比对内存状态，规则会静默失效且不再补发（界面却显示已生效）。
 func (e *Enforcer) applyDeviceState(blocked, dst map[string]bool, limits map[string]LimitKbps) ([]string, error) {
 	oldBlocked, oldDst, oldLimits := e.blocked, e.dstBlocks, e.limits
-	if mapsEqualBool(oldBlocked, blocked) && mapsEqualBool(oldDst, dst) && mapsEqualLimit(oldLimits, limits) {
+	same := mapsEqualBool(oldBlocked, blocked) && mapsEqualBool(oldDst, dst) && mapsEqualLimit(oldLimits, limits)
+	if same {
+		// 期望状态没变，但必须核对自有链与规则是否真实存在：
+		// OpenWrt 防火墙重载会用 iptables-restore 冲刷整表，
+		// 只比对内存状态会让断网/封禁规则静默失效（界面却显示已生效）。
+		if out, ok := e.iptablesDump(); ok && !e.rulesPresent(out) {
+			logf("检测到自有链或规则缺失（防火墙可能被重载），重新下发管控规则")
+			e.chainsReady = false
+			same = false
+		}
+	}
+	if same {
 		return nil, nil
 	}
 	now := nowUnix()
@@ -404,14 +593,14 @@ func (e *Enforcer) SetLimit(ip string, down, up int) ([]string, error) {
 	}
 	minor := classMinor(ip)
 	if down <= 0 && up <= 0 {
-		return []string{fmt.Sprintf("tc class del dev br-lan classid 1:%d", minor)}, nil
+		return []string{fmt.Sprintf("tc class del dev br-lan classid %s%d", tcHandleRoot, minor)}, nil
 	}
 	out := []string{}
 	if down > 0 {
-		out = append(out, fmt.Sprintf("tc class replace dev br-lan parent 1: classid 1:%d htb rate %dkbit", minor, down))
+		out = append(out, fmt.Sprintf("tc class replace dev br-lan parent %s classid %s%d htb rate %dkbit", tcHandleRoot, tcHandleRoot, minor, down))
 	}
 	if up > 0 {
-		out = append(out, fmt.Sprintf("tc class replace dev ifb0 parent 2: classid 2:%d htb rate %dkbit", minor, up))
+		out = append(out, fmt.Sprintf("tc class replace dev ifb0 parent %s classid %s%d htb rate %dkbit", tcHandleIfb, tcHandleIfb, minor, up))
 	}
 	return out, nil
 }
@@ -643,38 +832,45 @@ func (e *Enforcer) RestoreFromStore() {
 // ---------------- 域名封堵（ipset） ----------------
 
 // applyDomainState 应用域名封堵期望集合（解析 -> ipset）。
+//
+// 内存状态（dnsDomains/domainIPs）只在 ipset 下发成功后才提交，
+// 且只包含真正封堵成功的域名（解析失败/下发失败的域名留在 pending，
+// 下一轮继续重试，不会因"状态相同"而永不重试）。
 func (e *Enforcer) applyDomainState(desired map[string]bool) ([]string, error) {
+	e.dnsDesired = copyBoolMap(desired)
 	if mapsEqualBool(e.dnsDomains, desired) && len(e.pending) == 0 {
 		return nil, nil
 	}
 	var applied []string
 	now := nowUnix()
-	// 解析新增域名
+	// 解析需要新增的域名（失败项留在 pending 等待重试）
+	resolved := make(map[string][]uint32, len(desired))
 	for d := range desired {
-		if e.dnsDomains[d] {
+		if ips, ok := e.domainIPs[d]; ok && len(ips) > 0 {
+			resolved[d] = ips
 			continue
+		}
+		if next, ok := e.pending[d]; ok && now < next {
+			continue // 等待下一次重试
 		}
 		ips := e.app.ResolveDomain(d)
-		if len(ips) == 0 {
-			if _, ok := e.pending[d]; !ok {
-				e.pending[d] = now + 60
-			}
-			logf("域名 %s 解析失败，稍后重试封堵", d)
-			continue
-		}
 		parsed := make([]uint32, 0, len(ips))
 		for _, s := range ips {
 			if v, ok := parseIPv4Str(s); ok {
 				parsed = append(parsed, v)
 			}
 		}
-		e.domainIPs[d] = parsed
-		delete(e.pending, d)
+		if len(parsed) == 0 {
+			e.pending[d] = now + 60
+			logf("域名 %s 解析失败，稍后重试封堵", d)
+			continue
+		}
+		resolved[d] = parsed
 	}
 	// 计算 ip 集合并与已下发集合比对
 	wantIPs := map[uint32]bool{}
 	for d := range desired {
-		for _, ip := range e.domainIPs[d] {
+		for _, ip := range resolved[d] {
 			wantIPs[ip] = true
 		}
 	}
@@ -684,14 +880,10 @@ func (e *Enforcer) applyDomainState(desired map[string]bool) ([]string, error) {
 			oldIPs[ip] = true
 		}
 	}
-	newDomains := copyBoolMap(desired)
-	e.dnsDomains = newDomains
-	// 清理不再被引用的域名 IP
-	for d := range oldIPs {
-		_ = d
-	}
+	// 下发 ipset（失败不提交内存状态，失败项放回 pending 供下一轮重试）
 	if len(wantIPs) > 0 {
 		if _, err := e.app.shell("ipset create " + ipsetName + " hash:ip -exist"); err != nil {
+			e.markDomainsPending(desired, now)
 			return applied, fmt.Errorf("创建 ipset 失败: %w", err)
 		}
 	}
@@ -701,6 +893,7 @@ func (e *Enforcer) applyDomainState(desired map[string]bool) ([]string, error) {
 		}
 		cmd := fmt.Sprintf("ipset add %s %s -exist", ipsetName, ip4String(ip))
 		if _, err := e.app.shell(cmd); err != nil {
+			e.markDomainsPending(desired, now)
 			return applied, fmt.Errorf("写入 ipset 失败: %w", err)
 		}
 		applied = append(applied, cmd)
@@ -711,23 +904,40 @@ func (e *Enforcer) applyDomainState(desired map[string]bool) ([]string, error) {
 		}
 		cmd := fmt.Sprintf("ipset del %s %s -exist", ipsetName, ip4String(ip))
 		if _, err := e.app.shell(cmd); err != nil {
+			e.markDomainsPending(desired, now)
 			return applied, fmt.Errorf("移除 ipset 记录失败: %w", err)
 		}
 		applied = append(applied, cmd)
 	}
 	// 确保 iptables 规则存在
-	if rules, err := e.rebuildDeviceRules(); err != nil {
+	rules, err := e.rebuildDeviceRules()
+	if err != nil {
+		e.markDomainsPending(desired, now)
 		return applied, err
-	} else {
-		applied = append(applied, rules...)
 	}
-	// 清理已删除域名的解析缓存
-	for d := range e.domainIPs {
-		if !e.dnsDomains[d] {
-			delete(e.domainIPs, d)
+	applied = append(applied, rules...)
+	// 下发成功：提交内存状态（只提交真正封堵成功的域名）
+	e.domainIPs = resolved
+	e.dnsDomains = make(map[string]bool, len(resolved))
+	for d := range desired {
+		if len(resolved[d]) > 0 {
+			e.dnsDomains[d] = true
+			delete(e.pending, d)
 		}
 	}
 	return applied, nil
+}
+
+// markDomainsPending 把尚未成功封堵的域名放回 pending（下一轮重试）。
+func (e *Enforcer) markDomainsPending(desired map[string]bool, now int64) {
+	for d := range desired {
+		if e.dnsDomains[d] && len(e.domainIPs[d]) > 0 {
+			continue // 已封堵成功
+		}
+		if _, ok := e.pending[d]; !ok {
+			e.pending[d] = now + 60
+		}
+	}
 }
 
 // retryPendingDomains 重试解析失败的域名。
@@ -743,22 +953,25 @@ func (e *Enforcer) retryPendingDomains(now int64) {
 			continue
 		}
 		ips := e.app.ResolveDomain(d)
-		if len(ips) == 0 {
-			e.pending[d] = now + 120
-			continue
-		}
 		parsed := make([]uint32, 0, len(ips))
 		for _, s := range ips {
 			if v, ok := parseIPv4Str(s); ok {
 				parsed = append(parsed, v)
 			}
 		}
+		if len(parsed) == 0 {
+			e.pending[d] = now + 120
+			continue
+		}
 		e.domainIPs[d] = parsed
 		delete(e.pending, d)
 		changed = true
 	}
 	if changed {
-		desired := copyBoolMap(e.dnsDomains)
+		desired := copyBoolMap(e.dnsDesired)
+		if len(desired) == 0 {
+			desired = copyBoolMap(e.dnsDomains)
+		}
 		if _, err := e.applyDomainState(desired); err != nil {
 			logf("重试域名封堵失败: %v", err)
 		}
@@ -1058,6 +1271,7 @@ func (e *Enforcer) Reset() ([]string, error) {
 	e.limits = map[string]LimitKbps{}
 	e.limitsAt = map[string]int64{}
 	e.dnsDomains = map[string]bool{}
+	e.dnsDesired = map[string]bool{}
 	e.domainIPs = map[string][]uint32{}
 	e.pending = map[string]int64{}
 	e.policyActive = map[string]bool{}
@@ -1092,6 +1306,7 @@ func (e *Enforcer) RevokeDomainBlock() {
 	defer e.mu.Unlock()
 	e.app.shellQuiet("ipset flush " + ipsetName + " 2>/dev/null; ipset destroy " + ipsetName + " 2>/dev/null")
 	e.dnsDomains = map[string]bool{}
+	e.dnsDesired = map[string]bool{}
 	e.domainIPs = map[string][]uint32{}
 	e.pending = map[string]int64{}
 	if e.chainsReady {
@@ -1118,6 +1333,7 @@ func (e *Enforcer) RevokeAll() {
 	e.limits = map[string]LimitKbps{}
 	e.limitsAt = map[string]int64{}
 	e.dnsDomains = map[string]bool{}
+	e.dnsDesired = map[string]bool{}
 	e.domainIPs = map[string][]uint32{}
 	e.pending = map[string]int64{}
 	e.policyActive = map[string]bool{}

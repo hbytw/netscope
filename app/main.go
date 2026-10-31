@@ -10,12 +10,14 @@ package main
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -28,6 +30,26 @@ import (
 	"syscall"
 	"time"
 )
+
+// ---------------- 版本号（单一来源：app/version.txt） ----------------
+
+// buildVersion 编译期注入点：go build -ldflags "-X main.buildVersion=1.2.3"。
+// 未注入时回退到内嵌的 version.txt（该文件是版本号的唯一权威来源）。
+var buildVersion string
+
+//go:embed version.txt
+var versionFile string
+
+// AppVersion 返回当前版本号：编译期注入优先，其次内嵌的 version.txt。
+func AppVersion() string {
+	if v := strings.TrimSpace(buildVersion); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(versionFile); v != "" {
+		return v
+	}
+	return "0.0.0-dev"
+}
 
 // App 应用根对象（所有组件共享）。
 type App struct {
@@ -53,7 +75,10 @@ type App struct {
 
 	execMu   sync.Mutex
 	dnsTapMu sync.Mutex
-	pidPath  string
+	switchMu sync.Mutex // 设置补丁「读—改—写」串行化，避免并发丢更新
+
+	scaleLogN int
+	pidPath   string
 
 	// 命令记录（demo/dry-run 下便于单测断言「开关撤销流程」调用了哪些命令）
 	cmdMu  sync.Mutex
@@ -95,6 +120,7 @@ func NewApp(cfg *Config) *App {
 	}
 	a.agg = NewAgg(maxBuckets)
 	a.ct = NewConnEngine(cfg.LANCIDR)
+	a.ct.SetSelfIPs(localIPv4s())
 	a.devs = NewDeviceMgr(a)
 	a.dns = NewDNSResolver(a)
 	a.sys = NewSysInfo(a, cfg.Demo)
@@ -200,6 +226,10 @@ func badSetting(msg string) error { return &switchError{status: 400, msg: msg} }
 // ApplySwitchPatch 应用设置补丁（开关 + 阈值），返回新设置与本次实际动作。
 // 开关变更顺序：先撤销（安全），再启用；dnsTap 变更失败会回滚且不落库。
 func (a *App) ApplySwitchPatch(patch settingsPatch) (Settings, []string, []string, error) {
+	// 串行化「读—改—写」全过程：并发 PUT 会互相覆盖（用旧快照全量覆盖 Settings）
+	a.switchMu.Lock()
+	defer a.switchMu.Unlock()
+
 	cur := a.store.Settings()
 	next := cur
 	if patch.Enabled != nil {
@@ -404,10 +434,12 @@ func (a *App) shellInput(cmd, input string) (string, error) {
 		logf("[dry-run] %s <<< (%d bytes)", cmd, len(input))
 		return "", nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
 	a.execMu.Lock()
 	defer a.execMu.Unlock()
+	// 超时预算必须在拿到 execMu 之后再开始计时：
+	// 排队等锁的时间不计入超时，否则并发调用一多，命令还没执行就被判定超时。
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
 	c.Stdin = strings.NewReader(input)
 	var buf bytes.Buffer
@@ -448,15 +480,76 @@ func (a *App) iptablesSnapshot() string {
 	return out
 }
 
-// restoreIptables 用快照恢复 iptables（失败记录告警）。
+// iptablesSnapshotComplete 校验快照完整性。
+//
+// iptables-save 的输出按表分段：每段以 "*<表名>" 开头、以 "COMMIT" 结尾。
+// 快照若被截断（例如保存过程中进程被杀），某段就缺少 COMMIT —— 此时绝不能
+// 拿去做整表恢复，否则 iptables-restore 会把防火墙/NAT 表清空，路由器直接断网。
+func iptablesSnapshotComplete(snapshot string) bool {
+	s := strings.TrimSpace(snapshot)
+	if s == "" {
+		return false
+	}
+	for _, table := range []string{"filter", "mangle", "nat", "raw"} {
+		head := "*" + table
+		i := strings.Index(s, head+"\n")
+		if i < 0 {
+			return false
+		}
+		rest := s[i+len(head)+1:]
+		commit := strings.Index(rest, "\nCOMMIT")
+		if commit < 0 {
+			return false
+		}
+		// 下一张表出现在 COMMIT 之前 → 本段被截断
+		if next := strings.Index(rest, "\n*"); next >= 0 && next < commit {
+			return false
+		}
+	}
+	return strings.HasSuffix(s, "COMMIT")
+}
+
+// cleanupOwnChains 只清理本项目自有的 UBM_* 链及其跳转，其余规则原样保留。
+// 复用管控层的 teardownIptables（同时复位 chainsReady，避免下次下发时链已不存在）。
+func (a *App) cleanupOwnChains() {
+	if a.enf != nil {
+		if err := a.enf.teardownIptables(); err != nil {
+			logf("清理 iptables 自有链失败: %v", err)
+		}
+		return
+	}
+	a.shellQuiet(strings.Join([]string{
+		"iptables -F UBM_FWD 2>/dev/null",
+		"iptables -F UBM_IN 2>/dev/null",
+		"iptables -D FORWARD -j UBM_FWD 2>/dev/null",
+		"iptables -D INPUT -j UBM_IN 2>/dev/null",
+		"iptables -X UBM_FWD 2>/dev/null",
+		"iptables -X UBM_IN 2>/dev/null",
+	}, "; "))
+}
+
+// restoreIptables 用快照回滚 iptables（失败保护版）。
+//
+// 绝不使用「整表 flush + restore」的裸 iptables-restore 回滚：
+// 快照被截断或命令中途被杀都会把防火墙/NAT 表清空 —— 路由器直接断网。
+// 这里分两步：
+//  1. 快照完整时用 iptables-restore --noflush 增量恢复（不清空既有表）；
+//  2. 快照不完整或增量恢复失败时，只清理本项目自有的 UBM_* 链，其余规则原样保留。
 func (a *App) restoreIptables(snapshot string) {
 	if snapshot == "" || a.cfg.Demo || a.cfg.DryRun {
 		return
 	}
-	logf("回滚 iptables 规则（iptables-restore）")
-	if _, err := a.shellInput("iptables-restore", snapshot); err != nil {
-		logf("iptables 回滚失败，请检查: %v", err)
+	if iptablesSnapshotComplete(snapshot) {
+		logf("回滚 iptables 规则（iptables-restore --noflush，不清空既有表）")
+		if _, err := a.shellInput("iptables-restore --noflush", snapshot); err == nil {
+			return
+		} else {
+			logf("iptables 增量回滚失败，转为只清理本项目自有链: %v", err)
+		}
+	} else {
+		logf("iptables 快照不完整（可能被截断），跳过整表恢复，只清理本项目自有链")
 	}
+	a.cleanupOwnChains()
 }
 
 // cleanupStaleDeviceMeta 清理历史 state 中累积的非内网设备（公网/docker 邻居等）。
@@ -509,8 +602,45 @@ func (a *App) collectOnce() {
 	rates := a.agg.Tick(int64(interval), now)
 	a.devs.ApplyRates(rates, now)
 	a.sys.Sample(int64(interval))
+	a.updateScale()
 	if a.cfg.Demo && a.demo != nil {
 		a.demo.Tick(now)
+	}
+}
+
+// updateScale 用物理接口速率校准 conntrack 归因统计。
+//
+// conntrack 差分在 UDP 打洞/端口复用场景下会重复计入，绝对值不可信
+// （实测可虚高 10~1000 倍）；但它给出的「各类/各设备/各域名的相对比例」仍然可用。
+// 这里以 LAN 接口计数（物理真实）为总量基准，算出比例系数并交给 Agg，
+// 使所有对外显示的速率都锚定在物理真实量级上。
+func (a *App) updateScale() {
+	sys := a.sys.Snapshot()
+	phys := sys.NetDownBps + sys.NetUpBps
+	if phys <= 0 {
+		return
+	}
+	// 取未经校准的 conntrack 速率（LastRates 已缩放，这里用 Agg 内部原始值）
+	raw := a.agg.RawRates()
+	ct := raw.DownBps + raw.UpBps
+	if ct <= 0 {
+		return // conntrack 本周期无数据：保持上一系数
+	}
+	f := float64(phys) / float64(ct)
+	if f <= 0.0001 {
+		return
+	}
+	// 平滑，避免系数抖动导致显示跳变
+	old := a.agg.Scale()
+	if old <= 0 {
+		old = f
+	} else {
+		old = 0.7*old + 0.3*f
+	}
+	a.agg.SetScale(old)
+	a.scaleLogN++
+	if a.scaleLogN%30 == 1 {
+		logf("[scale] 物理=%.2f Mbps conntrack=%.2f Mbps 系数=%.6f", float64(phys)/1e6, float64(ct)/1e6, old)
 	}
 }
 
@@ -870,7 +1000,7 @@ func (a *App) Run() error {
 	errCh := make(chan error, 1)
 	go func() {
 		logf("观澜 NetScope %s 启动：http://%s（数据目录 %s，demo=%v，dry-run=%v）",
-			Version, a.cfg.Addr, a.cfg.DataDir, a.cfg.Demo, a.cfg.DryRun)
+			AppVersion(), a.cfg.Addr, a.cfg.DataDir, a.cfg.Demo, a.cfg.DryRun)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -885,10 +1015,12 @@ func (a *App) Run() error {
 		logf("HTTP 服务异常退出: %v", err)
 	}
 	close(a.stop)
+	// 先关闭 SSE 广播（结束活跃的流式连接），再关闭 HTTP 服务，
+	// 否则 Shutdown 会一直等 SSE handler 结束，白白耗尽 5 秒超时。
+	a.hub.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
-	a.hub.Close()
 	if err := a.store.Save(); err != nil {
 		logf("退出前保存状态失败: %v", err)
 	}
@@ -930,6 +1062,9 @@ func (a *App) startupDNS() {
 }
 
 // checkSingleInstance 单实例锁（/tmp/guanlan.pid，仅 Linux 真机）。
+//
+// pid 文件位于 /tmp（sticky 目录，任何本地用户可写），内容绝不能拼进 shell 命令：
+// 先用 strconv 校验为纯数字，再用 /proc/<pid> + signal 0 判活，全程不走 shell。
 func (a *App) checkSingleInstance() {
 	if a.cfg.Demo || a.cfg.DryRun || runtime.GOOS != "linux" {
 		return
@@ -937,19 +1072,40 @@ func (a *App) checkSingleInstance() {
 	pidPath := "/tmp/guanlan.pid"
 	a.pidPath = pidPath
 	if b, err := os.ReadFile(pidPath); err == nil {
-		pid := strings.TrimSpace(string(b))
-		if pid != "" {
-			out, err := exec.Command("/bin/sh", "-c", "kill -0 "+pid+" 2>/dev/null").CombinedOutput()
-			_ = out
-			if err == nil {
-				log.Fatalf("检测到已有观澜实例在运行（pid %s），本次启动退出", pid)
+		raw := strings.TrimSpace(string(b))
+		if raw != "" {
+			pid, perr := strconv.Atoi(raw)
+			switch {
+			case perr != nil || pid <= 0:
+				// 内容不是合法 pid：按垃圾文件处理，绝不当作命令执行
+				logf("pid 文件内容非法（%q），已按残留处理", raw)
+			case processAlive(pid):
+				log.Fatalf("检测到已有观澜实例在运行（pid %d），本次启动退出", pid)
+			default:
+				logf("清理残留 pid 文件（pid %d 已不存在）", pid)
 			}
-			logf("清理残留 pid 文件（pid %s 已不存在）", pid)
 		}
 	}
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
 		logf("写入 pid 文件失败: %v", err)
 	}
+}
+
+// processAlive 判断 pid 对应的进程是否存在（不走 shell，避免命令注入）。
+// 优先用 signal 0 探测；EPERM 表示进程存在但无权限，同样视为存活。
+func processAlive(pid int) bool {
+	if proc, err := os.FindProcess(pid); err == nil {
+		err = proc.Signal(syscall.Signal(0))
+		if err == nil {
+			return true
+		}
+		if errors.Is(err, os.ErrPermission) {
+			return true
+		}
+	}
+	// 兜底：Linux 上 /proc/<pid> 存在即代表进程存在
+	_, err := os.Stat("/proc/" + strconv.Itoa(pid))
+	return err == nil
 }
 
 func (a *App) removePid() {
@@ -978,6 +1134,34 @@ func trimSpaceBytes(b []byte) []byte { return bytes.TrimSpace(b) }
 func goGOARCH() string { return runtime.GOARCH }
 
 // main 解析 flag 并启动服务。
+// localIPv4s 返回本机所有接口的 IPv4 地址（路由器自身）。
+// 用于把本机出站流量（如 xray 透明代理出口）从「设备」统计中排除。
+func localIPv4s() []uint32 {
+	var out []uint32
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return out
+	}
+	for _, ifi := range ifs {
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if v4 := ipn.IP.To4(); v4 != nil {
+				var b [4]byte
+				copy(b[:], v4)
+				out = append(out, ip4ToUint32(b))
+			}
+		}
+	}
+	return out
+}
+
 func main() {
 	addr := flag.String("addr", ":8088", "监听地址")
 	webDir := flag.String("web", "", "前端资源目录（空=使用内嵌资源）")
@@ -1004,7 +1188,7 @@ func main() {
 	cfg.WebDir = *webDir
 
 	logf("观澜 NetScope %s（域名规则 %d 条，黑名单 %d 个，OUI %d 条）",
-		Version, DomainRuleCount(), BlockedDomainCount(), OUIEntryCount())
+		AppVersion(), DomainRuleCount(), BlockedDomainCount(), OUIEntryCount())
 	if cfg.UsingDefaultPassword() {
 		logf("提示：当前仍使用默认密码，请在设置页及时修改")
 	}

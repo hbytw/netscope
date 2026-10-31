@@ -8,9 +8,11 @@
 #
 # 安全性：
 #   * 只清理本项目自建的 iptables 链（UBM_*）与 tc 规则，不触碰他人规则
-#   * DNS 旁挂通过 uci delete 还原 dnsmasq 原生选项，可完全逆变
+#   * DNS 旁挂与后端 ApplyDNSTap 机制一致：改写的是 /etc/dnsmasq.conf 的
+#     log-facility 行（原值备份在 $DATA_DIR/logfacility.orig），还原时写回该行
 #   * 不改动网络接口、DNS 上游、lan 区配置；不重启路由器
-#   * dnsmasq 只做 stop + start（该固件 reload 有 bug），且每次都做 nslookup 健康检查
+#   * dnsmasq 只在确实改动过配置时才 stop + start（该固件 reload 有 bug），
+#     且每次启停后都做 nslookup 健康检查
 #   * 任何一步失败均记录并继续；脚本退出前确保 DNS 可解析
 #
 set -u
@@ -33,10 +35,17 @@ PID_FILE="/var/run/${APP_NAME}.pid"
 PORT="${GUANLAN_PORT:-8088}"
 RUN_DIR="/tmp/${APP_NAME}"
 
-# --- DNS 旁挂（UCI 原生选项） ---
+# --- DNS 旁挂（与后端 ApplyDNSTap 一致：改写 /etc/dnsmasq.conf 的 log-facility） ---
+DNS_CONF="/etc/dnsmasq.conf"
+# 原值备份：install.sh 写在持久目录（跨重启保留），后端运行时另存 /tmp/guanlan/logfacility.orig
+LOGFAC_ORIG_FILE="${DATA_DIR}/logfacility.orig"
+LOGFAC_ORIG_TMP="/tmp/${APP_NAME}/logfacility.orig"
 UCI_SECTION="dhcp.@dnsmasq[0]"
 UCI_OPT_LOGQUERIES="logqueries"
-UCI_OPT_LOGFACILITY="logfacility"
+
+# --- tc：本项目只使用 br-lan（root handle 1: htb / ingress handle ffff:）与 ifb0（root handle 2: htb） ---
+TC_DEV_MAIN="br-lan"
+TC_DEV_IFB="ifb0"
 
 PURGE=0
 for a in "$@"; do
@@ -130,18 +139,59 @@ else
 fi
 
 # ===========================================================================
-# 4. DNS 旁挂还原（UCI 原生选项，完全可逆）
+# 4. 还原 DNS 旁挂（与后端 ApplyDNSTap 机制完全一致）
 #
-#   uci delete dhcp.@dnsmasq[0].logqueries
-#   uci delete dhcp.@dnsmasq[0].logfacility
-#   uci commit dhcp
-#   /etc/init.d/dnsmasq stop ; sleep 1 ; /etc/init.d/dnsmasq start
-#   nslookup 健康检查
+#   后端开启旁挂时做的是：
+#     uci set dhcp.@dnsmasq[0].logqueries='1' → uci commit dhcp
+#     把 /etc/dnsmasq.conf 的 log-facility 行改成 /tmp/guanlan/dnsmasq.log
+#     （原值备份在 /tmp/guanlan/logfacility.orig）→ stop + start dnsmasq
+#   关闭旁挂时：uci delete logqueries + 把 log-facility 行写回原值 + stop + start。
 #
-#   该固件 ubus call dnsmasq reload 不存在；/etc/init.d/dnsmasq reload 有 bug
-#   （停得掉起不来 → 全网 DNS 中断），故只用 stop + start。
+#   所以卸载脚本必须还原的是「/etc/dnsmasq.conf 的 log-facility 行」，
+#   而不是 uci delete logfacility —— 后端从不写 UCI logfacility（写了会与
+#   /etc/dnsmasq.conf 自带的 log-facility 重复 → dnsmasq 报 illegal repeated
+#   keyword 启动失败）。
+#
+#   原值来源（优先级从高到低）：
+#     1) $DATA_DIR/logfacility.orig —— install.sh 写入的持久备份
+#     2) /tmp/guanlan/logfacility.orig —— 后端运行时备份（tmpfs，重启即失）
+#     3) /dev/null —— dnsmasq 默认值
+#
+#   只有确实改动过 dnsmasq 配置（log-facility 被改过 / logqueries 仍存在）时才重启 dnsmasq。
 # ===========================================================================
-log "还原 DNS 查询日志旁挂（uci delete）"
+log "还原 DNS 查询日志旁挂（/etc/dnsmasq.conf log-facility）"
+
+# --- 读取 /etc/dnsmasq.conf 当前的 log-facility 取值（只读） ---
+current_logfacility() {
+  [ -f "$DNS_CONF" ] || return 0
+  grep -m1 '^[[:space:]]*log-facility[[:space:]]*=' "$DNS_CONF" 2>/dev/null \
+    | sed -e 's/^[^=]*=//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# --- 取原值（只接受路径/设备名字符，非法值一律回退 /dev/null） ---
+original_logfacility() {
+  V=""
+  if [ -s "$LOGFAC_ORIG_FILE" ]; then
+    V=$(head -n1 "$LOGFAC_ORIG_FILE" 2>/dev/null | tr -d '\r')
+  fi
+  if [ -z "$V" ] && [ -s "$LOGFAC_ORIG_TMP" ]; then
+    V=$(head -n1 "$LOGFAC_ORIG_TMP" 2>/dev/null | tr -d '\r')
+  fi
+  case "$V" in
+    ""|*[!A-Za-z0-9_./-]*) echo "/dev/null" ;;
+    *) echo "$V" ;;
+  esac
+}
+
+# --- 把 log-facility 行写回指定值 ---
+write_logfacility() {
+  V="$1"
+  [ -f "$DNS_CONF" ] || return 1
+  sed -i 's#^[[:space:]]*log-facility[[:space:]]*=.*#log-facility='"$V"'#' "$DNS_CONF" 2>/dev/null || return 1
+  grep -q '^[[:space:]]*log-facility[[:space:]]*=' "$DNS_CONF" 2>/dev/null \
+    || echo "log-facility=$V" >> "$DNS_CONF"
+  return 0
+}
 
 # --- DNS 健康检查 ---
 dns_health_check() {
@@ -189,17 +239,54 @@ dns_restart_safe() {
   return 1
 }
 
+# --- 判断是否真的改动过 dnsmasq 配置 ---
+DNS_TOUCHED=0
+CUR_LOGFAC=$(current_logfacility)
+ORIG_LOGFAC=$(original_logfacility)
+
+if [ -n "$CUR_LOGFAC" ] && [ "$CUR_LOGFAC" != "$ORIG_LOGFAC" ]; then
+  DNS_TOUCHED=1
+  log "检测到 log-facility 被改为 $CUR_LOGFAC（原值 $ORIG_LOGFAC），需要还原"
+else
+  log "log-facility 未被改动（当前：${CUR_LOGFAC:-无该行}，原值：$ORIG_LOGFAC）"
+fi
+
 if command -v uci >/dev/null 2>&1; then
-  run_sh "uci delete ${UCI_SECTION}.${UCI_OPT_LOGQUERIES} 2>/dev/null"
-  run_sh "uci delete ${UCI_SECTION}.${UCI_OPT_LOGFACILITY} 2>/dev/null"
-  run_sh "uci commit dhcp"
-  log "已删除 UCI 旁挂选项并提交"
+  if uci get "${UCI_SECTION}.${UCI_OPT_LOGQUERIES}" >/dev/null 2>&1; then
+    DNS_TOUCHED=1
+    log "检测到 UCI ${UCI_SECTION}.${UCI_OPT_LOGQUERIES} 仍存在，需要清除"
+  fi
 else
   warn "系统缺少 uci，跳过 UCI 还原"
 fi
 
-dns_restart_safe
-DNS_HEALTH_RC=$?
+if [ "$DRY" = "1" ]; then
+  run_sh "sed -i 's#^[[:space:]]*log-facility[[:space:]]*=.*#log-facility=${ORIG_LOGFAC}#' ${DNS_CONF}"
+  run_sh "uci delete ${UCI_SECTION}.${UCI_OPT_LOGQUERIES} 2>/dev/null; uci commit dhcp"
+  if [ "$DNS_TOUCHED" = "1" ]; then
+    run_sh "/etc/init.d/dnsmasq stop >/dev/null 2>&1; sleep 1; /etc/init.d/dnsmasq start >/dev/null 2>&1"
+  fi
+  DNS_HEALTH_RC=0
+elif [ "$DNS_TOUCHED" = "1" ]; then
+  # 还原 log-facility（先写回原值，再重启 dnsmasq 让其生效）
+  if write_logfacility "$ORIG_LOGFAC"; then
+    log "已还原 $DNS_CONF 的 log-facility → $ORIG_LOGFAC"
+    # 备份已用完，删除（避免下次误用陈旧原值）
+    run_sh "rm -f $LOGFAC_ORIG_FILE"
+  else
+    warn "还原 $DNS_CONF 的 log-facility 失败，请人工检查（备份文件已保留：$LOGFAC_ORIG_FILE）"
+  fi
+  if command -v uci >/dev/null 2>&1; then
+    run_sh "uci delete ${UCI_SECTION}.${UCI_OPT_LOGQUERIES} 2>/dev/null"
+    run_sh "uci commit dhcp"
+  fi
+
+  dns_restart_safe
+  DNS_HEALTH_RC=$?
+else
+  log "未启用过 DNS 旁挂（dnsmasq 配置未被改动），不重启 dnsmasq"
+  DNS_HEALTH_RC=0
+fi
 
 # ===========================================================================
 # 5. 清理 iptables 自有链（UBM_*）——只删本项目的链
@@ -238,18 +325,54 @@ else
 fi
 
 # ===========================================================================
-# 6. 清理 tc 限速规则（尽力而为）
+# 6. 清理 tc 限速规则（只处理本项目用过的那几个，且先比对句柄）
+#
+#   本项目只创建过：
+#     br-lan  root    handle 1: htb   （下行限速）
+#     br-lan  ingress handle ffff:    （上行重定向到 ifb0）
+#     ifb0    root    handle 2: htb   （上行限速）
+#
+#   绝不能对所有网卡执行 tc qdisc del root/ingress —— 那会抹掉用户自己的
+#   SQM/QoS 队列（例如 WAN 口上的 cake）。所以先 tc qdisc show 比对句柄与类型，
+#   确认是本项目创建的才删除；不是就跳过并保留用户配置。
 # ===========================================================================
-log "清理 tc 限速规则（尽力而为）"
+log "清理 tc 限速规则（只处理 br-lan / ifb0，且先比对句柄）"
 if command -v tc >/dev/null 2>&1; then
-  for DEV in $(ls /sys/class/net 2>/dev/null); do
-    tc qdisc del dev "$DEV" root 2>/dev/null && log "已删除 $DEV root qdisc" || true
-    tc qdisc del dev "$DEV" handle ffff: ingress 2>/dev/null || true
-  done
-  if ip link show ifb0 >/dev/null 2>&1; then
-    ip link del ifb0 2>/dev/null && log "已删除 ifb0" || warn "删除 ifb0 失败"
+  # --- br-lan root：必须是 htb 且句柄为 1: 才认定为本项目的 ---
+  ROOT_OURS=0
+  if tc qdisc show dev "$TC_DEV_MAIN" 2>/dev/null | grep -q 'qdisc htb 1:'; then
+    ROOT_OURS=1
+    tc qdisc del dev "$TC_DEV_MAIN" root 2>/dev/null \
+      && log "已删除 $TC_DEV_MAIN root qdisc（htb 1:）" \
+      || warn "删除 $TC_DEV_MAIN root qdisc 失败"
   else
-    log "ifb0 不存在，跳过"
+    log "跳过 $TC_DEV_MAIN root qdisc（非本项目的 htb 1:，保留用户自己的 QoS）"
+  fi
+
+  # --- br-lan ingress：只有在本项目的 root 队列存在、且过滤器把流量重定向到 ifb0 时才删 ---
+  if [ "$ROOT_OURS" = "1" ] && \
+     tc filter show dev "$TC_DEV_MAIN" parent ffff: 2>/dev/null | grep -qi 'redirect.*ifb0'; then
+    tc qdisc del dev "$TC_DEV_MAIN" handle ffff: ingress 2>/dev/null \
+      && log "已删除 $TC_DEV_MAIN ingress qdisc" \
+      || warn "删除 $TC_DEV_MAIN ingress qdisc 失败"
+  else
+    log "跳过 $TC_DEV_MAIN ingress qdisc（未确认是本项目创建，保留用户自己的 QoS）"
+  fi
+
+  # --- ifb0：只删句柄 2: 的 htb；设备上还有别的队列（如用户 SQM）就整台保留 ---
+  if ip link show "$TC_DEV_IFB" >/dev/null 2>&1; then
+    if tc qdisc show dev "$TC_DEV_IFB" 2>/dev/null | grep -q 'qdisc htb 2:'; then
+      tc qdisc del dev "$TC_DEV_IFB" root 2>/dev/null \
+        && log "已删除 $TC_DEV_IFB root qdisc（htb 2:）" \
+        || warn "删除 $TC_DEV_IFB root qdisc 失败"
+    fi
+    if tc qdisc show dev "$TC_DEV_IFB" 2>/dev/null | grep -q .; then
+      log "$TC_DEV_IFB 上仍有其它队列（可能是用户自己的 SQM/QoS），保留该设备"
+    else
+      ip link del "$TC_DEV_IFB" 2>/dev/null && log "已删除 $TC_DEV_IFB" || warn "删除 $TC_DEV_IFB 失败"
+    fi
+  else
+    log "$TC_DEV_IFB 不存在，跳过"
   fi
 else
   warn "无 tc，跳过"
@@ -257,8 +380,19 @@ fi
 
 # ===========================================================================
 # 7. 清理运行时临时目录
+#
+#   /tmp/guanlan 里可能有后端运行时写的 logfacility.orig（tmpfs，重启即失）。
+#   先把它转存到持久目录，再删运行目录 —— 否则原值备份会跟着一起消失。
 # ===========================================================================
 log "清理运行目录 $RUN_DIR"
+if [ "$DRY" != "1" ] && [ -s "$LOGFAC_ORIG_TMP" ] && [ ! -s "$LOGFAC_ORIG_FILE" ]; then
+  NOW_LOGFAC=$(current_logfacility)
+  if [ -n "$NOW_LOGFAC" ] && [ "$NOW_LOGFAC" != "$ORIG_LOGFAC" ]; then
+    # 还原尚未生效（失败）：把原值备份转存到持久目录，别让它随 /tmp 一起消失
+    cp -f "$LOGFAC_ORIG_TMP" "$LOGFAC_ORIG_FILE" 2>/dev/null \
+      && log "已把 log-facility 原值转存到 $LOGFAC_ORIG_FILE"
+  fi
+fi
 run_sh "rm -rf $RUN_DIR 2>/dev/null" && log "已删除 $RUN_DIR" || warn "删除 $RUN_DIR 失败"
 
 # ===========================================================================
@@ -288,7 +422,7 @@ if [ "$DRY" = "1" ]; then
   run_sh "pidof $APP_NAME || echo '[DRY] 无 $APP_NAME 进程'"
   run_sh "ls -l $BIN_DST $INIT_SCRIPT $CONF_DIR 2>&1 || true"
   run_sh "uci get ${UCI_SECTION}.${UCI_OPT_LOGQUERIES} 2>/dev/null || echo '[DRY] logqueries 已为空'"
-  run_sh "uci get ${UCI_SECTION}.${UCI_OPT_LOGFACILITY} 2>/dev/null || echo '[DRY] logfacility 已为空'"
+  run_sh "grep -n 'log-facility' ${DNS_CONF} 2>/dev/null || echo '[DRY] 无 log-facility 行'"
   run_sh "iptables -S 2>/dev/null | grep '^UBM_' || echo '[DRY] 无 UBM_* 链'"
   run_sh "nslookup www.baidu.com 127.0.0.1 >/dev/null 2>&1 && echo '[DRY] nslookup 正常' || echo '[DRY] nslookup 失败'"
   echo "============================================================"
@@ -342,13 +476,15 @@ if command -v uci >/dev/null 2>&1; then
   else
     echo "  [ OK ] UCI logqueries 已清除"
   fi
-  F=$(uci get "${UCI_SECTION}.${UCI_OPT_LOGFACILITY}" 2>/dev/null)
-  if [ -n "$F" ]; then
-    echo "  [FAIL] UCI logfacility 仍存在：$F"
-    FAIL=1
-  else
-    echo "  [ OK ] UCI logfacility 已清除"
-  fi
+fi
+
+# /etc/dnsmasq.conf 的 log-facility 还原确认（后端旁挂改的就是这一行）
+NOW_LOGFAC=$(current_logfacility)
+if [ -n "$NOW_LOGFAC" ] && [ "$NOW_LOGFAC" != "$ORIG_LOGFAC" ]; then
+  echo "  [FAIL] log-facility 未还原：当前 $NOW_LOGFAC（原值 $ORIG_LOGFAC）"
+  FAIL=1
+else
+  echo "  [ OK ] log-facility 已还原（${NOW_LOGFAC:-无该行}）"
 fi
 
 # dnsmasq 健康与解析验证
@@ -369,10 +505,16 @@ else
   echo "  [SKIP] 无 nslookup，跳过解析验证"
 fi
 
+# dnsmasq 重启后的健康检查退出码必须纳入最终判定（此前被丢弃）
+if [ "$DNS_HEALTH_RC" != "0" ]; then
+  echo "  [FAIL] dnsmasq 重启后健康检查未通过（已做过紧急恢复，仍异常）"
+  FAIL=1
+fi
+
 echo "============================================================"
 if [ "$FAIL" = "0" ]; then
   echo " 卸载完成，路由器无残留。"
-  echo " DNS 旁挂选项已清除，dnsmasq 日志去向恢复为系统默认（/dev/null）。"
+  echo " DNS 旁挂已还原：UCI logqueries 已清除，/etc/dnsmasq.conf 的 log-facility 已回到原值。"
   exit 0
 else
   echo " 存在残留，请检查上面的 [FAIL] 项。"

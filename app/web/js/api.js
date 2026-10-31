@@ -95,8 +95,13 @@ async function request(path, { method = 'GET', body, query, skip401 = false } = 
   if (res.status === 401) {
     // 登录接口自身的 401 = 密码错误，不应触发"会话失效"全局处理
     // （否则登录页会同时出现「登录已失效」与「密码错误」两条矛盾提示）
-    if (!skip401) handleUnauthorized();
-    throw makeError('密码错误', 'unauthorized', 401);
+    // 其余接口的 401 语义由后端 error 字段区分：unauthorized=会话失效，bad_password=密码错误
+    const code = (data && data.code) || '';
+    if (!skip401 && code !== 'bad_password') handleUnauthorized();
+    const msg = code === 'bad_password' ? '密码错误'
+      : code === 'unauthorized' ? '登录已失效，请重新登录'
+      : (data && data.error) || '未授权';
+    throw makeError(msg, code || 'unauthorized', 401);
   }
   if (!res.ok) {
     const msg = (data && data.error) || `请求失败（HTTP ${res.status}）`;
@@ -1383,7 +1388,7 @@ export const SWITCH_DEFS = [
   { key: 'domainBlock', name: '域名封堵', icon: 'ban', desc: '不开启则不拦截域名' },
   { key: 'schedule', name: '定时策略', icon: 'clock', desc: '不开启则不按时间窗自动启停' },
   { key: 'alerts', name: '安全告警', icon: 'alert', desc: '不开启则不做风险研判' },
-  { key: 'history', name: '历史统计', icon: 'layers', desc: '不开启则只保留实时数据' }
+  { key: 'history', name: '历史统计', icon: 'layers', desc: '关闭后不再落盘历史统计文件（近期曲线仍可查）' }
 ];
 
 /** 关闭某开关需要撤销已下发规则（需要二次确认） */

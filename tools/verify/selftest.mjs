@@ -318,13 +318,15 @@ if (authed) {
   }
 
   // --- ⑥ 通过 PUT 逐个开启子开关后，数据应恢复 ---
+  // 注意：这里**不能**开启 dnsTap —— 该开关会改写 /etc/dnsmasq.conf 并重启 dnsmasq
+  //（造成 1~2 秒全网 DNS 空窗），与本自检「不改系统状态」的约定冲突。
   try {
     const p = await req('PUT', `${base}/api/settings`, {
-      enabled: true, collect: true, alerts: true, history: true, dnsTap: true,
+      enabled: true, collect: true, alerts: true, history: true,
     });
     const okP = p.status === 200;
     addRow('PUT /api/settings（开启子开关）', '/api/settings',
-      'HTTP 200，接受 enabled/collect/alerts/history/dnsTap 子集',
+      'HTTP 200，接受 enabled/collect/alerts/history 子集（不含 dnsTap）',
       `HTTP ${p.status} ${clip(p.text, 160)}`, okP);
     snippets['PUT /api/settings（开启子开关）'] = { status: p.status, body: p.json ?? clip(p.text, 300) };
   } catch (e) {

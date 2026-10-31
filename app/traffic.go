@@ -138,7 +138,10 @@ const (
 
 // Agg 流量聚合器。
 type Agg struct {
-	mu         sync.Mutex
+	mu sync.Mutex
+	// sinkMu 串行化 sink 调用：sink 在 mu 之外执行（磁盘 IO 不能阻塞读 Agg 的 API），
+	// 但仍需保证同一时刻只有一个落盘写。
+	sinkMu     sync.Mutex
 	maxBuckets int
 	maxConns   int
 
@@ -159,6 +162,11 @@ type Agg struct {
 	iPath      map[string][2]int64
 
 	last IntervalRates
+
+	// scale 校准系数：conntrack 归因统计与物理接口速率的比例（由 App 用接口计数校准）。
+	// conntrack 在 UDP 打洞/端口复用场景下会重复计入，绝对值不可信；
+	// 这里用它做「相对权重」，乘以系数后锚定到物理真实速率。
+	scale float64
 
 	conns        map[string]*Connection
 	newConnTimes []int64
@@ -216,7 +224,11 @@ func (g *Agg) AddPathBytes(path string, up, down int64) {
 }
 
 // SetSink 设置分钟桶落盘回调。
-func (g *Agg) SetSink(fn func(*Bucket)) { g.sink = fn }
+func (g *Agg) SetSink(fn func(*Bucket)) {
+	g.mu.Lock()
+	g.sink = fn
+	g.mu.Unlock()
+}
 
 // SetMaxBuckets 调整保留桶数（演示模式预填历史时使用）。
 func (g *Agg) SetMaxBuckets(n int) {
@@ -247,25 +259,38 @@ func timeNowMinute() int64 {
 	return nowUnix() / 60 * 60
 }
 
-// ensureBucketLocked 返回当前分钟桶；跨分钟时封存旧桶。
-func (g *Agg) ensureBucketLocked(now int64) *Bucket {
+// sealBucketLocked 跨分钟时封存当前分钟桶，返回被封存的桶（nil 表示未跨分钟）。
+// 落盘（sink）不在这里做：由调用方在锁外调用 flushSink，避免磁盘 IO 阻塞读 Agg 的 API。
+// 没有数据的分钟不创建空桶（与原行为一致），有数据时由 AddDelta 创建。
+func (g *Agg) sealBucketLocked(now int64) *Bucket {
 	minute := now / 60 * 60
-	if g.cur != nil && g.cur.T == minute {
-		return g.cur
+	if g.cur == nil || g.cur.T == minute {
+		return nil
 	}
-	if g.cur != nil {
-		old := g.cur
-		g.buckets = append(g.buckets, old)
-		if len(g.buckets) > g.maxBuckets {
-			drop := len(g.buckets) - g.maxBuckets
-			g.buckets = append([]*Bucket(nil), g.buckets[drop:]...)
-		}
-		if g.sink != nil {
-			g.sink(old.Clone())
-		}
+	old := g.cur
+	g.cur = nil
+	g.buckets = append(g.buckets, old)
+	if len(g.buckets) > g.maxBuckets {
+		drop := len(g.buckets) - g.maxBuckets
+		g.buckets = append([]*Bucket(nil), g.buckets[drop:]...)
 	}
-	g.cur = newBucket(minute)
-	return g.cur
+	return old
+}
+
+// flushSink 落盘分钟桶（必须在 g.mu 之外调用）。
+func (g *Agg) flushSink(b *Bucket) {
+	if b == nil {
+		return
+	}
+	g.mu.Lock()
+	fn := g.sink
+	g.mu.Unlock()
+	if fn == nil {
+		return
+	}
+	g.sinkMu.Lock()
+	defer g.sinkMu.Unlock()
+	fn(b.Clone())
 }
 
 // AddDelta 累加一段流量增量。cat 为分类键，domain 可为空。
@@ -277,8 +302,12 @@ func (g *Agg) AddDelta(devIP, dstIP, cat, domain string, up, down, now int64) {
 		cat = "other"
 	}
 	g.mu.Lock()
-	defer g.mu.Unlock()
-	b := g.ensureBucketLocked(now)
+	sealed := g.sealBucketLocked(now)
+	b := g.cur
+	if b == nil {
+		b = newBucket(now / 60 * 60)
+		g.cur = b
+	}
 	b.Up += up
 	b.Down += down
 	b.CatUp[cat] += up
@@ -331,6 +360,9 @@ func (g *Agg) AddDelta(devIP, dstIP, cat, domain string, up, down, now int64) {
 			g.iDevDomain[devIP][domain] = dd
 		}
 	}
+	g.mu.Unlock()
+	// 落盘在锁外做：磁盘 IO 不阻塞读 Agg 的 API
+	g.flushSink(sealed)
 }
 
 // UpsertConn 更新/新建连接明细（有容量上限）。
@@ -415,13 +447,15 @@ func (g *Agg) DropConn(key string) {
 
 // Tick 结算一个采样周期：计算速率、追加趋势点、清理过期连接。
 // intervalSec 为采样间隔秒数。
+// 同时显式封存分钟桶：即使本周期没有新流量，跨分钟也会把上一分钟封存并落盘
+// （否则收尾分钟永远不会落盘，进程重启即丢）。
 func (g *Agg) Tick(intervalSec, now int64) IntervalRates {
 	if intervalSec <= 0 {
 		intervalSec = 2
 	}
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	div := intervalSec
+	sealed := g.sealBucketLocked(now)
 
 	r := IntervalRates{
 		UpBps:           g.iUp * 8 / div,
@@ -510,17 +544,83 @@ func (g *Agg) Tick(intervalSec, now int64) IntervalRates {
 
 	g.last = r
 	g.resetIntervalLocked()
+	g.mu.Unlock()
+	// 落盘在锁外做：磁盘 IO 不阻塞读 Agg 的 API
+	g.flushSink(sealed)
 	return r
 }
 
-// LastRates 最近一次速率快照（map 只读）。
-func (g *Agg) LastRates() IntervalRates {
+// SetScale 设置校准系数（conntrack 权重 → 物理速率的比例）。
+func (g *Agg) SetScale(f float64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if f <= 0 || f > 1e9 {
+		return
+	}
+	g.scale = f
+}
+
+// RawRates 返回未经校准缩放的原始速率快照（用于计算校准系数）。
+func (g *Agg) RawRates() IntervalRates {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.last
 }
 
-// RecentTrend 最近趋势点（最多 60 个）。
+// Scale 当前校准系数。
+func (g *Agg) Scale() float64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.scale <= 0 {
+		return 1
+	}
+	return g.scale
+}
+
+// LastRates 最近一次速率快照（map 只读）。返回前按校准系数缩放到物理真实量级。
+func (g *Agg) LastRates() IntervalRates {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	r := g.last
+	if g.scale > 0 && g.scale != 1 {
+		r.UpBps = int64(float64(r.UpBps) * g.scale)
+		r.DownBps = int64(float64(r.DownBps) * g.scale)
+		r.CatBps = scalePairs(r.CatBps, g.scale)
+		r.DevBps = scalePairs(r.DevBps, g.scale)
+		r.DomainBps = scalePairs(r.DomainBps, g.scale)
+		r.DstBps = scalePairs(r.DstBps, g.scale)
+		r.PathBps = scalePairs(r.PathBps, g.scale)
+		r.DevCatBps = scaleDevCats(r.DevCatBps, g.scale)
+		r.DevDomainBps = scaleDevCats(r.DevDomainBps, g.scale)
+	}
+	return r
+}
+
+// scalePairs 按系数缩放 [2]int64 映射。
+func scalePairs(m map[string][2]int64, f float64) map[string][2]int64 {
+	if len(m) == 0 {
+		return m
+	}
+	out := make(map[string][2]int64, len(m))
+	for k, v := range m {
+		out[k] = [2]int64{int64(float64(v[0]) * f), int64(float64(v[1]) * f)}
+	}
+	return out
+}
+
+// scaleDevCats 按系数缩放 嵌套的 [2]int64 映射。
+func scaleDevCats(m map[string]map[string][2]int64, f float64) map[string]map[string][2]int64 {
+	if len(m) == 0 {
+		return m
+	}
+	out := make(map[string]map[string][2]int64, len(m))
+	for dev, cats := range m {
+		out[dev] = scalePairs(cats, f)
+	}
+	return out
+}
+
+// RecentTrend 最近趋势点（最多 60 个）。已按校准系数缩放。
 func (g *Agg) RecentTrend(limit int) []TrendPoint {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -529,6 +629,12 @@ func (g *Agg) RecentTrend(limit int) []TrendPoint {
 	}
 	out := make([]TrendPoint, limit)
 	copy(out, g.recent[len(g.recent)-limit:])
+	if g.scale > 0 && g.scale != 1 {
+		for i := range out {
+			out[i].Up = int64(float64(out[i].Up) * g.scale)
+			out[i].Down = int64(float64(out[i].Down) * g.scale)
+		}
+	}
 	return out
 }
 

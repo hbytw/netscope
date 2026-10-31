@@ -9,7 +9,8 @@ package main
 //   - ThreatFox Community API 需要 Auth-Key（401），通过环境变量 THREATFOX_AUTH_KEY
 //     配置后启用；未配置时跳过并记录 warning，其余公开源照常更新。
 //   - URLhaus/Feodo/Spamhaus 使用公开镜像/导出；PhishTank 需 API key（403）暂不启用。
-//   - 加载上限：域名 50000、IP/CIDR 30000；超限按 confidence 降序截断保留高置信度。
+//   - 加载上限：域名 50000、IP/CIDR 30000；超限按 confidence 降序截断保留高置信度，
+//     但内置 curated 规则（内置黑名单）标记为不可裁剪，始终保留。
 
 import (
 	"bufio"
@@ -573,13 +574,37 @@ func mergeThreatRulesWithBase(baseD, baseI, fetchedD, fetchedI []ThreatRule) ([]
 	return doms, ips
 }
 
+// isCuratedRule 判断是否为内置 curated 规则（内置黑名单：矿池/赌博域名）。
+// 这类规则置信度为 0（未知），但按"内置黑名单始终保留"的约定不可被裁剪。
+func isCuratedRule(r ThreatRule) bool {
+	return strings.HasPrefix(r.Source, "内置黑名单")
+}
+
 // truncateByConfidence 超限时按置信度降序保留（同置信度保留原顺序），再按需截断。
+// 内置 curated 规则标记为不可裁剪：即使置信度为 0 也始终保留，
+// 并为它们预留名额（总条数仍不超过 max）。
 func truncateByConfidence(rules []ThreatRule, max int) []ThreatRule {
-	sort.SliceStable(rules, func(i, j int) bool { return rules[i].Confidence > rules[j].Confidence })
-	if len(rules) > max {
-		rules = rules[:max]
+	keep := make([]ThreatRule, 0, len(rules))
+	trim := make([]ThreatRule, 0, len(rules))
+	for _, r := range rules {
+		if isCuratedRule(r) {
+			keep = append(keep, r)
+			continue
+		}
+		trim = append(trim, r)
 	}
-	return rules
+	sort.SliceStable(trim, func(i, j int) bool { return trim[i].Confidence > trim[j].Confidence })
+	limit := max - len(keep)
+	if limit < 0 {
+		limit = 0
+	}
+	if len(trim) > limit {
+		trim = trim[:limit]
+	}
+	out := make([]ThreatRule, 0, len(keep)+len(trim))
+	out = append(out, keep...)
+	out = append(out, trim...)
+	return out
 }
 
 // saveThreatFile 原子写 threats.json（tmp + rename）。

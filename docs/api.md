@@ -302,7 +302,7 @@ q 非空时**只返回匹配项**（不返回分页列表）：
 | `domainBlock` | 域名封堵 | 不写 ipset、不下发 iptables 拦截规则 | 需 `enabled` + `collect`（需域名归因） |
 | `schedule` | 定时策略 | 不按时间窗自动启停规则 | 需 `enabled` + `deviceControl` |
 | `alerts` | 安全告警 | 不做规则研判、不产生事件（历史事件仍保留可查） | 需 `enabled` + `collect` |
-| `history` | 历史统计 | 不写 1min 桶 JSONL、不保留历史曲线（仅实时） | 需 `enabled` + `collect` |
+| `history` | 历史统计 | 停止写入 1min 桶 JSONL（不再落盘历史统计文件；内存中的近期曲线仍可查） | 需 `enabled` + `collect` |
 
 **开关变更的安全规则**：
 - 关闭任何开关时，**必须同步撤销该开关已经下发的一切规则**（iptables/ipset/tc/dnsmasq），回到"从未开启"的状态；

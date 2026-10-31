@@ -41,6 +41,8 @@ APP_ADDR="0.0.0.0:8088"
 start_service() {
     # /tmp 是 tmpfs，重启即失，每次启动都要确保目录存在
     mkdir -p "$APP_RUNDIR" "$DNS_LOG_DIR" "$APP_DATA" "$APP_LOG_DIR" 2>/dev/null
+    # dnsmasq 以 dnsmasq 用户运行，必须能写入 DNS 日志目录
+    chown dnsmasq:dnsmasq "$DNS_LOG_DIR" 2>/dev/null || chmod 0777 "$DNS_LOG_DIR" 2>/dev/null
 
     procd_open_instance
     procd_set_param command "$APP_BIN" \\
@@ -50,7 +52,7 @@ start_service() {
     # 崩溃自动重启：3600 秒窗口内最多重启 5 次，间隔 5 秒
     procd_set_param respawn 3600 5 5
     procd_set_param limits nofile="4096 4096"
-    procd_set_param stdout 1
+    procd_set_param stdout /var/log/guanlan.log
     procd_set_param stderr 1
     procd_close_instance
 }
@@ -219,10 +221,23 @@ def build_ipk(bin_path, version, arch, out_dir):
     return ipk_path, tgz_path
 
 
+def default_version():
+    """版本号单一来源：app/version.txt（构建时读取）。"""
+    vf = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app", "version.txt")
+    try:
+        with open(vf, "r", encoding="utf-8") as f:
+            v = f.read().strip()
+            if v:
+                return v
+    except OSError:
+        pass
+    return "1.0.0"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default=os.path.join(ROOT, "dist", "guanlan"))
-    ap.add_argument("--version", default="1.0.0")
+    ap.add_argument("--version", default=default_version())
     ap.add_argument("--arch", default="aarch64_generic")
     ap.add_argument("--out", default=os.path.join(ROOT, "dist"))
     a = ap.parse_args()

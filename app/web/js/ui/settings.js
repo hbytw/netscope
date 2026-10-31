@@ -11,7 +11,7 @@ import {
 } from './components.js';
 import { formatDuration, formatNumber, formatTime } from './format.js';
 import {
-  SWITCH_DEFS, REVOKE_SWITCHES, subscribeSettings, refreshSettings, setSwitch
+  SWITCH_DEFS, REVOKE_SWITCHES, subscribeSettings, refreshSettings, setSwitch, putSettings
 } from '../api.js';
 
 export async function mount(host, ctx) {
@@ -176,6 +176,7 @@ export async function mount(host, ctx) {
     // DNS 旁挂（历史字段）跟随 dnsTap 开关
     if (dnsSwitch && typeof s.dnsTap === 'boolean') {
       dnsSwitch.getEl().checked = enabled && s.dnsTap;
+      dnsSwitch.getEl().disabled = !enabled;
       dnsWarn.classList.toggle('hidden', !(enabled && s.dnsTap));
       dnsDesc.textContent = (enabled && s.dnsTap)
         ? '已开启：dnsmasq 会在查询日志中记录完整域名，用于域名分类与黑名单拦截。'
@@ -185,7 +186,9 @@ export async function mount(host, ctx) {
 
   /* ---------- 采集与留存 ---------- */
   const intervalInput = h('input', { class: 'input num', type: 'number', min: '1', max: '60', step: '1' });
-  const retentionInput = h('input', { class: 'input num', type: 'number', min: '1', max: '365', step: '1' });
+  // 后端只接受 1~90 天，超出会直接 400
+  const retentionInput = h('input', { class: 'input num', type: 'number', min: '1', max: '90', step: '1' });
+  const retentionHint = h('span', { class: 'field-hint', text: '到期数据由后台清理任务自动回收。可设置 1~90 天。' });
   const dataDirEl = h('span', { class: 'v mono', text: '—' });
   const versionEl = h('span', { class: 'v', text: '—' });
 
@@ -205,7 +208,7 @@ export async function mount(host, ctx) {
           h('div', { class: 'field' }, [
             h('label', { class: 'field-label' }, [h('span', { text: '数据留存（天）' })]),
             retentionInput,
-            h('span', { class: 'field-hint', text: '到期数据由后台清理任务自动回收。' })
+            retentionHint
           ])
         ]),
         h('div', { class: 'g6' }, [
@@ -230,12 +233,9 @@ export async function mount(host, ctx) {
   dnsSwitch = switchControl({
     checked: true,
     label: '启用 dnsmasq 旁挂',
-    onChange: (v) => {
-      dnsWarn.classList.toggle('hidden', !v);
-      dnsDesc.textContent = v
-        ? '已开启：dnsmasq 会在查询日志中记录完整域名，用于域名分类与黑名单拦截。'
-        : '已关闭：仅能基于 IP 分类，域名统计与黑名单拦截将不可用。';
-    }
+    // 真正生效的是后端 dnsTap 开关（功能开关列表里的「DNS 行为日志」也是同一个 key），
+    // 这里必须调用 setSwitch，否则拨动无效且会被下一次刷新悄悄拨回
+    onChange: (v) => onSwitchChange('dnsTap', v, dnsSwitch)
   });
   const dnsCard = card({
     title: 'DNS 旁挂',
@@ -385,11 +385,22 @@ export async function mount(host, ctx) {
   ]);
 
   saveBtn.addEventListener('click', async () => {
+    // 前端先做区间校验，避免必然 400 的请求
+    const retention = Number(retentionInput.value);
+    if (!Number.isFinite(retention) || retention < 1 || retention > 90) {
+      retentionHint.textContent = '数据留存天数需在 1~90 之间。';
+      retentionHint.style.color = 'var(--crit)';
+      retentionInput.focus();
+      toast('数据留存天数需在 1~90 之间', 'error');
+      return;
+    }
+    retentionHint.textContent = '到期数据由后台清理任务自动回收。可设置 1~90 天。';
+    retentionHint.style.color = '';
     saveBtn.classList.add('is-loading');
     try {
       const payload = {
         collectIntervalSec: Number(intervalInput.value) || 2,
-        retentionDays: Number(retentionInput.value) || 14,
+        retentionDays: retention,
         alert: {
           enable: alertEnable.getEl().checked,
           scanPorts: Number(scanPortsInput.value) || 20,

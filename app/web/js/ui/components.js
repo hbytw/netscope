@@ -15,7 +15,15 @@ export function h(tag, attrs = {}, children = []) {
     if (k === 'class') el.className = v;
     else if (k === 'html') el.innerHTML = v;
     else if (k === 'text') el.textContent = v;
-    else if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
+    else if (k === 'style' && typeof v === 'object') {
+      // CSS 自定义属性（--c / --sem）必须走 setProperty：
+      // Object.assign(el.style, v) 对自定义属性无效（分类配色、风险色、在线圆点会全部退化为回退色）
+      for (const [sk, sv] of Object.entries(v)) {
+        if (sv === null || sv === undefined) continue;
+        if (sk.startsWith('--')) el.style.setProperty(sk, sv);
+        else el.style[sk] = sv;
+      }
+    }
     else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2).toLowerCase(), v);
     else if (k === 'dataset') for (const [dk, dv] of Object.entries(v)) el.dataset[dk] = dv;
     else el.setAttribute(k, v === true ? '' : String(v));
@@ -196,7 +204,7 @@ export function switchControl({ checked = false, label = '', onChange, disabled 
 
 /**
  * 可排序 / 可搜索 / 空态 / 骨架屏的表格。
- * @returns {HTMLElement & {setRows, setLoading, setQuery, setSort}}
+ * @returns {HTMLElement & {setRows, setLoading, setQuery, setSort, setPage, getPage}}
  */
 export function table({ columns, rows = [], empty = '暂无数据', emptyIcon = ICONS.list, searchable = false, onRowClick, sortKey, sortDir = 'desc', pageSize = 0, rowClass }) {
   const wrap = h('div', { class: 'table-wrap' });
@@ -309,6 +317,9 @@ export function table({ columns, rows = [], empty = '暂无数据', emptyIcon = 
     setLoading(on) { state.loading = !!on; render(); },
     setQuery(q) { state.query = q || ''; state.page = 1; render(); },
     setSort(key, dir = 'desc') { state.sortKey = key; state.sortDir = dir; render(); },
+    /** 跳转到指定页（外部翻页入口；内部按 pageSize 切片） */
+    setPage(p) { state.page = Math.max(1, Number(p) || 1); render(); },
+    getPage() { return state.page; },
     getRows() { return state.rows; },
     refresh: render,
     __onPage: null
@@ -591,6 +602,9 @@ export function pager({ onChange }) {
       st.page = page; st.pages = Math.max(1, pages); st.total = total;
       render();
     },
+    /** 当前页码（供外部读取，避免依赖内部状态） */
+    getPage() { return st.page; },
+    getPages() { return st.pages; },
     prev() { if (st.page > 1) { st.page--; render(); if (onChange) onChange(st.page); } },
     next() { if (st.page < st.pages) { st.page++; render(); if (onChange) onChange(st.page); } }
   };

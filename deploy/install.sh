@@ -9,15 +9,22 @@
 # 特性：
 #   * 幂等：可重复运行，已安装时覆盖升级，不破坏用户改过的密码
 #   * 安全：二进制先落 /tmp 校验再原子 mv 到 /usr/sbin，避免 overlay 写一半断电损坏
-#   * 可回滚：DNS 旁挂失败自动 uci delete 回滚并恢复 dnsmasq，服务本体安装不受影响
-#   * 最小改动：DNS 旁挂走 UCI 原生选项，不改 /etc/dnsmasq.conf、不加 conf-dir 文件
+#   * 可回滚：DNS 旁挂失败自动还原并恢复 dnsmasq，服务本体安装不受影响
+#   * 最小改动：安装时不改 dnsmasq 配置（旁挂由设置页开关控制）；
 #     不改上游 DNS / 网络接口 / lan 区配置
 #
-# DNS 旁挂实现（原生可逆）：
-#   dhcp.@dnsmasq[0].logqueries=1              → --log-queries=extra
-#   dhcp.@dnsmasq[0].logfacility=<路径>        → --log-facility
+# DNS 旁挂机制（与后端 app/dns.go ApplyDNSTap 完全一致）：
+#   开启：uci set dhcp.@dnsmasq[0].logqueries=1 → uci commit dhcp
+#         把 /etc/dnsmasq.conf 的 log-facility 行改成 /tmp/guanlan/dnsmasq.log
+#         （原值备份到 /tmp/guanlan/logfacility.orig）→ stop + start dnsmasq
+#   关闭：uci delete logqueries + 把 log-facility 行写回原值 → stop + start dnsmasq
 #   该固件 ubus call dnsmasq reload 不存在；/etc/init.d/dnsmasq reload 有 bug
 #   （停得掉起不来 → 全网 DNS 中断），故只用 stop + start。
+#
+# 安装脚本本身不启用旁挂、不改 dnsmasq 配置，只做一件事：
+#   把 /etc/dnsmasq.conf 的 log-facility 原值备份到持久目录
+#   $DATA_DIR/logfacility.orig —— 供 uninstall.sh / rollback.sh 还原用
+#   （/tmp/guanlan 是 tmpfs，重启即失，不能只存在那里）。
 #
 set -u
 
@@ -45,12 +52,14 @@ LISTEN_ADDR="0.0.0.0:${PORT}"
 DATA_PATH="${DATA_DIR}/data"
 LOG_DIR="${DATA_DIR}/logs"
 
-# --- DNS 旁挂（UCI 原生选项） ---
+# --- DNS 旁挂（与后端 ApplyDNSTap 一致：改写 /etc/dnsmasq.conf 的 log-facility） ---
 DNS_LOG_DIR="/tmp/${APP_NAME}"
 DNS_LOG="${DNS_LOG_DIR}/dnsmasq.log"
+DNS_CONF="/etc/dnsmasq.conf"
+# log-facility 原值的持久备份（卸载/回退时按它还原；/tmp 是 tmpfs，重启即失）
+LOGFAC_ORIG_FILE="${DATA_DIR}/logfacility.orig"
 UCI_SECTION="dhcp.@dnsmasq[0]"
 UCI_OPT_LOGQUERIES="logqueries"
-UCI_OPT_LOGFACILITY="logfacility"
 
 DEFAULT_PASSWORD="${GUANLAN_DEFAULT_PASSWORD:-guanlan2026}"
 LAN_IP="${GUANLAN_LAN_IP:-192.168.1.254}"
@@ -93,6 +102,43 @@ run_in() {
     return 0
   fi
   sh -c "$1" 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# dnsmasq.conf 的 log-facility 读写（与后端 app/dns.go 同一套语义）
+# ---------------------------------------------------------------------------
+
+# --- 读取当前 log-facility 取值（只读） ---
+current_logfacility() {
+  [ -f "$DNS_CONF" ] || return 0
+  grep -m1 '^[[:space:]]*log-facility[[:space:]]*=' "$DNS_CONF" 2>/dev/null \
+    | sed -e 's/^[^=]*=//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# --- 取原值（只接受路径/设备名字符，非法值回退 /dev/null） ---
+original_logfacility() {
+  V=""
+  if [ -s "$LOGFAC_ORIG_FILE" ]; then
+    V=$(head -n1 "$LOGFAC_ORIG_FILE" 2>/dev/null | tr -d '\r')
+  fi
+  case "$V" in
+    ""|*[!A-Za-z0-9_./-]*) echo "/dev/null" ;;
+    *) echo "$V" ;;
+  esac
+}
+
+# --- 把 log-facility 行写回指定值 ---
+write_logfacility() {
+  V="$1"
+  if [ "$DRY" = "1" ]; then
+    echo "[DRY] 写回 $DNS_CONF 的 log-facility → $V"
+    return 0
+  fi
+  [ -f "$DNS_CONF" ] || return 1
+  sed -i 's#^[[:space:]]*log-facility[[:space:]]*=.*#log-facility='"$V"'#' "$DNS_CONF" 2>/dev/null || return 1
+  grep -q '^[[:space:]]*log-facility[[:space:]]*=' "$DNS_CONF" 2>/dev/null \
+    || echo "log-facility=$V" >> "$DNS_CONF"
+  return 0
 }
 
 # ===========================================================================
@@ -148,6 +194,41 @@ for d in $DATA_SUBDIRS; do
   run_sh "mkdir -p ${DATA_DIR}/${d}" || warn "创建 ${DATA_DIR}/${d} 失败"
 done
 run_sh "mkdir -p $RUN_DIR $DNS_LOG_DIR" || warn "创建运行目录失败"
+# dnsmasq 以 dnsmasq 用户运行，必须能写入 DNS 日志目录（否则日志文件创建失败、
+# 轮转后变成 *.log.old 且新文件缺失，域名归因随之失效）
+run_sh "chown dnsmasq:dnsmasq $DNS_LOG_DIR 2>/dev/null || chmod 0777 $DNS_LOG_DIR" || warn "设置 DNS 日志目录权限失败"
+
+# ---------------------------------------------------------------------------
+# 2.5 备份 /etc/dnsmasq.conf 的 log-facility 原值（供卸载/回退还原）
+#
+#   后端开启 DNS 旁挂时改写的就是这一行，原值必须留底，否则还原不回来。
+#   /tmp/guanlan/logfacility.orig 是 tmpfs（重启即失），所以这里另存一份到
+#   持久分区 $DATA_DIR/logfacility.orig。
+#
+#   只在「还没有备份」且「当前值不是旁挂路径」时写备份：
+#   重装时若 /etc/dnsmasq.conf 已被旁挂改写，绝不能把旁挂路径当成原值。
+# ---------------------------------------------------------------------------
+if [ "$DRY" = "1" ]; then
+  run_sh "echo '[DRY] 将把 /etc/dnsmasq.conf 的 log-facility 原值备份到 ${LOGFAC_ORIG_FILE}'"
+elif [ -s "$LOGFAC_ORIG_FILE" ]; then
+  log "log-facility 原值备份已存在：$LOGFAC_ORIG_FILE（保持不变）"
+else
+  CUR_LOGFAC=$(current_logfacility)
+  case "$CUR_LOGFAC" in
+    "$DNS_LOG")
+      log "检测到 $DNS_CONF 已被旁挂改写（$DNS_LOG），跳过备份以免覆盖原值"
+      ;;
+    ""|*[!A-Za-z0-9_./-]*)
+      # 没有该行或取值异常：dnsmasq 默认走 /dev/null
+      printf '%s\n' "/dev/null" > "$LOGFAC_ORIG_FILE" 2>/dev/null \
+        && log "log-facility 原值备份（默认 /dev/null）→ $LOGFAC_ORIG_FILE"
+      ;;
+    *)
+      printf '%s\n' "$CUR_LOGFAC" > "$LOGFAC_ORIG_FILE" 2>/dev/null \
+        && log "log-facility 原值备份：$CUR_LOGFAC → $LOGFAC_ORIG_FILE"
+      ;;
+  esac
+fi
 
 # ===========================================================================
 # 3. 安装二进制（先校验，再原子替换）
@@ -302,6 +383,7 @@ PROG="${APP_NAME}"
 APP_BIN="/usr/sbin/${APP_NAME}"
 APP_DATA="${DATA_PATH}"
 APP_LOG_DIR="${LOG_DIR}"
+APP_LOG_FILE="${LOG_DIR}/guanlan.log"
 APP_RUNDIR="${RUN_DIR}"
 DNS_LOG_DIR="${DNS_LOG_DIR}"
 APP_ADDR="${LISTEN_ADDR}"
@@ -309,6 +391,17 @@ APP_ADDR="${LISTEN_ADDR}"
 start_service() {
     # /tmp 是 tmpfs，重启即失，每次启动都要确保目录存在
     mkdir -p "\$APP_RUNDIR" "\$DNS_LOG_DIR" "\$APP_LOG_DIR" 2>/dev/null
+    # dnsmasq 以 dnsmasq 用户运行：必须能写入 DNS 日志目录，否则日志文件创建失败
+    # （表现为日志变成 *.log.old、域名归因失效）
+    chown dnsmasq:dnsmasq "\$DNS_LOG_DIR" 2>/dev/null || chmod 0777 "\$DNS_LOG_DIR" 2>/dev/null
+
+    # 日志文件限量：超过 4MB 只保留最后 2000 行，避免长期运行撑爆存储分区
+    if [ -f "\$APP_LOG_FILE" ]; then
+        LOGSZ=\$(wc -c < "\$APP_LOG_FILE" 2>/dev/null || echo 0)
+        if [ "\$LOGSZ" -gt 4194304 ] 2>/dev/null; then
+            tail -n 2000 "\$APP_LOG_FILE" > "\$APP_LOG_FILE.tmp" 2>/dev/null && mv -f "\$APP_LOG_FILE.tmp" "\$APP_LOG_FILE"
+        fi
+    fi
 
     procd_open_instance
     procd_set_param command "\$APP_BIN" \\
@@ -318,8 +411,10 @@ start_service() {
     # 崩溃自动重启：3600 秒窗口内最多重启 5 次，间隔 5 秒
     procd_set_param respawn 3600 5 5
     procd_set_param limits nofile="4096 4096"
-    procd_set_param stdout 1
-    procd_set_param stderr 1
+    # 日志真正落盘：procd 的 stdout/stderr 写文件路径；
+    # 写 "1" 是转发到 procd 的 stdout（进 syslog），文件永远不会被创建
+    procd_set_param stdout "\$APP_LOG_FILE"
+    procd_set_param stderr "\$APP_LOG_FILE"
     procd_close_instance
 }
 
@@ -331,18 +426,21 @@ run_sh "chmod 0755 $INIT_TMP" || warn "设置 init 脚本权限失败"
 run_sh "mv -f $INIT_TMP $INIT_SCRIPT" || die "写入 init 脚本失败"
 
 # ===========================================================================
-# 6. DNS 查询日志旁挂（UCI 原生，可逆）
+# 6. DNS 查询日志旁挂（安装时不启用，机制与后端 ApplyDNSTap 一致）
 #
-#   dhcp.@dnsmasq[0].logqueries=1
-#   dhcp.@dnsmasq[0].logfacility=/tmp/guanlan/dnsmasq.log
+#   用户在设置页打开 dnsTap 后，后端才会：
+#     uci set dhcp.@dnsmasq[0].logqueries='1' → uci commit dhcp
+#     把 /etc/dnsmasq.conf 的 log-facility 行改成 /tmp/guanlan/dnsmasq.log
+#     （原值备份到 /tmp/guanlan/logfacility.orig）→ stop + start dnsmasq
 #
-#   * 不改 /etc/dnsmasq.conf（该文件自带 log-facility=/dev/null）
 #   * 不在 /tmp/dnsmasq.d/ 新增 conf-dir 文件
 #     （conf-dir 里若再写 log-facility → dnsmasq 启动失败 illegal repeated keyword）
+#   * 不写 UCI logfacility（与 /etc/dnsmasq.conf 自带的 log-facility 重复 → 启动失败）
 #   * 该固件 ubus call dnsmasq reload 不存在；/etc/init.d/dnsmasq reload 有 bug
 #     （停得掉起不来 → 全网 DNS 中断），故只用 stop + start
 #
-# 失败时：uci delete 回滚 + 再次 stop/start + 复查；服务本体安装不受影响。
+# 失败时：清除 UCI logqueries + 还原 log-facility + 再次 stop/start + 复查；
+#         服务本体安装不受影响。
 # ===========================================================================
 
 # --- DNS 健康检查 ---
@@ -374,10 +472,12 @@ dns_restart_safe() {
     return 0
   fi
 
-  warn "dnsmasq 健康检查失败！执行紧急回滚：删除 UCI 旁挂选项 → 再次 stop/start → 复查"
+  warn "dnsmasq 健康检查失败！执行紧急回滚：清除 UCI 旁挂 + 还原 log-facility → 再次 stop/start → 复查"
   uci delete "${UCI_SECTION}.${UCI_OPT_LOGQUERIES}" 2>/dev/null
-  uci delete "${UCI_SECTION}.${UCI_OPT_LOGFACILITY}" 2>/dev/null
   uci commit dhcp 2>/dev/null
+  # 后端改的是 /etc/dnsmasq.conf 的 log-facility（不是 UCI logfacility），
+  # 这里按同一机制还原，避免留下半改状态。
+  write_logfacility "$(original_logfacility)" || warn "还原 $DNS_CONF 的 log-facility 失败"
   /etc/init.d/dnsmasq stop >/dev/null 2>&1
   sleep 1
   /etc/init.d/dnsmasq start >/dev/null 2>&1
@@ -398,11 +498,14 @@ dns_restart_safe() {
 
 # 设计意图（与 app/main.go 启动逻辑、app/dns.go ApplyDNSTap 一致）：
 #   * DNS 旁挂由 dnsTap 功能开关控制，**安装时不预置**任何 UCI 选项；
-#   * 用户开启 dnsTap → 后端 ApplyDNSTap(true) 才会 uci set + stop/start + 健康检查；
-#   * 用户关闭 dnsTap → 后端 ApplyDNSTap(false) 会 uci delete 还原；
-#   * 因此安装后 dnsmasq 保持原状：logqueries 为空、log-facility=/dev/null，
-#     不重启 dnsmasq、不改 /etc/dnsmasq.conf、不加 /tmp/dnsmasq.d/ 文件 ——
+#   * 用户开启 dnsTap → 后端 ApplyDNSTap(true) 才会 uci set + 改写
+#     /etc/dnsmasq.conf 的 log-facility + stop/start + 健康检查；
+#   * 用户关闭 dnsTap → 后端 ApplyDNSTap(false) 会 uci delete + 还原
+#     log-facility（原值备份在 /tmp/guanlan/logfacility.orig）；
+#   * 因此安装后 dnsmasq 保持原状：logqueries 为空、log-facility 不变，
+#     不重启 dnsmasq、不加 /tmp/dnsmasq.d/ 文件 ——
 #     满足「开关不打开不影响任何现有功能」。
+#   * 安装脚本只把 log-facility 原值另存一份到持久目录，供卸载/回退还原。
 log "DNS 旁挂：由 dnsTap 功能开关控制，安装时未启用（dnsmasq 保持原状）"
 DNS_TAP_OK=0
 
@@ -412,6 +515,23 @@ DNS_TAP_OK=0
 log "注册并启动服务"
 run_sh "$INIT_SCRIPT enable >/dev/null 2>&1" && log "已设置开机自启 (enable)" || warn "enable 失败（可能非 procd 环境）"
 run_sh "$INIT_SCRIPT restart >/dev/null 2>&1 || { $INIT_SCRIPT stop >/dev/null 2>&1; $INIT_SCRIPT start >/dev/null 2>&1; }"
+
+# --- 打印服务日志：优先日志文件，其次 syslog（logread -e guanlan） ---
+dump_service_log() {
+  N="${1:-40}"
+  LOGF="${LOG_DIR}/guanlan.log"
+  if [ -s "$LOGF" ]; then
+    echo "--- $LOGF（最后 $N 行）---" >&2
+    tail -n "$N" "$LOGF" >&2
+    return 0
+  fi
+  if command -v logread >/dev/null 2>&1; then
+    echo "--- logread -e guanlan（最后 $N 行）---" >&2
+    logread -e guanlan 2>/dev/null | tail -n "$N" >&2
+    return 0
+  fi
+  echo "（没有日志文件 $LOGF，也没有 logread）" >&2
+}
 
 # 等待进程起来
 if [ "$DRY" = "1" ]; then
@@ -426,9 +546,7 @@ else
 
   if ! pidof "$APP_NAME" >/dev/null 2>&1; then
     warn "服务进程未启动，打印日志："
-    LOGF="${LOG_DIR}/guanlan.log"
-    [ -f "$LOGF" ] && tail -n 40 "$LOGF" >&2
-    tail -n 40 "/tmp/${APP_NAME}.log" 2>/dev/null >&2
+    dump_service_log 40
     exit 1
   fi
   log "服务进程已启动 (pid=$(pidof "$APP_NAME"))"
@@ -462,8 +580,7 @@ else
 
   if [ "$HEALTH_OK" != "1" ]; then
     warn "健康检查失败，打印服务日志："
-    LOGF="${LOG_DIR}/guanlan.log"
-    [ -f "$LOGF" ] && tail -n 60 "$LOGF" >&2
+    dump_service_log 60
     echo "--- 服务状态 ---" >&2
     "$INIT_SCRIPT" status >&2 2>/dev/null || true
     exit 1
@@ -483,14 +600,15 @@ echo " 二进制     : $BIN_DST"
 echo " 数据目录   : $DATA_DIR"
 echo " 配置       : $CONF_FILE"
 echo " 运行日志   : $LOG_DIR/guanlan.log"
+echo " 系统日志   : logread -e guanlan"
 if [ "$DNS_TAP_OK" = "1" ]; then
-  echo " DNS 旁挂   : 已启用（UCI 原生选项）"
+  echo " DNS 旁挂   : 已启用"
   echo "   uci 选项 : ${UCI_SECTION}.${UCI_OPT_LOGQUERIES}=1"
-  echo "              ${UCI_SECTION}.${UCI_OPT_LOGFACILITY}=$DNS_LOG"
   echo "   日志去向 : $DNS_LOG (tmpfs，不占 overlay)"
-  echo "   未改动   : /etc/dnsmasq.conf、/tmp/dnsmasq.d/（保持原状）"
+  echo "   配置改动 : $DNS_CONF 的 log-facility（原值备份 $LOGFAC_ORIG_FILE）"
 else
   echo " DNS 旁挂   : 未启用（由 dnsTap 功能开关控制；安装时未预置，dnsmasq 保持原状）"
+  echo "   原值备份 : $LOGFAC_ORIG_FILE（供卸载/回退还原 log-facility）"
 fi
 if [ -n "$NEW_PASSWORD" ]; then
   echo ""

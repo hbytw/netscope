@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     观澜 NetScope · 交叉编译构建脚本（Windows → Linux arm64）
 
@@ -28,6 +28,17 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $appDir = Join-Path $repoRoot 'app'
 $outDir = Join-Path $repoRoot $OutputDir
 $outFile = Join-Path $outDir 'guanlan'
+
+# 版本号单一来源：app/version.txt（编译期注入二进制）
+$versionFile = Join-Path $appDir 'version.txt'
+$appVersion = '1.0.0'
+if (Test-Path -LiteralPath $versionFile) {
+    $v = (Get-Content -LiteralPath $versionFile -Raw).Trim()
+    if ($v) { $appVersion = $v }
+}
+if ($Ldflags -notmatch 'buildVersion') {
+    $Ldflags = "$Ldflags -X main.buildVersion=$appVersion"
+}
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg) { Write-Host "    OK  $msg" -ForegroundColor Green }

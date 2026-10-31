@@ -31,7 +31,6 @@ export async function mount(host, ctx) {
   let selectedId = null;
   let editing = null;
   let destroyed = false;
-  let unsub = null;
 
   /* 紧凑空态（减少占屏，替代大图标空态） */
   function hintLine(text, icon = ICONS.list) {
@@ -506,11 +505,15 @@ export async function mount(host, ctx) {
   async function onRestoreDns() {
     confirmDialog({
       title: '还原 DNS 拦截', danger: true, confirmText: '还原',
-      message: '将移除全部 dnsmasq 旁挂拦截记录。确认继续？',
+      message: '注意：/api/enforce/reset 会清空全部管控（断网 / 限速 / 目标封禁 / DNS 拦截），'
+        + '并停用全部策略。确认继续？',
       onConfirm: async () => {
         try {
           const r = await api.enforceReset();
-          toast('DNS 拦截已全部还原', 'success');
+          toast(`已清空全部管控（${(r && r.removed ? r.removed.length : 0)} 项）并停用全部策略`, 'success');
+          // 管控被全局清空：设备断网/限速状态与策略启用状态都会变化，必须一并刷新
+          await reloadDevices();
+          await reloadPolicies();
           await loadEnforce();
         } catch (e) { throw e; }
       }
@@ -602,6 +605,8 @@ export async function mount(host, ctx) {
   cleanups.push(unsubSettings);
 
   /* ---------- SSE 增量 ---------- */
+  // app.js 已把 /api/stream 的 tick 以 CustomEvent 派发到 document，
+  // 本页只监听 document 事件，避免重复订阅同一流。
   const onTick = (ev) => {
     const t = ev.detail;
     if (destroyed || !t || !t.devices) return;
@@ -617,12 +622,6 @@ export async function mount(host, ctx) {
   };
   document.addEventListener('gl:tick', onTick);
   cleanups.push(() => document.removeEventListener('gl:tick', onTick));
-
-  unsub = api.subscribe((type, payload) => {
-    if (destroyed) return;
-    if (type === 'tick') onTick({ detail: payload });
-  });
-  cleanups.push(() => unsub && unsub());
 
   return {
     unmount() {

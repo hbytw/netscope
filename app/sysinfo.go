@@ -27,6 +27,12 @@ type SysSnapshot struct {
 	TempC      float64
 	WanRxBps   int64
 	WanTxBps   int64
+	// NetUpBps/NetDownBps：用户视角的上下行速率（bit/s），来自 LAN 侧接口计数。
+	//   NetUpBps   = LAN RX（用户 → 路由器）= 上行
+	//   NetDownBps = LAN TX（路由器 → 用户）= 下行
+	// 这是物理真实值，作为实时速率的权威来源（conntrack 只负责归因）。
+	NetUpBps   int64
+	NetDownBps int64
 	ConnCount  int64
 	DiskFreeMb int64
 	RSSMb      int64
@@ -153,6 +159,9 @@ func (s *SysInfo) Sample(intervalSec int64) {
 				}
 				snap.WanRxBps = drx * 8 / intervalSec
 				snap.WanTxBps = dtx * 8 / intervalSec
+				// 用户视角：LAN RX = 上行，LAN TX = 下行
+				snap.NetUpBps = snap.WanRxBps
+				snap.NetDownBps = snap.WanTxBps
 			}
 			s.prevNetRx, s.prevNetTx = rx, tx
 		}
@@ -238,6 +247,8 @@ func (s *SysInfo) sampleDemo(intervalSec int64) {
 		r := s.app.agg.LastRates()
 		snap.WanRxBps = r.DownBps
 		snap.WanTxBps = r.UpBps
+		snap.NetUpBps = r.UpBps
+		snap.NetDownBps = r.DownBps
 	}
 	s.mu.Lock()
 	s.s = snap

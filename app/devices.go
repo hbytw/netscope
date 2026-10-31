@@ -101,25 +101,54 @@ func (m *DeviceMgr) NoteTraffic(ip string, up, down, now int64) {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	st, _ := m.ensureLocked(ip, now)
+	st, created := m.ensureLocked(ip, now)
 	st.TotalUp += up
 	st.TotalDown += down
 	if up > 0 || down > 0 {
 		st.LastSeen = now
 	}
+	// 首次见到流量的设备：置 known 并触发 new_device。
+	// 否则租约/邻居合并时该设备已存在（created=false），新设备事件会永久丢失，
+	// 且该设备后续的上下线事件也会因 known=false 被整体跳过。
+	fresh := created && !m.known[ip]
+	name := ""
+	if fresh {
+		m.known[ip] = true
+		name = m.displayNameLocked(st)
+	}
+	m.mu.Unlock()
+	if fresh && m.app != nil && m.app.sec != nil {
+		m.app.sec.OnNewDevice(ip, name, now)
+	}
+}
+
+// scaleFactor 当前校准系数（conntrack 归因速率 → 物理真实速率的比例）。
+// 与分类/KPI 速率同源，保证同一份响应里各口径一致。
+func (m *DeviceMgr) scaleFactor() float64 {
+	if m.app == nil || m.app.agg == nil {
+		return 1
+	}
+	sc := m.app.agg.Scale()
+	if sc <= 0 {
+		return 1
+	}
+	return sc
 }
 
 // ApplyRates 应用一个采样周期的设备速率、分类/域名偏好、趋势点。
+// r 为 conntrack 原始速率快照；对外展示的设备速率统一乘校准系数，
+// 与分类速率、KPI 保持同一口径（否则同一响应里会相差 10~1000 倍）。
 func (m *DeviceMgr) ApplyRates(r IntervalRates, now int64) {
+	sc := m.scaleFactor() // 先取系数再取设备锁，避免嵌套加锁
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for ip, pair := range r.DevBps {
 		st, _ := m.ensureLocked(ip, now)
-		st.UpBps, st.DownBps = pair[0], pair[1]
-		if pair[0] > 0 || pair[1] > 0 {
+		st.UpBps = int64(float64(pair[0]) * sc)
+		st.DownBps = int64(float64(pair[1]) * sc)
+		if st.UpBps > 0 || st.DownBps > 0 {
 			st.LastSeen = now
-			st.Trend = append(st.Trend, TrendPoint{T: now, Up: pair[0], Down: pair[1]})
+			st.Trend = append(st.Trend, TrendPoint{T: now, Up: st.UpBps, Down: st.DownBps})
 			if len(st.Trend) > 120 {
 				st.Trend = st.Trend[len(st.Trend)-120:]
 			}
@@ -279,7 +308,7 @@ func (m *DeviceMgr) Refresh(now int64) {
 		if l.IP == "" {
 			continue
 		}
-		st, created := m.ensureLocked(l.IP, now)
+		st, _ := m.ensureLocked(l.IP, now)
 		if net, ok := accepted[l.IP]; ok {
 			st.Network = net
 		}
@@ -290,7 +319,9 @@ func (m *DeviceMgr) Refresh(now int64) {
 		if st.Hostname == "" && l.Hostname != "" {
 			st.Hostname = l.Hostname
 		}
-		if created && !m.known[l.IP] {
+		// 按「是否已知」判断：设备可能先被流量（NoteTraffic）发现，
+		// 此时 created=false，若仍按 created 判断，新设备事件会永久丢失。
+		if !m.known[l.IP] {
 			m.known[l.IP] = true
 			events = append(events, pendingEvent{"new_device", l.IP, m.displayNameLocked(st)})
 			m.recordFirstSeen(l.IP, now)
@@ -298,7 +329,7 @@ func (m *DeviceMgr) Refresh(now int64) {
 	}
 	// 3) 内网邻居合并
 	for _, n := range acceptedNeigh {
-		st, created := m.ensureLocked(n.IP, now)
+		st, _ := m.ensureLocked(n.IP, now)
 		if net, ok := accepted[n.IP]; ok {
 			st.Network = net
 		}
@@ -312,7 +343,7 @@ func (m *DeviceMgr) Refresh(now int64) {
 				st.Online = true
 			}
 		}
-		if created && !m.known[n.IP] {
+		if !m.known[n.IP] {
 			m.known[n.IP] = true
 			events = append(events, pendingEvent{"new_device", n.IP, m.displayNameLocked(st)})
 			m.recordFirstSeen(n.IP, now)

@@ -24,7 +24,7 @@ const RANGES = [
 
 export async function mount(host, ctx) {
   const { api } = ctx;
-  const charts = [];
+  const charts = {};
   const cleanups = [];
   let range = '1h';
   let stacked = false;
@@ -33,13 +33,13 @@ export async function mount(host, ctx) {
   let liveBuf = [];   // 2 秒粒度实时点（覆盖最近约 30 分钟，用于细粒度滚动显示）
   let conns = [];
   let destroyed = false;
-  let unsub = null;
   let connQuery = '';
   let connPage = 1;
   let dstBlocked = new Set();   // 已封禁的目标 IP（用于就地解封）
   let devBlocked = new Set();   // 已断网的设备 IP（用于就地解封）
   let urlQuery = '';
   let urlPage = 1;
+  let urlRows = [];
 
   /* ---------- 头部 ---------- */
   const rangeSeg = h('div', { class: 'segment' });
@@ -157,6 +157,7 @@ export async function mount(host, ctx) {
     }
   ];
   const urlTbl = table({ columns: urlCols, rows: [], pageSize: 12, sortKey: 'bytes', sortDir: 'desc', onRowClick: (d) => showUrlDetail(d) });
+  urlTbl.__onPage = (p, pages) => urlPager.set(p, pages, urlRows.length);
   const urlCard = card({
     title: '最近访问 URL', sub: 'WAF 式访问记录 · 按流量',
     actions: [urlCount],
@@ -461,8 +462,9 @@ export async function mount(host, ctx) {
     const q = urlQuery.toLowerCase();
     let list = domains;
     if (q) list = domains.filter((d) => `${d.domain} ${d.label || ''} ${d.category || ''}`.toLowerCase().includes(q));
-    urlTbl.__page = urlPage;
+    urlRows = list;
     urlTbl.setRows(list);
+    urlTbl.setPage(urlPage);
     urlCount.textContent = `${list.length} 条`;
   }
 
@@ -472,8 +474,8 @@ export async function mount(host, ctx) {
     filteredConns = q
       ? conns.filter((c) => `${c.domain || ''} ${c.dstIp} ${c.app || ''} ${c.srcIp} ${c.deviceName || ''}`.toLowerCase().includes(q))
       : conns.slice();
-    connTbl.__page = connPage;
     connTbl.setRows(filteredConns);
+    connTbl.setPage(connPage);
     connCount.textContent = `${formatNumber(conns.length)} 条连接`;
   }
 
@@ -487,6 +489,7 @@ export async function mount(host, ctx) {
       h('span', { class: 'v mono', text: String(v ?? '-') })
     ]);
     const pathLabel = PATH_LABEL[c.path] || (c.iface ? c.iface : '直接出网');
+    const dur = Math.max(0, Math.floor(Number(c.durationSec) || 0));
     const body = h('div', { class: 'kv-grid', style: { padding: '4px 2px' } }, [
       kv('设备', c.deviceName || c.srcIp),
       kv('源地址', `${c.srcIp}:${c.srcPort}`),
@@ -497,7 +500,7 @@ export async function mount(host, ctx) {
       kv('分类', CATEGORY_LABEL[c.category] || '其他'),
       kv('应用', c.app || '-'),
       kv('状态', c.state || '-'),
-      kv('持续', `${Math.round((c.durationSec || 0) / 60)} 分 ${(c.durationSec || 0) % 60} 秒`),
+      kv('持续', `${Math.floor(dur / 60)} 分 ${dur % 60} 秒`),
       kv('下行', formatBytes(c.downBytes || 0)),
       kv('上行', formatBytes(c.upBytes || 0)),
       kv('开始时间', c.startedAt ? formatTime(c.startedAt) : '-'),
@@ -661,6 +664,8 @@ export async function mount(host, ctx) {
   cleanups.push(unsubSettings);
 
   /* ---------- SSE 增量更新（2 秒实时） ---------- */
+  // app.js 已把 /api/stream 的 tick 以 CustomEvent 派发到 document，
+  // 本页只监听 document 事件，避免重复订阅同一流导致实时点翻倍。
   // tick.trendPoint 是 2 秒粒度的实时速率（bit/s），与 series 的 up/down 同单位。
   // 这里累积成 liveBuf，与历史桶按真实时间合并绘制：
   //   · 曲线整体随时间窗口右移而向前滚动
@@ -668,14 +673,24 @@ export async function mount(host, ctx) {
   const onTick = (ev) => {
     const t = ev.detail;
     if (destroyed || !t) return;
+    // 头部实时速率（不掺入 30 秒桶序列）
+    if (t.kpi) {
+      rateNow.textContent = `↓ ${formatBps(t.kpi.downBps || 0)}  ↑ ${formatBps(t.kpi.upBps || 0)}`;
+    }
     const tp = t.trendPoint;
     if (!tp) return;
     const now = Number(tp.t || t.ts || 0) || Math.floor(Date.now() / 1000);
-    const pt = { t: now, up: tp.up || 0, down: tp.down || 0, byCat: {}, live: true };
+    // 优先使用物理接口速率（netUp/netDown，来自 LAN 接口计数，物理真实）；
+    // 缺失时退回 conntrack 的 trendPoint。
+    const upBps = Number(t.netUp ?? tp.up ?? 0);
+    const downBps = Number(t.netDown ?? tp.down ?? 0);
+    const pt = { t: now, up: upBps, down: downBps, byCat: {}, live: true };
     if (Array.isArray(t.categories)) {
       t.categories.forEach((c) => {
         if (!c || !c.key) return;
-        pt.byCat[c.key] = Math.round((c.downBps || 0) / 8);   // bit/s → 字节/秒
+        // 与历史段口径一致：byCat 是「上下行合计」的字节数，
+        // 实时点按 bit/s → 字节/秒换算，且上行同样计入（否则衔接处出现台阶）
+        pt.byCat[c.key] = Math.round(((c.upBps || 0) + (c.downBps || 0)) / 8);
       });
     }
     const last = liveBuf[liveBuf.length - 1];
@@ -693,20 +708,11 @@ export async function mount(host, ctx) {
   }, 30000);
   cleanups.push(() => clearInterval(refreshTimer));
 
-  unsub = api.subscribe((type, payload) => {
-    if (destroyed) return;
-    if (type === 'tick' && payload && payload.kpi) {
-      // 只更新头部实时速率，不掺入 30 秒桶序列
-      rateNow.textContent = `↓ ${formatBps(payload.kpi.downBps || 0)}  ↑ ${formatBps(payload.kpi.upBps || 0)}`;
-    }
-  });
-  cleanups.push(() => unsub && unsub());
-
   return {
     unmount() {
       destroyed = true;
       cleanups.forEach((fn) => { try { fn(); } catch (_) {} });
-      charts.forEach((c) => { try { c.dispose?.(); } catch (_) {} });
+      Object.values(charts).forEach((c) => { try { c?.dispose?.(); } catch (_) {} });
     }
   };
 }

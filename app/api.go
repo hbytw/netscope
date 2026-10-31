@@ -83,6 +83,17 @@ func (s *Sessions) Drop(tok string) {
 	s.mu.Unlock()
 }
 
+// DropAllExcept 注销除 keep 之外的全部会话（改密后调用，避免旧会话继续可用）。
+func (s *Sessions) DropAllExcept(keep string) {
+	s.mu.Lock()
+	for t := range s.tokens {
+		if t != keep {
+			delete(s.tokens, t)
+		}
+	}
+	s.mu.Unlock()
+}
+
 type loginState struct {
 	fails   int
 	lockEnd int64
@@ -266,7 +277,7 @@ func (a *App) apiDispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !a.authed(r) {
-		writeErr(w, http.StatusUnauthorized, "unauthorized", "")
+		writeErr(w, http.StatusUnauthorized, "登录已失效，请重新登录", "unauthorized")
 		return
 	}
 	switch parts[0] {
@@ -322,6 +333,14 @@ func (a *App) authed(r *http.Request) bool {
 		return false
 	}
 	return a.sessions.Valid(c.Value, nowUnix())
+}
+
+// sessionToken 取当前请求的会话 token（改密后需要保留当前会话、注销其它会话）。
+func sessionToken(r *http.Request) string {
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		return c.Value
+	}
+	return ""
 }
 
 // ---------------- 鉴权接口 ----------------
@@ -402,6 +421,9 @@ func (a *App) handlePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 修改密码后注销其他会话，仅保留当前会话
+	if tok := sessionToken(r); tok != "" {
+		a.sessions.DropAllExcept(tok)
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 }
 
@@ -631,7 +653,9 @@ func (a *App) buildOverview() overviewResp {
 		KPI: kpiJSON{
 			Online: online, Devices: len(devJSON), Conns: sys.ConnCount,
 			NewConns: rates.NewConnsLastMin, DNSQps: round1f(a.dns.QPS(now)),
-			Alerts: a.store.UnackedCount(), UpBps: rates.UpBps, DownBps: rates.DownBps,
+			Alerts: a.store.UnackedCount(),
+			// 实时上下行用 LAN 接口计数（物理真实）；conntrack 速率仅用于归因统计
+			UpBps: sys.NetUpBps, DownBps: sys.NetDownBps,
 			RiskLevel: a.sec.Level(),
 		},
 		Sys:        sysToJSON(sys),
@@ -866,6 +890,15 @@ func (a *App) handleDevices(w http.ResponseWriter, r *http.Request, parts []stri
 		if !decodeJSON(w, r, &req) {
 			return
 		}
+		// 与 alias 分支保持一致：校验设备存在 + 限制长度，避免写入任意 IP / 超长分组
+		if len([]rune(req.Group)) > 32 {
+			writeErr(w, http.StatusBadRequest, "分组名最长 32 个字符", "bad_group")
+			return
+		}
+		if _, _, _, ok := a.deviceFor(ip); !ok {
+			writeErr(w, http.StatusNotFound, "设备不存在", "not_found")
+			return
+		}
 		a.store.UpdateDeviceMeta(ip, func(m *DeviceMeta) { m.Group = req.Group })
 		dj, _, _, _ := a.deviceFor(ip)
 		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "applied": []string{}, "device": dj})
@@ -1020,10 +1053,12 @@ type connsResp struct {
 }
 
 // rangeSpec 时间范围 -> 时长与基础桶宽。
+// 注意：底层统计桶是「分钟桶」(now/60*60)，基础桶宽必须是 60 的倍数，
+// 否则聚合会错位（30 秒桶只能装下半分钟数据，速率显示会翻倍并出现锯齿）。
 func rangeSpec(r string) (dur int64, bucketSec int64, ok bool) {
 	switch r {
 	case "", "1h":
-		return 3600, 30, true
+		return 3600, 60, true
 	case "6h":
 		return 6 * 3600, 120, true
 	case "24h":
@@ -1108,6 +1143,18 @@ func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request, parts []stri
 		bucketSec *= 2
 		series = aggregateSeries(buckets, bucketSec)
 	}
+	// 按校准系数缩放到物理真实量级（conntrack 归因的绝对值不可信，比例可用）
+	// 注意：byCat 与 up/down 必须同口径缩放，否则堆叠图历史段与 byCategory/overview 相差 sc 倍。
+	sc := a.agg.Scale()
+	if sc > 0 && sc != 1 {
+		for i := range series {
+			series[i].Up = int64(float64(series[i].Up) * sc)
+			series[i].Down = int64(float64(series[i].Down) * sc)
+			for k, v := range series[i].ByCat {
+				series[i].ByCat[k] = int64(float64(v) * sc)
+			}
+		}
+	}
 
 	// 分类/应用总量
 	byCat := map[string][2]int64{}
@@ -1134,7 +1181,9 @@ func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request, parts []stri
 			share = float64(p[0]+p[1]) / float64(totalCat)
 		}
 		byCategory = append(byCategory, trafficCat{
-			Key: c.Key, Label: c.Label, Up: p[0], Down: p[1],
+			Key: c.Key, Label: c.Label,
+			Up:    int64(float64(p[0]) * sc),
+			Down:  int64(float64(p[1]) * sc),
 			Share: roundShare(share), Color: c.Color,
 		})
 	}
@@ -1164,7 +1213,7 @@ func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request, parts []stri
 		}
 		byDevice = append(byDevice, trafficDev{
 			IP: ip, Name: displayName(name, ip), Alias: metas[ip].Alias,
-			Up: p[0], Down: p[1], Share: roundShare(share),
+			Up: int64(float64(p[0]) * sc), Down: int64(float64(p[1]) * sc), Share: roundShare(share),
 		})
 	}
 	sortTrafficDev(byDevice)
@@ -2076,6 +2125,10 @@ type tickFrame struct {
 	Categories  []tickCat    `json:"categories"`
 	TrendPoint  TrendPoint   `json:"trendPoint"`
 	Wan         tickWan      `json:"wan"`
+	// NetUp/NetDown：用户视角上下行速率（bit/s），来自 LAN 接口计数（物理真实值）。
+	// 前端用它绘制 2 秒实时曲线与实时速率显示，避免 conntrack 归因误差影响实时数字。
+	NetUp   int64 `json:"netUp"`
+	NetDown int64 `json:"netDown"`
 }
 
 // buildTick 构造 tick 帧。
@@ -2166,7 +2219,8 @@ func (a *App) buildTick(now int64, full bool, last map[string]tickDevice) tickFr
 			Online: countOnline(states, metas), Devices: visible,
 			Conns: sys.ConnCount, NewConns: rates.NewConnsLastMin,
 			DNSQps: round1f(a.dns.QPS(now)), Alerts: a.store.UnackedCount(),
-			UpBps: rates.UpBps, DownBps: rates.DownBps, RiskLevel: a.sec.Level(),
+			// 实时上下行用 LAN 接口计数（物理真实）；conntrack 速率仅用于归因统计
+			UpBps: sys.NetUpBps, DownBps: sys.NetDownBps, RiskLevel: a.sec.Level(),
 		},
 		Sys:         sysToJSON(sys),
 		Devices:     devices,
@@ -2176,6 +2230,8 @@ func (a *App) buildTick(now int64, full bool, last map[string]tickDevice) tickFr
 		Categories:  cats,
 		TrendPoint:  tp,
 		Wan:         tickWan{RxBps: sys.WanRxBps, TxBps: sys.WanTxBps},
+		NetUp:       sys.NetUpBps,
+		NetDown:     sys.NetDownBps,
 	}
 }
 
@@ -2204,10 +2260,16 @@ func tickDeviceEqual(a, b tickDevice) bool {
 		a.Risk == b.Risk && a.Blocked == b.Blocked && a.TopCat == b.TopCat
 }
 
+// countOnline 统计在线设备数。
+// 口径与 buildOverview 的「在线设备」保持一致：只统计未隐藏的内网（LAN/zt/vpn）设备，
+// 否则可能出现 online > devices。
 func countOnline(states []DeviceState, metas map[string]DeviceMeta) int {
 	n := 0
 	for _, st := range states {
 		if metas[st.IP].Hidden {
+			continue
+		}
+		if !isInternalNetwork(st.Network) {
 			continue
 		}
 		if st.Online {

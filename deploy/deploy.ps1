@@ -5,7 +5,10 @@
 .DESCRIPTION
     流程：build.ps1 → scp dist/guanlan 到 /tmp/guanlan.new → scp install.sh 到 /tmp/install.sh
           → ssh 执行 sh /tmp/install.sh → 输出部署结果与访问地址。
-    所有密码从环境变量 OWRT_PASS 读取（请先设置环境变量），也可用 -Password 传入。
+    所有密码从环境变量 OWRT_PASS 读取（请先设置环境变量），也可用 -Password 传入；
+    未提供口令时直接报错，不会回退到任何默认口令。
+    主机密钥由 tools/owssh.py / tools/owrt.py 校验：首次连接打印指纹供人工核对并登记，
+    之后严格校验（密钥不一致即中止）。
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File deploy\deploy.ps1
@@ -24,14 +27,14 @@ param(
     # 远端临时文件名
     [string]$RemoteBin = '/tmp/guanlan.new',
     [string]$RemoteScript = '/tmp/install.sh',
-    # 部署脚本
-    [string]$InstallScript = (Join-Path $PSScriptRoot 'install.sh'),
-    # 构建脚本
-    [string]$BuildScript = (Join-Path $PSScriptRoot 'build.ps1'),
+    # 部署脚本（留空则用脚本同目录的 install.sh；见下方 $PSScriptRoot 解析）
+    [string]$InstallScript = '',
+    # 构建脚本（留空则用脚本同目录的 build.ps1）
+    [string]$BuildScript = '',
     # 干跑：上传后以 GL_APPLY=0 执行 install.sh，只打印命令不真实执行
     [switch]$DryRun,
-    # 用户自助回退脚本（上传到路由器，用户可随时自己执行）
-    [string]$RollbackScript = (Join-Path $PSScriptRoot 'rollback.sh'),
+    # 用户自助回退脚本（上传到路由器，用户可随时自己执行；留空则用同目录 rollback.sh）
+    [string]$RollbackScript = '',
     # 远端回退脚本位置
     [string]$RemoteRollback = '/tmp/rollback.sh'
 )
@@ -39,8 +42,17 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# 注意：带 [CmdletBinding()] 的脚本在 param 默认值里取 $PSScriptRoot 会拿到空串
+#       （Windows PowerShell 5.1 实测），导致 Join-Path 直接报错、脚本起不来。
+#       所以路径统一在脚本体内解析。
+if (-not $InstallScript) { $InstallScript = Join-Path $PSScriptRoot 'install.sh' }
+if (-not $BuildScript) { $BuildScript = Join-Path $PSScriptRoot 'build.ps1' }
+if (-not $RollbackScript) { $RollbackScript = Join-Path $PSScriptRoot 'rollback.sh' }
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $distBin = Join-Path $repoRoot 'dist\guanlan'
+$owssh = Join-Path $repoRoot 'tools\owssh.py'
+$owrt = Join-Path $repoRoot 'tools\owrt.py'
 
 function Write-Step($m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Write-Ok($m) { Write-Host "    OK  $m" -ForegroundColor Green }
@@ -71,6 +83,11 @@ if (-not $useParamiko) {
 
 # ---------------------------------------------------------------------------
 # 远端执行封装
+#
+# 口令策略：只用 $env:OWRT_PASS / -Password 传入的口令；
+#           未提供就直接报错，绝不回退到任何公开的默认口令。
+# 主机密钥：owssh.py / owrt.py 负责 —— 首次连接打印指纹供人工核对并登记，
+#           之后严格校验，密钥不一致直接中止。
 # ---------------------------------------------------------------------------
 function Invoke-Remote {
     param([string]$Command, [int]$TimeoutSec = 180)
@@ -78,8 +95,7 @@ function Invoke-Remote {
         $env:OWRT_HOST = $Host_
         $env:OWRT_USER = $User
         $env:OWRT_PASS = $Password
-        $runner = Join-Path $repoRoot 'tools\owrt.py'
-        $out = & $pythonExe $runner --cmd $Command --timeout $TimeoutSec 2>&1
+        $out = & $pythonExe $owrt --cmd $Command --timeout $TimeoutSec 2>&1
         $code = $LASTEXITCODE
         return [pscustomobject]@{ Code = $code; Out = ($out | Out-String) }
     }
@@ -93,26 +109,13 @@ function Invoke-Remote {
 function Send-File {
     param([string]$Local, [string]$Remote)
     if ($useParamiko) {
-        $py = @"
-import os, sys
-import paramiko
-host = os.environ['OWRT_HOST']; user = os.environ['OWRT_USER']; pw = os.environ['OWRT_PASS']
-local, remote = sys.argv[1], sys.argv[2]
-c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-c.connect(host, username=user, password=pw, timeout=15, banner_timeout=15, auth_timeout=15, look_for_keys=False, allow_agent=False)
-s = c.open_sftp()
-s.put(local, remote)
-s.close(); c.close()
-print('SFTP_OK ' + remote)
-"@
-        $tmpPy = Join-Path $env:TEMP ("owrt_put_{0}.py" -f (Get-Random))
-        Set-Content -LiteralPath $tmpPy -Value $py -Encoding UTF8
-        $env:OWRT_HOST = $Host_; $env:OWRT_USER = $User; $env:OWRT_PASS = $Password
-        try {
-            $out = & $pythonExe $tmpPy $Local $Remote 2>&1
-            $code = $LASTEXITCODE
-        }
-        finally { Remove-Item -LiteralPath $tmpPy -Force -ErrorAction SilentlyContinue }
+        $env:OWRT_HOST = $Host_
+        $env:OWRT_USER = $User
+        $env:OWRT_PASS = $Password
+        # 走 owssh.py：--upload 用 rsplit 解析，Windows 盘符路径不会切坏；
+        # 同时复用同一套主机密钥校验（不再使用 AutoAddPolicy）。
+        $out = & $pythonExe $owssh --upload ("{0}:{1}" -f $Local, $Remote) 2>&1
+        $code = $LASTEXITCODE
         return [pscustomobject]@{ Code = $code; Out = ($out | Out-String) }
     }
     else {
@@ -124,6 +127,11 @@ print('SFTP_OK ' + remote)
 # ---------------------------------------------------------------------------
 # 0. 连接检查
 # ---------------------------------------------------------------------------
+if (-not $Password) {
+    Write-Err '未提供路由器口令：请设置环境变量 OWRT_PASS 或用 -Password 传入（不会回退到任何默认口令）。'
+    exit 2
+}
+
 Write-Step "检查路由器连通性（$User@$Host_）"
 $probe = Invoke-Remote -Command "uname -m; echo '---'; df -h / | tail -1; echo '---'; free -m | head -2" -TimeoutSec 40
 if ($probe.Code -ne 0) {
@@ -201,7 +209,7 @@ $install = Invoke-Remote -Command "sh -c '$applyEnv GL_ROLLBACK_SH=$RemoteRollba
 Write-Host $install.Out
 if ($install.Code -ne 0) {
     Write-Err "安装脚本返回非零（$($install.Code)），部署失败"
-    Write-Host "诊断：查看 /mnt/mmcblk2p4/guanlan/logs/guanlan.log 与 $RemoteScript 输出" -ForegroundColor Yellow
+    Write-Host "诊断：查看 /mnt/mmcblk2p4/guanlan/logs/guanlan.log，或在路由器上执行 logread -e guanlan" -ForegroundColor Yellow
     exit $install.Code
 }
 
@@ -228,7 +236,8 @@ Write-Ok "部署完成"
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Green
 Write-Host " 访问地址   : http://$($Host_):$Port" -ForegroundColor Green
-Write-Host " 初始密码   : guanlan2026（若为首次安装；否则沿用原密码）" -ForegroundColor Green
+Write-Host " 初始密码   : 产品默认 guanlan2026（仅首次安装时生成；若安装时设置过" -ForegroundColor Green
+Write-Host "              GUANLAN_DEFAULT_PASSWORD 则以实际为准；登录后请立即修改）" -ForegroundColor Green
 Write-Host " 二进制 sha : $binSha" -ForegroundColor Green
 Write-Host "============================================================" -ForegroundColor Green
 exit 0

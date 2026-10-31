@@ -5,7 +5,7 @@
    ========================================================================== */
 
 import {
-  h, card, kpi, chip, button, svgIcon, ICONS, skeleton, emptyState, errorBox, deviceIcon
+  h, card, kpi, chip, button, svgIcon, ICONS, skeleton, emptyState, errorBox, deviceIcon, toast
 } from './components.js';
 import { areaChart, donutChart, barRank } from './chart.js';
 import {
@@ -16,10 +16,9 @@ import { subscribeSettings, isEnabled, setSwitch, refreshSettings } from '../api
 
 export async function mount(host, ctx) {
   const { api } = ctx;
-  const charts = [];
+  const charts = {};
   const cleanups = [];
   let data = null;
-  let unsub = null;
   let destroyed = false;
 
   /* ---------- 系统未启用提示条（api.md §7.3） ---------- */
@@ -150,12 +149,13 @@ export async function mount(host, ctx) {
       const dt = new Date(p.t * 1000);
       return `${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')}:${String(dt.getSeconds()).padStart(2, '0')}`;
     });
+    // 后端 trend 的 up/down 为 bit/s → ÷8 得到字节/秒，与图例/气泡（formatBps）口径一致
     const series = [
-      { name: '下行', color: '#22d3ee', values: (d.trend || []).map((p) => p.down || 0) },
-      { name: '上行', color: '#7c5cff', values: (d.trend || []).map((p) => p.up || 0) }
+      { name: '下行', color: '#22d3ee', values: (d.trend || []).map((p) => (p.down || 0) / 8) },
+      { name: '上行', color: '#7c5cff', values: (d.trend || []).map((p) => (p.up || 0) / 8) }
     ];
     if (!charts.trend) {
-      charts.trend = areaChart(trendCanvas, { labels, series, stacked: false, unit: 'bps' });
+      charts.trend = areaChart(trendCanvas, { labels, series, stacked: false, unit: 'bytes' });
     } else {
       charts.trend.update({ labels, series });
     }
@@ -334,6 +334,8 @@ export async function mount(host, ctx) {
   cleanups.push(unsubSettings);
 
   /* ---------- SSE 增量更新（仅更新受影响组件） ---------- */
+  // app.js 已把 /api/stream 的 tick/alert 以 CustomEvent 派发到 document，
+  // 本页只监听 document 事件，避免重复订阅同一流导致数据翻倍。
   const onTick = (ev) => {
     const t = ev.detail;
     if (!t || destroyed || !data) return;
@@ -380,19 +382,11 @@ export async function mount(host, ctx) {
     document.removeEventListener('gl:alert', onAlert);
   });
 
-  /* ---------- 本页独立订阅（用于大屏/独立场景） ---------- */
-  unsub = api.subscribe((type, payload) => {
-    if (destroyed) return;
-    if (type === 'tick') onTick({ detail: payload });
-    else if (type === 'alert') onAlert({ detail: payload });
-  });
-  cleanups.push(() => unsub && unsub());
-
   return {
     unmount() {
       destroyed = true;
       cleanups.forEach((fn) => { try { fn(); } catch (_) {} });
-      charts.forEach((c) => { try { c.dispose?.(); } catch (_) {} });
+      Object.values(charts).forEach((c) => { try { c?.dispose?.(); } catch (_) {} });
     }
   };
 }

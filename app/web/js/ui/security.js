@@ -31,7 +31,7 @@ const EVENT_TYPES = {
 
 export async function mount(host, ctx) {
   const { api } = ctx;
-  const charts = [];
+  const charts = {};
   const cleanups = [];
   let events = [];
   let summary = { critical: 0, warn: 0, info: 0, total: 0 };
@@ -41,7 +41,6 @@ export async function mount(host, ctx) {
   let severity = '';
   let ackFilter = 'all';
   let destroyed = false;
-  let unsub = null;
 
   /* ---------- 风险横幅 ---------- */
   const bannerIcon = h('div', { class: 'risk-icon' }, [svgIcon(ICONS.shield, 22)]);
@@ -410,7 +409,8 @@ export async function mount(host, ctx) {
     }
     const pageSize = 50;
     const pages = Math.max(1, Math.ceil(events.length / pageSize));
-    const page = Math.min(Math.max(1, eventPager.__page || 1), pages);
+    // 当前页码从 pager 读取（pager 内部状态，外部不可见）
+    const page = Math.min(Math.max(1, eventPager.getPage()), pages);
     const slice = events.slice((page - 1) * pageSize, page * pageSize);
     eventPager.set(page, pages, events.length);
     eventCount.textContent = `${events.length} 条事件`;
@@ -554,7 +554,8 @@ export async function mount(host, ctx) {
       return;
     }
     devs.forEach((d) => {
-      const pct = Math.round((d.risk || 0) * 100);
+      // 风险分上限 1.0，超出时钳制，避免进度条溢出轨道
+      const pct = Math.min(100, Math.max(0, Math.round((d.risk || 0) * 100)));
       const sem = pct >= 60 ? 'crit' : pct >= 30 ? 'warn' : 'info';
       const reasons = (d.reasons || []).map((r) => `${EVENT_TYPES[r.type] || r.type} ×${r.count}`).join(' · ') || '—';
       const row = h('div', { class: 'risk-row', style: { cursor: 'pointer' } }, [
@@ -741,6 +742,8 @@ export async function mount(host, ctx) {
   cleanups.push(unsubSettings);
 
   /* ---------- SSE 增量 ---------- */
+  // app.js 已把 /api/stream 的 alert 以 CustomEvent 派发到 document，
+  // 本页只监听 document 事件，避免重复订阅导致告警与统计翻倍。
   const onAlert = (ev) => {
     const e = ev.detail;
     if (destroyed || !e) return;
@@ -757,17 +760,11 @@ export async function mount(host, ctx) {
   document.addEventListener('gl:alert', onAlert);
   cleanups.push(() => document.removeEventListener('gl:alert', onAlert));
 
-  unsub = api.subscribe((type, payload) => {
-    if (destroyed) return;
-    if (type === 'alert') onAlert({ detail: payload });
-  });
-  cleanups.push(() => unsub && unsub());
-
   return {
     unmount() {
       destroyed = true;
       cleanups.forEach((fn) => { try { fn(); } catch (_) {} });
-      charts.forEach((c) => { try { c.dispose?.(); } catch (_) {} });
+      Object.values(charts).forEach((c) => { try { c?.dispose?.(); } catch (_) {} });
     }
   };
 }

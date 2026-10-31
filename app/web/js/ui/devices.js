@@ -17,7 +17,7 @@ import { refreshSettings, isEnabled, isFeatureOn, subscribeSettings } from '../a
 
 export async function mount(host, ctx) {
   const { api } = ctx;
-  const charts = [];
+  const charts = {};
   const cleanups = [];
   let devices = [];
   let filtered = [];
@@ -26,7 +26,7 @@ export async function mount(host, ctx) {
   let onlyOnline = false;
   let destroyed = false;
   let drawerInst = null;
-  let unsub = null;
+  let drawerChart = null;   // 抽屉内的实时曲线（每次打开前销毁上一个）
 
   /* ---------- 头部工具栏 ---------- */
   const searchInput = h('input', { class: 'input', type: 'search', placeholder: '搜索 别名 / 主机名 / IP / MAC / 厂商' });
@@ -127,7 +127,7 @@ export async function mount(host, ctx) {
     rowClass: (d) => (d.blocked ? 'row-danger' : (d.risk >= 0.6 ? 'row-warn' : ''))
   });
 
-  const pagerEl = pager({ onChange: (p) => { tbl.__page = p; renderTable(); } });
+  const pagerEl = pager({ onChange: (p) => { tbl.setPage(p); } });
   tbl.__onPage = (page, pages) => pagerEl.set(page, pages, filtered.length);
 
   const tableCard = card({
@@ -269,14 +269,23 @@ export async function mount(host, ctx) {
   }
 
   /* ---------- 设备详情抽屉 ---------- */
+  /** 销毁抽屉内的图表实例（避免 ResizeObserver / resize 监听泄漏） */
+  function disposeDrawerChart() {
+    if (!drawerChart) return;
+    try { drawerChart.dispose?.(); } catch (_) {}
+    drawerChart = null;
+  }
+
   async function openDeviceDrawer(d) {
     if (drawerInst) { try { drawerInst.close(); } catch (_) {} }
+    disposeDrawerChart();
     const bodyEl = h('div', { class: 'col gap-3' }, [skeleton(6)]);
     drawerInst = drawer({
       title: d.alias || d.hostname || d.ip,
       sub: `${d.vendor || '未知设备'} · ${d.ip} · ${d.mac}`,
       body: [bodyEl],
-      foot: []
+      foot: [],
+      onClose: () => { disposeDrawerChart(); }
     });
 
     try {
@@ -341,7 +350,8 @@ export async function mount(host, ctx) {
       const dt = new Date(p.t * 1000);
       return `${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')}:${String(dt.getSeconds()).padStart(2, '0')}`;
     });
-    const chart = areaChart(trendCanvas, {
+    disposeDrawerChart();
+    drawerChart = areaChart(trendCanvas, {
       labels,
       series: [
         { name: '下行', color: '#22d3ee', values: (info.trend || []).map((p) => p.down || 0) },
@@ -349,7 +359,6 @@ export async function mount(host, ctx) {
       ],
       unit: 'bps'
     });
-    charts.push(chart);
 
     // Top 域名
     const domBox = h('div', { class: 'col gap-2' });
@@ -508,6 +517,8 @@ export async function mount(host, ctx) {
   cleanups.push(unsubSettings);
 
   /* ---------- SSE 增量更新 ---------- */
+  // app.js 已把 /api/stream 的 tick 以 CustomEvent 派发到 document，
+  // 本页只监听 document 事件，避免重复订阅同一流导致数据翻倍。
   // 后端约定（backend-dev / web3d-dev，已对齐）：
   //   full=false → 按 ip 合并；removed[] 中的 ip 为已从可见集合移除的设备
   //   full 缺省或 true → 整体替换本地设备列表（向后兼容旧契约：devices 语义为全量）
@@ -552,17 +563,12 @@ export async function mount(host, ctx) {
   document.addEventListener('gl:tick', onTick);
   cleanups.push(() => document.removeEventListener('gl:tick', onTick));
 
-  unsub = api.subscribe((type, payload) => {
-    if (destroyed) return;
-    if (type === 'tick') onTick({ detail: payload });
-  });
-  cleanups.push(() => unsub && unsub());
-
   return {
     unmount() {
       destroyed = true;
       cleanups.forEach((fn) => { try { fn(); } catch (_) {} });
-      charts.forEach((c) => { try { c.dispose?.(); } catch (_) {} });
+      Object.values(charts).forEach((c) => { try { c?.dispose?.(); } catch (_) {} });
+      disposeDrawerChart();
       if (drawerInst) { try { drawerInst.close(); } catch (_) {} }
     }
   };

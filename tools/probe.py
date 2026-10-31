@@ -22,10 +22,10 @@ CMDS = [
 
 def main():
     sel = sys.argv[1:] or None
-    c = paramiko.SSHClient()
-    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(HOST, username=USER, password=PASS, timeout=15,
-              look_for_keys=False, allow_agent=False)
+    # 复用 owrt.connect：带主机密钥指纹校验（首次连接登记，后续严格比对）
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import owrt
+    c = owrt.connect()
     for name, cmd in CMDS:
         if sel and name not in sel:
             continue

@@ -9,6 +9,14 @@ package main
 //     超限时按最早开始时间淘汰；
 //   - 每轮只把「有增量」或「新出现」的 flow 通过回调交给聚合层，中间态立即丢弃；
 //   - 条目消失时回调 emitGone，由聚合层删除连接明细（最后一小段字节可接受地丢失）。
+//
+// 差分口径（重要，勿随意改动）：
+//   - 单流增量不设固定上限：只要累计值没有倒退，就按差值计入（高速单流不能被永久漏计）；
+//   - 累计值倒退（up < snap.Up 或 down < snap.Down）说明该 key 对应的流被重建
+//     （端口复用 / tuple 形态切换），新旧累计值不可比，此时只更新快照、不计入增量；
+//   - 新 key 首见：累计字节很小 → 累计值即本区间增量；累计字节很大 → 不推进该流的
+//     快照基线，下一轮把累计值一次性计入（避免首见窗口的字节永久丢失）；
+//   - baseline 轮（启动/Reset 后的第一轮）只登记快照，不计入任何统计（避免幻影流量）。
 
 import (
 	"bufio"
@@ -16,8 +24,11 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // conntrackPath 采集文件（变量形式便于测试/demo 替换）。
@@ -44,14 +55,19 @@ type flowKey struct {
 	SPort uint16
 	Dst   uint32
 	DPort uint16
+	// Dir 方向标记：0 = 设备在 orig 侧，1 = 设备在 reply 侧。
+	// conntrack 表中同一条流会占两行（原方向一行、反向一行），若不区分方向，
+	// 两行会落到同一个 key，orig/reply 的累计值互相覆盖，差分时产生大量虚假增量。
+	Dir uint8
 }
 
 // flowSnap 差分快照（紧凑结构，20000 条约 1.5MB）。
 type flowSnap struct {
-	Up      uint64
-	Down    uint64
-	Started int64
-	Gen     uint32
+	Up       uint64
+	Down     uint64
+	Started  int64
+	Gen      uint32
+	LastSeen int64 // 最后一次在 conntrack 表中出现的时间（用于老化淘汰）
 }
 
 // FlowDelta 一次采样得到的增量。
@@ -84,36 +100,113 @@ type ipNet struct {
 
 // ConnEngine conntrack 差分引擎（单 goroutine 使用，无需锁）。
 type ConnEngine struct {
-	deviceNets []ipNet // 设备网段（br-lan + zt/vpn 本地接口）
-	routeNets  []ipNet // 路由目标网段（经 zt/vpn 可达的远端网段）
-	maxFlows   int
-	flows      map[flowKey]*flowSnap
-	gen        uint32
-	baseline   bool
+	// nets 网段与本机 IP 快照（整体原子替换）。
+	// 设备刷新协程写、采集协程读，用 atomic.Value 避免「新指针 + 旧长度」的中间态。
+	nets     atomic.Value // netsSnapshot
+	maxFlows int
+	flows    map[flowKey]*flowSnap
+	gen      uint32
+	baseline bool
+
+	flowMu   sync.Mutex // 保护 flowHook
+	flowHook func(FlowContext)
 }
+
+// netsSnapshot 设备网段 / 路由网段 / 本机 IP 的不可变快照。
+type netsSnapshot struct {
+	device []ipNet
+	route  []ipNet
+	self   map[uint32]bool
+}
+
+// FlowContext 一条连接的流向上下文（emit 前后发布，供其它模块判断是否走代理）。
+type FlowContext struct {
+	DeviceIP string
+	DstIP    string
+	SPort    int
+	DPort    int
+	Proto    string
+	Path     string // direct / proxy / zerotier / vpn / lan
+}
+
+// smallFlowBytes 新 key 的「累计字节」低于该阈值才视为本区间新建的流并计入增量。
+// 超过阈值的绝大多数是首见之前就存在的旧流（conntrack 表 churn / 端口复用 / tuple 形态切换），
+// 直接把它们的累计值当增量会成百上千倍高估流量（实测放大 1000 倍以上）。
+// 阈值取 16KB：既能保留真正的新建小流，又最大限度避免旧流重现被重复计入。
+// 注意：超过阈值时并不是丢弃，而是「不推进快照基线」——下一轮把累计值一次性计入。
+const smallFlowBytes = 16 * 1024
 
 // NewConnEngine 按 LAN 网段创建引擎；extra 为额外设备网段（默认按 lan 处理）。
 // 运行期由 App.syncConnNets() 用拓扑采集结果覆盖为多网段（zt/vpn）。
 func NewConnEngine(lanCIDR string, extra ...string) *ConnEngine {
 	e := &ConnEngine{maxFlows: 20000, flows: map[flowKey]*flowSnap{}, baseline: true}
+	var device []ipNet
 	for _, cidr := range append([]string{lanCIDR}, extra...) {
 		if n, ok := ipNetFromCIDR(cidr, "lan", ""); ok {
-			e.deviceNets = append(e.deviceNets, n)
+			device = append(device, n)
 		}
 	}
+	e.setNets(device, nil)
 	return e
 }
 
+// SetSelfIPs 设置本机各接口的 IPv4（路由器自身）。
+// 本机出站连接（如 xray 透明代理的出口）不计入任何设备，只计入链路流向。
+func (e *ConnEngine) SetSelfIPs(ips []uint32) {
+	m := make(map[uint32]bool, len(ips))
+	for _, ip := range ips {
+		m[ip] = true
+	}
+	snap := e.netsSnapshot()
+	snap.self = m
+	e.nets.Store(snap)
+}
+
 // SetNets 更新设备网段与路由目标网段（运行期动态，来自 ip -br addr / ip route）。
+// 整体原子替换：采集协程要么看到旧快照、要么看到新快照，不会读到中间态。
 func (e *ConnEngine) SetNets(device, route []ipNet) {
-	e.deviceNets = append([]ipNet(nil), device...)
-	e.routeNets = append([]ipNet(nil), route...)
+	e.setNets(device, route)
+}
+
+// setNets 原子替换设备/路由网段（保留本机 IP 集合）。
+func (e *ConnEngine) setNets(device, route []ipNet) {
+	snap := e.netsSnapshot()
+	snap.device = append([]ipNet(nil), device...)
+	snap.route = append([]ipNet(nil), route...)
+	e.nets.Store(snap)
+}
+
+// netsSnapshot 取当前网段快照（未初始化时返回空快照）。
+func (e *ConnEngine) netsSnapshot() netsSnapshot {
+	if v := e.nets.Load(); v != nil {
+		return v.(netsSnapshot)
+	}
+	return netsSnapshot{self: map[uint32]bool{}}
+}
+
+// SetFlowHook 设置流向上下文回调：emit 前发布当前 flow、emit 后发布空上下文。
+func (e *ConnEngine) SetFlowHook(fn func(FlowContext)) {
+	e.flowMu.Lock()
+	e.flowHook = fn
+	e.flowMu.Unlock()
+}
+
+// publishFlow 发布流向上下文（无回调时直接返回）。
+func (e *ConnEngine) publishFlow(ctx FlowContext) {
+	e.flowMu.Lock()
+	fn := e.flowHook
+	e.flowMu.Unlock()
+	if fn != nil {
+		fn(ctx)
+	}
 }
 
 // Reset 清空差分状态（例如设置里改了 LAN 网段）。
+// baseline 置 true：下一轮只登记存量连接、不计入统计，
+// 否则关闭再开启采集后第一轮会把存量连接的累计字节当成新流量（幻影流量）。
 func (e *ConnEngine) Reset() {
 	e.flows = map[flowKey]*flowSnap{}
-	e.baseline = false
+	e.baseline = true
 }
 
 // ipNetFromCIDR 解析 CIDR 为 ipNet。
@@ -136,7 +229,8 @@ func ipNetFromCIDR(cidr, kind, iface string) (ipNet, bool) {
 
 // matchDevice 判断 IP 是否属于任一设备网段，返回命中的网段。
 func (e *ConnEngine) matchDevice(ip uint32) (ipNet, bool) {
-	for _, n := range e.deviceNets {
+	snap := e.netsSnapshot()
+	for _, n := range snap.device {
 		if ip&n.mask == n.net {
 			return n, true
 		}
@@ -146,7 +240,8 @@ func (e *ConnEngine) matchDevice(ip uint32) (ipNet, bool) {
 
 // matchRoute 判断目的 IP 是否命中路由目标网段，返回命中的网段。
 func (e *ConnEngine) matchRoute(ip uint32) (ipNet, bool) {
-	for _, n := range e.routeNets {
+	snap := e.netsSnapshot()
+	for _, n := range snap.route {
 		if ip&n.mask == n.net {
 			return n, true
 		}
@@ -214,48 +309,81 @@ func (e *ConnEngine) Collect(r io.Reader, now int64, emit func(FlowDelta), gone 
 		if !ok {
 			continue
 		}
+		// 累计字节（负值按 0 处理，避免异常值被当成巨量增量）
+		var upv, downv uint64
+		if up > 0 {
+			upv = uint64(up)
+		}
+		if down > 0 {
+			downv = uint64(down)
+		}
 		snap, exists := e.flows[key]
 		if !exists {
-			snap = &flowSnap{Started: now}
+			// 新 key 首见：
+			//   - baseline 轮（启动/Reset 后第一轮）：只登记快照，不计入统计；
+			//   - 累计字节很小：确属本区间内新建的流，累计值即增量；
+			//   - 累计字节很大：多半是「首见之前就存在」的旧流（conntrack 表 churn /
+			//     端口复用 / tuple 形态切换），此时不推进该流的快照基线，
+			//     下一轮把累计值一次性计入，避免首见窗口的字节被永久丢弃。
+			snap = &flowSnap{Started: now, LastSeen: now}
 			e.flows[key] = snap
-			delta := e.makeDelta(key, ent, meta, up, down, snap.Started, true)
-			if e.baseline {
-				delta.Baseline = true
+			switch {
+			case e.baseline:
+				snap.Up, snap.Down = upv, downv
+				if upv+downv <= smallFlowBytes {
+					delta := e.makeDelta(key, ent, meta, up, down, snap.Started, true)
+					delta.Baseline = true
+					e.emitFlow(emit, delta)
+				}
+			case upv+downv <= smallFlowBytes:
+				snap.Up, snap.Down = upv, downv
+				delta := e.makeDelta(key, ent, meta, up, down, snap.Started, true)
+				e.emitFlow(emit, delta)
+			default:
+				// 大额新流：保持快照基线为 0，下一轮把累计值一次性计入
 			}
-			emit(delta)
-		} else {
-			var du, dd int64
-			if uint64(up) > snap.Up {
-				du = int64(uint64(up) - snap.Up)
-			}
-			if uint64(down) > snap.Down {
-				dd = int64(uint64(down) - snap.Down)
-			}
-			if du > 0 || dd > 0 {
-				delta := e.makeDelta(key, ent, meta, up, down, snap.Started, false)
-				delta.UpDelta = du
-				delta.DownDelta = dd
-				emit(delta)
-			}
+			snap.Gen = e.gen
+			snap.LastSeen = now
+			continue
 		}
-		snap.Up = uint64(up)
-		snap.Down = uint64(down)
+		// 已有 key：按累计值差分。
+		// 累计值倒退说明该 key 对应的流被重建（端口复用 / tuple 形态切换），
+		// 新旧累计值不可比：只更新快照、不计入增量，否则会成倍虚高。
+		if upv < snap.Up || downv < snap.Down {
+			snap.Up, snap.Down = upv, downv
+			snap.Gen = e.gen
+			snap.LastSeen = now
+			continue
+		}
+		du := int64(upv - snap.Up)
+		dd := int64(downv - snap.Down)
+		snap.Up, snap.Down = upv, downv
 		snap.Gen = e.gen
+		snap.LastSeen = now
+		// 增量不设固定上限：只要累计值递增就计入（高速单流不能被永久漏计）。
+		if du > 0 || dd > 0 {
+			delta := e.makeDelta(key, ent, meta, up, down, snap.Started, false)
+			delta.UpDelta = du
+			delta.DownDelta = dd
+			e.emitFlow(emit, delta)
+		}
 	}
 	if err := sc.Err(); err != nil {
 		return total, err
 	}
 
 	// 清理本轮未出现的 flow
+	// 注意：保留快照（不删除），以记住该 key 的累计字节。
+	// 否则流消失后重现会被当作新流，把累计值当增量重复计入（会造成数量级放大）。
+	// 快照由 evict() 按 LastSeen 老化淘汰。
 	for k, snap := range e.flows {
 		if snap.Gen != e.gen {
 			if gone != nil {
 				gone(flowID(k))
 			}
-			delete(e.flows, k)
 		}
 	}
-	e.evict()
+	e.evict(now)
 	e.baseline = false
 	return total, nil
 }
@@ -267,14 +395,42 @@ type flowMeta struct {
 	device bool // 是否设备侧连接（false = 本机/docker0 等非用户设备流量，只计入链路不展示连接）
 }
 
+// emitFlow 发布流向上下文后回调（emit 期间上下文有效，emit 后清除，避免陈旧上下文被误用）。
+func (e *ConnEngine) emitFlow(emit func(FlowDelta), d FlowDelta) {
+	e.publishFlow(FlowContext{
+		DeviceIP: d.DeviceIP,
+		DstIP:    d.DstIP,
+		SPort:    d.SPort,
+		DPort:    d.DPort,
+		Proto:    d.Proto,
+		Path:     d.Path,
+	})
+	emit(d)
+	e.publishFlow(FlowContext{})
+}
+
 // normalize 判断方向并生成规范化 key，同时返回设备方向的上/下行累计字节与流向元信息。
 func (e *ConnEngine) normalize(ent ctEntry) (flowKey, int64, int64, flowMeta, bool) {
 	k := flowKey{Proto: protoCode(ent.Proto)}
+	// 本机出站连接（如 xray 透明代理的出口）：只计入链路流向，不归到任何设备，
+	// 否则代理出口的全部流量会记在路由器自己名下（Top 设备里出现路由器自身）。
+	// 流向复用统一的 pathFor()（含 zt/vpn/lan 判定），避免代理出口流量被记成 direct
+	// 而与设备侧的 proxy 链路重复计算。
+	if e.netsSnapshot().self[ent.SrcIP] {
+		k.Dev = ent.SrcIP
+		k.SPort = uint16(ent.SPort)
+		k.Dst = ent.DstIP
+		k.DPort = uint16(ent.DPort)
+		k.Dir = 0
+		path := e.pathFor(ent.DstIP, ent.DPort, ent.Mark)
+		return k, ent.OrigBytes, ent.ReplyBytes, flowMeta{path: path, device: false}, true
+	}
 	if n, ok := e.matchDevice(ent.SrcIP); ok {
 		k.Dev = ent.SrcIP
 		k.SPort = uint16(ent.SPort)
 		k.Dst = ent.DstIP
 		k.DPort = uint16(ent.DPort)
+		k.Dir = 0
 		meta := flowMeta{
 			path:   e.pathFor(ent.DstIP, ent.DPort, ent.Mark),
 			iface:  n.iface,
@@ -291,6 +447,7 @@ func (e *ConnEngine) normalize(ent ctEntry) (flowKey, int64, int64, flowMeta, bo
 		k.SPort = uint16(ent.DPort)
 		k.Dst = ent.SrcIP
 		k.DPort = uint16(ent.SPort)
+		k.Dir = 1
 		meta := flowMeta{
 			path:   e.pathFor(ent.SrcIP, ent.SPort, ent.Mark),
 			iface:  n.iface,
@@ -308,6 +465,7 @@ func (e *ConnEngine) normalize(ent ctEntry) (flowKey, int64, int64, flowMeta, bo
 		k.SPort = uint16(ent.SPort)
 		k.Dst = ent.DstIP
 		k.DPort = uint16(ent.DPort)
+		k.Dir = 0
 		return k, ent.OrigBytes, ent.ReplyBytes, flowMeta{path: "proxy", device: false}, true
 	}
 	return k, 0, 0, flowMeta{}, false
@@ -345,7 +503,14 @@ func (e *ConnEngine) makeDelta(k flowKey, ent ctEntry, meta flowMeta, up, down i
 }
 
 // evict 控制快照容量，超限时淘汰最早开始的 flow。
-func (e *ConnEngine) evict() {
+func (e *ConnEngine) evict(now int64) {
+	// 老化：超过 10 分钟未在 conntrack 表中出现的快照直接丢弃
+	const staleSec = 10 * 60
+	for k, s := range e.flows {
+		if now-s.LastSeen > staleSec {
+			delete(e.flows, k)
+		}
+	}
 	if len(e.flows) <= e.maxFlows {
 		return
 	}
@@ -353,21 +518,12 @@ func (e *ConnEngine) evict() {
 		k flowKey
 		t int64
 	}
-	list := make([]pair, 0, len(e.flows)-e.maxFlows+1)
+	list := make([]pair, 0, len(e.flows))
 	for k, s := range e.flows {
-		list = append(list, pair{k, s.Started})
+		list = append(list, pair{k, s.LastSeen})
 	}
-	// 简单选择：按开始时间排序后删除最旧的 10%
-	for i := 0; i < len(list); i++ {
-		for j := i + 1; j < len(list); j++ {
-			if list[j].t < list[i].t {
-				list[i], list[j] = list[j], list[i]
-			}
-		}
-		if i > 1024 {
-			break // 避免极端情况下 O(n^2)
-		}
-	}
+	// 按「最久未见」排序，淘汰最旧的一批
+	sort.Slice(list, func(i, j int) bool { return list[i].t < list[j].t })
 	need := len(e.flows) - e.maxFlows + 1
 	n := len(list) / 10
 	if n < need {
@@ -427,6 +583,8 @@ func flowID(k flowKey) string {
 	buf = appendIP4(buf, k.Dst)
 	buf = append(buf, '-')
 	buf = strconv.AppendUint(buf, uint64(k.DPort), 10)
+	buf = append(buf, '-')
+	buf = strconv.AppendUint(buf, uint64(k.Dir), 10)
 	return string(buf)
 }
 

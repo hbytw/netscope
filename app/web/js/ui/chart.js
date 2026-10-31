@@ -149,6 +149,47 @@ function fmtAxisBytes(v) {
   return `${x < 10 ? x.toFixed(1) : Math.round(x)}${units[i]}`;
 }
 
+/* ---------- 时间轴映射（绘制与 hover 共用，保证命中索引一致） ---------- */
+
+/**
+ * 解析模型的横轴：优先用真实时间戳 stamps + 窗口 timeWindow，
+ * 没有 stamps 时退化为等距索引。
+ */
+function axisOf(model, len) {
+  const stamps = Array.isArray(model.stamps) && model.stamps.length === len && len > 0 ? model.stamps : null;
+  const win = Array.isArray(model.timeWindow) && model.timeWindow.length === 2 ? model.timeWindow : null;
+  const tMin = win ? Number(win[0]) : (stamps ? Number(stamps[0]) : 0);
+  const tMax = win ? Number(win[1]) : (stamps ? Number(stamps[len - 1]) : 1);
+  const tSpan = (tMax - tMin) || 1;
+  return { stamps, win, tMin, tMax, tSpan };
+}
+
+/** 索引 → 像素 X（与 areaChart 绘制使用同一套映射） */
+function xAtIndex(ax, len, padL, plotW, idx) {
+  if (ax.stamps) {
+    const t = Number(ax.stamps[idx]) || ax.tMin;
+    return padL + ((t - ax.tMin) / ax.tSpan) * plotW;
+  }
+  return padL + (len <= 1 ? plotW / 2 : (idx / (len - 1)) * plotW);
+}
+
+/** 像素 X → 索引（真实时间轴按 stamps 反查最近点，等距轴按比例取整） */
+function indexAtX(ax, len, padL, plotW, mx) {
+  let idx;
+  if (ax.stamps) {
+    const t = ax.tMin + ((mx - padL) / plotW) * ax.tSpan;
+    idx = 0;
+    let bd = Infinity;
+    for (let i = 0; i < len; i++) {
+      const d = Math.abs(Number(ax.stamps[i]) - t);
+      if (d < bd) { bd = d; idx = i; }
+    }
+  } else {
+    idx = Math.round(((mx - padL) / plotW) * (len - 1));
+  }
+  return Math.max(0, Math.min(len - 1, idx));
+}
+
 /* ---------- 面积图（支持堆叠 / 非堆叠、双色渐变、十字线） ---------- */
 
 /**
@@ -204,19 +245,12 @@ export function areaChart(canvas, opts = {}) {
     // 真实时间轴（可选）：model.stamps 为与数据点一一对应的秒级时间戳，
     // model.timeWindow 为 [起始秒, 结束秒]。提供后按真实时间定位 X 轴，
     // 混合粒度（历史桶 + 实时细粒度）也能正确排布，窗口右移即整条曲线滚动。
-    const stamps = Array.isArray(model.stamps) && model.stamps.length === len ? model.stamps : null;
-    const win = Array.isArray(model.timeWindow) && model.timeWindow.length === 2 ? model.timeWindow : null;
-    const tMin = win ? Number(win[0]) : (stamps ? stamps[0] : 0);
-    const tMax = win ? Number(win[1]) : (stamps ? stamps[len - 1] : 1);
-    const tSpan = (tMax - tMin) || 1;
+    const ax = axisOf(model, len);
+    const stamps = ax.stamps;
+    const tMin = ax.tMin;
+    const tSpan = ax.tSpan;
 
-    const xAt = (idx) => {
-      if (stamps) {
-        const t = Number(stamps[idx]) || tMin;
-        return padL + ((t - tMin) / tSpan) * plotW;
-      }
-      return padL + (len <= 1 ? plotW / 2 : (idx / (len - 1)) * plotW);
-    };
+    const xAt = (idx) => xAtIndex(ax, len, padL, plotW, idx);
     const yAt = (v) => padT + plotH - (v / top) * plotH;
 
     // 网格 + Y 轴（在面积之下绘制，作为底纹）
@@ -406,9 +440,10 @@ export function areaChart(canvas, opts = {}) {
     if (!len || my < 0 || my > rect.height) { return; }
     const padL = m.padLeft ?? 52;
     const plotW = Math.max(10, rect.width - padL - 14);
-    let idx = Math.round(((mx - padL) / plotW) * (len - 1));
-    idx = Math.max(0, Math.min(len - 1, idx));
-    const x = padL + (len <= 1 ? plotW / 2 : (idx / (len - 1)) * plotW);
+    // 真实时间轴：按 stamps 反查最近时间点，避免等距公式反算导致落错点
+    const ax = axisOf(m, len);
+    const idx = indexAtX(ax, len, padL, plotW, mx);
+    const x = xAtIndex(ax, len, padL, plotW, idx);
     if (Math.abs(mx - x) > Math.max(18, plotW / len)) { setHover(null); return; }
     setHover({ index: idx });
   };

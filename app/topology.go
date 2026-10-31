@@ -246,6 +246,35 @@ func parseDefaultRoute(lines []string) (dev string, ok bool) {
 	return "", false
 }
 
+// wanIface 返回真正的 WAN（外网）接口名；本机没有 WAN 口时返回空串。
+//
+// 判定：默认路由的出口接口，且不是内网桥（br-lan*）/ZeroTier/隧道接口。
+// 旁路由场景下默认路由常在 br-lan（真正的出口是上一级主路由），
+// 此时本机并没有 WAN 口：互联网节点计数置 0 并在名称上标注，
+// 避免把 br-lan 的总计数（各链路之和）当成互联网流量而重复计算。
+func wanIface(ifaces []ifaceInfo, routes []string) string {
+	dev, ok := parseDefaultRoute(routes)
+	if !ok || dev == "" {
+		return ""
+	}
+	for _, f := range ifaces {
+		if f.Name != dev {
+			continue
+		}
+		switch f.Network {
+		case "lan", "zerotier":
+			return "" // 内网桥 / ZeroTier 出口不是 WAN
+		case "vpn":
+			if strings.HasPrefix(strings.ToLower(f.Name), "ppp") {
+				return f.Name // PPPoE 拨号口是真实 WAN
+			}
+			return "" // 隧道出口（tun/wg）不是 WAN
+		}
+		return f.Name
+	}
+	return ""
+}
+
 // detectProxy 探测本机是否有常见代理在监听（15s 缓存）。
 func (a *App) detectProxy() bool {
 	now := nowUnix()
@@ -374,13 +403,21 @@ func (a *App) buildTopology() topologyResp {
 		nodes = append(nodes, topologyNode{ID: lanID, Type: "lan", Name: "内网 LAN", CIDR: a.cfg.LANCIDR, Up: true})
 	}
 
-	// 互联网节点（默认路由存在即 up）
+	// 互联网节点：使用真正的 WAN 接口计数。
+	// 旁路由场景（默认路由在 br-lan）本机没有 WAN 口：计数置 0 并在名称上标注，
+	// 不再拿 br-lan 的总计数（各链路之和）当互联网流量，避免与 direct/proxy/zt/vpn 链路重复计算。
+	// LAN 内部互访（path=lan）不属于互联网流量，已从总量中扣除：
+	// 它只体现在 LAN 节点（br-lan 接口计数）上。
+	wanDev := wanIface(ifaces, routes)
 	internetRx, internetTx := int64(0), int64(0)
-	if dev, ok := parseDefaultRoute(routes); ok {
-		internetRx, internetTx = rxRate[dev], txRate[dev]
+	internetName := "互联网"
+	if wanDev != "" {
+		internetRx, internetTx = rxRate[wanDev], txRate[wanDev]
+	} else {
+		internetName = "互联网（无 WAN）"
 	}
 	nodes = append(nodes, topologyNode{
-		ID: "internet", Type: "internet", Name: "互联网",
+		ID: "internet", Type: "internet", Name: internetName,
 		Up: hasDefault, RxBps: internetRx, TxBps: internetTx,
 	})
 	// 代理节点（未探测到也返回，up=false 便于前端展示"未启用"状态）
@@ -417,6 +454,8 @@ func (a *App) buildTopology() topologyResp {
 	}
 
 	// 链路：LAN -> internet(direct) / proxy / 各虚拟网络
+	// 注：LAN 内部互访（path=lan）没有对外链路，已从互联网总量中扣除，
+	// 它只体现在 LAN 节点（br-lan 接口计数）上。
 	directLink := topologyLink{
 		From: lanID, To: "internet", Kind: "direct",
 		UpBps: directRate[0], DownBps: directRate[1],
