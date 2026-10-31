@@ -9,7 +9,7 @@ import {
 } from './components.js';
 import { areaChart, donutChart, barRank } from './chart.js';
 import {
-  formatBps, formatBytes, formatNumber, formatPercent, formatDuration,
+  formatBps, formatNumber, formatPercent, formatDuration,
   formatRelative, riskLevel, RISK_LABEL, RISK_SEM, SEVERITY_SEM, SEVERITY_LABEL, CATEGORY_COLOR
 } from './format.js';
 import { subscribeSettings, isEnabled, setSwitch, refreshSettings } from '../api.js';
@@ -166,11 +166,13 @@ export async function mount(host, ctx) {
     legendEl.innerHTML = '';
     const d = data;
     if (!d) return;
-    const ups = (d.trend || []).reduce((a, p) => a + (p.up || 0), 0);
-    const downs = (d.trend || []).reduce((a, p) => a + (p.down || 0), 0);
+    const pts = d.trend || [];
+    const n = pts.length || 1;
+    const avgUp = pts.reduce((a, p) => a + (p.up || 0), 0) / n;
+    const avgDown = pts.reduce((a, p) => a + (p.down || 0), 0) / n;
     [
-      { name: '下行', color: '#22d3ee', val: formatBps(downs) },
-      { name: '上行', color: '#7c5cff', val: formatBps(ups) }
+      { name: '下行均值', color: '#22d3ee', val: formatBps(avgDown) },
+      { name: '上行均值', color: '#7c5cff', val: formatBps(avgUp) }
     ].forEach((it) => {
       legendEl.appendChild(h('div', { class: 'legend-item' }, [
         h('span', { class: 'legend-swatch', style: { '--c': it.color } }),
@@ -187,8 +189,8 @@ export async function mount(host, ctx) {
     const total = items.reduce((a, x) => a + x.value, 0);
     const model = {
       data: items,
-      centerText: formatBytes(total),
-      centerLabel: '总下行'
+      centerText: formatBps(total),
+      centerLabel: '当前下行'
     };
     if (!charts.donut) charts.donut = donutChart(donutCanvas, model);
     else charts.donut.update(model);

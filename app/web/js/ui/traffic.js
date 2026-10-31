@@ -61,6 +61,7 @@ export async function mount(host, ctx) {
 
   const refreshBtn = button('刷新', { variant: 'ghost', icon: ICONS.refresh, onClick: () => loadTraffic() });
 
+  const rateNow = h('span', { class: 'fs-12', text: '—' });
   const headCard = h('div', { class: 'card', style: { padding: '11px 16px' } }, [
     h('div', { class: 'row-gap-3', style: { flexWrap: 'wrap' } }, [
       h('span', { class: 'fs-12 dim', text: '时间范围' }),
@@ -68,6 +69,10 @@ export async function mount(host, ctx) {
       h('div', { class: 'sys-sep' }),
       stackSwitch,
       h('div', { class: 'spacer', style: { flex: '1' } }),
+      h('div', { class: 'row-gap-2', style: { gap: '6px' } }, [
+        h('span', { class: 'fs-11 dim', text: '实时' }),
+        rateNow
+      ]),
       refreshBtn
     ])
   ]);
@@ -77,7 +82,7 @@ export async function mount(host, ctx) {
   const mainLegend = h('div', { class: 'chart-legend' });
   const mainCard = card({
     title: '流量趋势',
-    sub: '上下行速率与分类构成',
+    sub: '上下行流量与分类构成',
     body: [h('div', { class: 'chart-box', style: { height: '248px' } }, [mainCanvas]), mainLegend]
   });
 
@@ -326,21 +331,24 @@ export async function mount(host, ctx) {
   function renderMain() {
     if (!data) return;
     const labels = seriesLabels();
+    const bucketSec = Number(data.bucketSec) || 30;
     let series;
     if (stacked) {
-      const cats = (data.byCategory || []).filter((c) => c.key !== 'other');
+      // 后端 series.byCat 是「字节/桶」→ 换算成「字节/秒」，与全站字节单位一致
+      const cats = (data.byCategory || []).filter((c) => Number(c.down || 0) > 0);
       series = cats.map((c) => ({
         name: c.label,
         color: c.color || CATEGORY_COLOR[c.key] || '#94a3b8',
-        values: (data.series || []).map((p) => (p.byCat && p.byCat[c.key]) || 0)
+        values: (data.series || []).map((p) => Math.round(((p.byCat && p.byCat[c.key]) || 0) / bucketSec))
       }));
     } else {
+      // 后端 series.up/down 是 bit/s → ÷8 得到字节/秒
       series = [
-        { name: '下行', color: '#22d3ee', values: (data.series || []).map((p) => p.down || 0) },
-        { name: '上行', color: '#7c5cff', values: (data.series || []).map((p) => p.up || 0) }
+        { name: '下行', color: '#22d3ee', values: (data.series || []).map((p) => Math.round((p.down || 0) / 8)) },
+        { name: '上行', color: '#7c5cff', values: (data.series || []).map((p) => Math.round((p.up || 0) / 8)) }
       ];
     }
-    const model = { labels, series, stacked, unit: 'bps' };
+    const model = { labels, series, stacked, unit: 'bytes' };
     if (!charts.main) charts.main = areaChart(mainCanvas, model);
     else charts.main.update(model);
     renderMainLegend();
@@ -350,7 +358,7 @@ export async function mount(host, ctx) {
     mainLegend.innerHTML = '';
     if (!data) return;
     if (stacked) {
-      (data.byCategory || []).filter((c) => c.key !== 'other').forEach((c) => {
+      (data.byCategory || []).forEach((c) => {
         mainLegend.appendChild(h('div', { class: 'legend-item' }, [
           h('span', { class: 'legend-swatch', style: { '--c': c.color || CATEGORY_COLOR[c.key] } }),
           h('span', { text: c.label }),
@@ -358,11 +366,13 @@ export async function mount(host, ctx) {
         ]));
       });
     } else {
-      const ups = (data.series || []).reduce((a, p) => a + (p.up || 0), 0);
-      const downs = (data.series || []).reduce((a, p) => a + (p.down || 0), 0);
+      // series.up/down 是 bit/s 速率：展示区间均值（累加速率无物理意义）
+      const n = (data.series || []).length || 1;
+      const avgUp = (data.series || []).reduce((a, p) => a + (p.up || 0), 0) / n;
+      const avgDown = (data.series || []).reduce((a, p) => a + (p.down || 0), 0) / n;
       [
-        { name: '下行', color: '#22d3ee', val: formatBps(downs) },
-        { name: '上行', color: '#7c5cff', val: formatBps(ups) }
+        { name: '下行均值', color: '#22d3ee', val: formatBps(avgDown) },
+        { name: '上行均值', color: '#7c5cff', val: formatBps(avgUp) }
       ].forEach((it) => {
         mainLegend.appendChild(h('div', { class: 'legend-item' }, [
           h('span', { class: 'legend-swatch', style: { '--c': it.color } }),
@@ -414,7 +424,7 @@ export async function mount(host, ctx) {
     const max = Math.max(...domains.map((d) => d.bytes || 0)) || 1;
     domains.slice(0, 10).forEach((d) => {
       domList.appendChild(h('div', { class: 'rank-row' }, [
-        h('div', { class: 'rank-name', title: `${d.label || ''} ${d.domain}`, text: d.label || d.domain }),
+        h('div', { class: 'rank-name', title: `${d.label ? d.label + ' · ' : ''}${d.domain}`, text: d.domain }),
         h('div', { class: 'rank-bar' }, [
           h('i', { style: { width: `${Math.max(3, ((d.bytes || 0) / max) * 100)}%`, '--c': CATEGORY_COLOR[d.category] || '#94a3b8' } })
         ]),
@@ -441,7 +451,7 @@ export async function mount(host, ctx) {
       : conns.slice();
     connTbl.__page = connPage;
     connTbl.setRows(filteredConns);
-    connCount.textContent = `${conns.length} 条连接 · 共 ${formatNumber(connTbl.getRows().length || 0)} 行`;
+    connCount.textContent = `${formatNumber(conns.length)} 条连接`;
   }
 
   // 连接详情弹窗：点击连接行展示完整字段
@@ -627,24 +637,58 @@ export async function mount(host, ctx) {
   });
   cleanups.push(unsubSettings);
 
-  /* ---------- SSE 增量更新 ---------- */
+  /* ---------- SSE 增量更新（2 秒实时） ---------- */
+  // tick.trendPoint 是 2 秒粒度的实时速率（bit/s），与 series 的 up/down 单位一致。
+  // 策略：同一 30 秒桶内「更新最后一点」，跨桶时才追加新点 —— 既 2 秒实时，又不会像
+  // 之前那样每 2 秒 push 一个点导致尾部拉平、时间轴重复刻度。
   const onTick = (ev) => {
     const t = ev.detail;
-    if (destroyed || !t || !data) return;
-    if (t.trendPoint && (data.series || []).length) {
-      const last = data.series[data.series.length - 1];
-      data.series.push({ t: t.trendPoint.t, up: t.trendPoint.up, down: t.trendPoint.down, byCat: last.byCat || {} });
-      if (data.series.length > 200) data.series.shift();
-      renderMain();
-    }
-  };
+    if (destroyed || !t || !data || !Array.isArray(data.series) || !data.series.length) return;
+    const tp = t.trendPoint || null;
+    if (!tp) return;
+    const bucketSec = Number(data.bucketSec) || 30;
+    const now = Number(tp.t || t.ts || 0) || Math.floor(Date.now() / 1000);
+    const bucketStart = Math.floor(now / bucketSec) * bucketSec;
+    const last = data.series[data.series.length - 1];
 
+    if (bucketStart > last.t) {
+      // 跨入新桶：追加一个实时点（byCat 先留空，堆叠模式用 tick.categories 补齐）
+      data.series.push({ t: bucketStart, up: tp.up || 0, down: tp.down || 0, byCat: {} });
+      if (data.series.length > 240) data.series.shift();
+    } else {
+      // 同桶：直接更新最后一点的实时速率
+      last.up = tp.up || 0;
+      last.down = tp.down || 0;
+    }
+
+    // 堆叠模式：用 tick.categories（各分类当前 bit/s）换算成字节/桶，更新最后一点
+    if (stacked && Array.isArray(t.categories) && t.categories.length) {
+      const tail = data.series[data.series.length - 1];
+      const bc = {};
+      t.categories.forEach((c) => {
+        const k = c.key;
+        if (!k) return;
+        bc[k] = Math.round(((c.downBps || 0) * bucketSec) / 8);
+      });
+      tail.byCat = bc;
+    }
+    renderMain();
+  };
   document.addEventListener('gl:tick', onTick);
   cleanups.push(() => document.removeEventListener('gl:tick', onTick));
+  const refreshTimer = setInterval(() => {
+    if (destroyed || document.visibilityState === 'hidden') return;
+    loadTraffic();
+    loadConns();
+  }, 30000);
+  cleanups.push(() => clearInterval(refreshTimer));
 
   unsub = api.subscribe((type, payload) => {
     if (destroyed) return;
-    if (type === 'tick') onTick({ detail: payload });
+    if (type === 'tick' && payload && payload.kpi) {
+      // 只更新头部实时速率，不掺入 30 秒桶序列
+      rateNow.textContent = `↓ ${formatBps(payload.kpi.downBps || 0)}  ↑ ${formatBps(payload.kpi.upBps || 0)}`;
+    }
   });
   cleanups.push(() => unsub && unsub());
 
