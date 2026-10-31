@@ -1,0 +1,19 @@
+# 统一换行符：Linux 脚本/源码保持 LF，避免 Windows 检出成 CRLF 后在路由器上执行失败
+* text=auto
+*.sh   text eol=lf
+*.py   text eol=lf
+*.mjs  text eol=lf
+*.js   text eol=lf
+*.go   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.css  text eol=lf
+*.html text eol=lf
+*.yml  text eol=lf
+*.ps1  text eol=crlf
+
+# 二进制
+*.png  binary
+*.jpg  binary
+*.ipk  binary
+*.gz   binary

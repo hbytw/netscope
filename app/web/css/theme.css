@@ -1,0 +1,105 @@
+/* ==========================================================================
+   观澜 NetScope · 主题令牌
+   依据 docs/design.md §1 色彩令牌 / §2 排版 / §3 布局 / §4 组件
+   ========================================================================== */
+
+:root {
+  /* —— 底色层 —— */
+  --bg-0: #05070d;
+  --bg-1: #0a0f1a;
+  --bg-2: #101827;
+  --bg-3: #16202f;
+
+  /* —— 描边 —— */
+  --line: rgba(148, 163, 184, .14);
+  --line-strong: rgba(148, 163, 184, .26);
+  --line-soft: rgba(148, 163, 184, .08);
+
+  /* —— 文字 —— */
+  --text-0: #e8eefc;
+  --text-1: #9fb0cc;
+  --text-2: #5d6f8c;
+
+  /* —— 品牌与语义色 —— */
+  --brand: #22d3ee;
+  --brand-2: #7c5cff;
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --crit: #fb7185;
+  --info: #38bdf8;
+
+  /* —— 分类色（api.md §8，勿改） —— */
+  --cat-video: #22d3ee;
+  --cat-game: #a78bfa;
+  --cat-social: #f472b6;
+  --cat-web: #38bdf8;
+  --cat-download: #fbbf24;
+  --cat-mail: #34d399;
+  --cat-cloud: #2dd4bf;
+  --cat-other: #94a3b8;
+
+  /* —— 光晕 / 渐变 —— */
+  --glow: 0 0 24px rgba(34, 211, 238, .35);
+  --glow-soft: 0 0 12px rgba(34, 211, 238, .18);
+  --glow-crit: 0 0 22px rgba(251, 113, 133, .32);
+  --grad-brand: linear-gradient(135deg, #22d3ee 0%, #7c5cff 100%);
+  --grad-panel: linear-gradient(180deg, rgba(16, 24, 39, .82), rgba(10, 15, 26, .92));
+  --grad-panel-flat: linear-gradient(180deg, rgba(16, 24, 39, .72), rgba(10, 15, 26, .88));
+
+  /* —— 圆角 —— */
+  --radius: 14px;
+  --radius-sm: 10px;
+  --radius-xs: 8px;
+  --radius-pill: 999px;
+
+  /* —— 字体 —— */
+  --font: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, "Courier New", monospace;
+
+  /* —— 间距 —— */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+
+  /* —— 尺寸 —— */
+  --topbar-h: 56px;
+  --content-pad: 18px;
+  --gap: 16px;
+  --drawer-w: 420px;
+  --modal-w: 520px;
+
+  /* —— 动效 —— */
+  --ease: cubic-bezier(.4, 0, .2, 1);
+  --dur: 200ms;
+
+  /* —— 阴影 —— */
+  --shadow-1: 0 2px 10px rgba(0, 0, 0, .32);
+  --shadow-2: 0 10px 34px rgba(0, 0, 0, .48);
+  --shadow-3: 0 22px 60px rgba(0, 0, 0, .58);
+  --inset: inset 0 1px 0 rgba(255, 255, 255, .04);
+
+  --z-drawer: 60;
+  --z-modal: 80;
+  --z-toast: 100;
+}
+
+/* 分类色工具类 */
+.c-video { --cat: var(--cat-video); }
+.c-game { --cat: var(--cat-game); }
+.c-social { --cat: var(--cat-social); }
+.c-web { --cat: var(--cat-web); }
+.c-download { --cat: var(--cat-download); }
+.c-mail { --cat: var(--cat-mail); }
+.c-cloud { --cat: var(--cat-cloud); }
+.c-other { --cat: var(--cat-other); }
+
+/* 语义色工具类 */
+.s-ok { --sem: var(--ok); }
+.s-warn { --sem: var(--warn); }
+.s-crit { --sem: var(--crit); }
+.s-info { --sem: var(--info); }
+.s-brand { --sem: var(--brand); }
+.s-mute { --sem: var(--text-2); }

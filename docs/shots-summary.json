@@ -1,0 +1,179 @@
+{
+  "generatedAt": "2026-10-31T09:18:14.404Z",
+  "baseUrl": "http://127.0.0.1:8083",
+  "browser": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+  "viewport": "1600x900@2x",
+  "pageWaitMs": 3500,
+  "shots": [
+    {
+      "id": "screen",
+      "route": "#/screen",
+      "title": "3D 托盘态势大屏",
+      "file": "docs/shots-screen.png",
+      "bytes": 2507652,
+      "navOk": true,
+      "canvas": {
+        "w": 3200,
+        "h": 1800,
+        "cw": 1600,
+        "ch": 900,
+        "colorRatio": 0,
+        "nonBlankRatio": 0,
+        "nonBlank": true,
+        "kind": "webgl",
+        "hasGL": true,
+        "glError": 0,
+        "dataUrlBytes": 154930,
+        "all": [
+          {
+            "w": 3200,
+            "h": 1800,
+            "cw": 1600,
+            "ch": 900,
+            "colorRatio": 0,
+            "nonBlankRatio": 0,
+            "nonBlank": true,
+            "kind": "webgl",
+            "hasGL": true,
+            "glError": 0,
+            "dataUrlBytes": 154930
+          }
+        ],
+        "mainCanvas": {
+          "w": 3200,
+          "h": 1800,
+          "cw": 1600,
+          "ch": 900,
+          "colorRatio": 0,
+          "nonBlankRatio": 0,
+          "nonBlank": true,
+          "kind": "webgl",
+          "hasGL": true,
+          "glError": 0,
+          "dataUrlBytes": 154930
+        }
+      }
+    },
+    {
+      "id": "overview",
+      "route": "#/overview",
+      "title": "总览",
+      "file": "docs/shots-overview.png",
+      "bytes": 624101,
+      "navOk": true
+    },
+    {
+      "id": "devices",
+      "route": "#/devices",
+      "title": "设备管理",
+      "file": "docs/shots-devices.png",
+      "bytes": 664573,
+      "navOk": true
+    },
+    {
+      "id": "traffic",
+      "route": "#/traffic",
+      "title": "流量分析",
+      "file": "docs/shots-traffic.png",
+      "bytes": 537415,
+      "navOk": true
+    },
+    {
+      "id": "behavior",
+      "route": "#/behavior",
+      "title": "行为管控",
+      "file": "docs/shots-behavior.png",
+      "bytes": 403288,
+      "navOk": true
+    },
+    {
+      "id": "security",
+      "route": "#/security",
+      "title": "安全态势",
+      "file": "docs/shots-security.png",
+      "bytes": 723210,
+      "navOk": true
+    },
+    {
+      "id": "settings",
+      "route": "#/settings",
+      "title": "设置",
+      "file": "docs/shots-settings.png",
+      "bytes": 583517,
+      "navOk": true
+    },
+    {
+      "id": "overview-disabled",
+      "route": "#/overview (enabled=false)",
+      "title": "系统未启用降级页",
+      "file": "docs/shots-overview-disabled.png",
+      "bytes": 612107,
+      "navOk": true
+    }
+  ],
+  "counts": {
+    "shots": 8,
+    "consoleErrors": 0,
+    "pageErrors": 0,
+    "requestFailures": 0,
+    "sseNavigationNoise": 7,
+    "http4xx5xx": 0,
+    "issues": 0
+  },
+  "consoleErrors": [],
+  "pageErrors": [],
+  "requestFailures": [],
+  "sseNoise": [
+    {
+      "kind": "sseNoise",
+      "page": "screen",
+      "method": "GET",
+      "url": "http://127.0.0.1:8083/api/stream",
+      "reason": "net::ERR_ABORTED"
+    },
+    {
+      "kind": "sseNoise",
+      "page": "overview",
+      "method": "GET",
+      "url": "http://127.0.0.1:8083/api/stream",
+      "reason": "net::ERR_ABORTED"
+    },
+    {
+      "kind": "sseNoise",
+      "page": "devices",
+      "method": "GET",
+      "url": "http://127.0.0.1:8083/api/stream",
+      "reason": "net::ERR_ABORTED"
+    },
+    {
+      "kind": "sseNoise",
+      "page": "traffic",
+      "method": "GET",
+      "url": "http://127.0.0.1:8083/api/stream",
+      "reason": "net::ERR_ABORTED"
+    },
+    {
+      "kind": "sseNoise",
+      "page": "behavior",
+      "method": "GET",
+      "url": "http://127.0.0.1:8083/api/stream",
+      "reason": "net::ERR_ABORTED"
+    },
+    {
+      "kind": "sseNoise",
+      "page": "security",
+      "method": "GET",
+      "url": "http://127.0.0.1:8083/api/stream",
+      "reason": "net::ERR_ABORTED"
+    },
+    {
+      "kind": "sseNoise",
+      "page": "settings",
+      "method": "GET",
+      "url": "http://127.0.0.1:8083/api/stream",
+      "reason": "net::ERR_ABORTED"
+    }
+  ],
+  "issues": [],
+  "passed": true
+}

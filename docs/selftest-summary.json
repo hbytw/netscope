@@ -1,0 +1,708 @@
+{
+  "generatedAt": "2026-10-31T10:15:10.844Z",
+  "baseUrl": "http://192.168.1.254:8088",
+  "user": "admin",
+  "total": 30,
+  "pass": 30,
+  "fail": 0,
+  "passed": true,
+  "results": [
+    {
+      "name": "/healthz",
+      "url": "/healthz",
+      "expect": "HTTP 200 且 {\"ok\":true}",
+      "actual": "HTTP 200 {\"enabled\":false,\"ok\":true,\"uptimeSec\":32}",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "鉴权拦截（未登录）",
+      "url": "/api/overview",
+      "expect": "HTTP 401",
+      "actual": "HTTP 401 {\"error\":\"unauthorized\"}",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "POST /api/login",
+      "url": "/api/login",
+      "expect": "HTTP 200 {\"ok\":true} + gl_session Cookie",
+      "actual": "HTTP 200 {\"expiresIn\":86400,\"ok\":true} cookie=true",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/session",
+      "url": "/api/session",
+      "expect": "HTTP 200 {\"authed\":true}",
+      "actual": "HTTP 200 {\"authed\":true,\"username\":\"admin\"}",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/overview",
+      "url": "/api/overview",
+      "expect": "HTTP 200，含 kpi/sys/categories/trend/topDevices",
+      "actual": "HTTP 200 {\"ts\":1793441692,\"kpi\":{\"online\":0,\"devices\":0,\"conns\":0,\"newConns\":0,\"dnsQps\":0,\"alerts\":0,\"upBps\":0,\"downBps\":0,\"riskLevel\":\"low\"},\"sys\":{\"cpuPct\":0,\"memPct\":0,\"memUsedMb\":0,\"load1\":0,\"uptimeSec\":0, …(已截断)",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/devices",
+      "url": "/api/devices",
+      "expect": "HTTP 200，devices 数组且含 ip/mac/online 字段",
+      "actual": "HTTP 200 {\"devices\":[]}",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/traffic?range=1h",
+      "url": "/api/traffic?range=1h",
+      "expect": "HTTP 200，range=1h，含 series/bucketSec/byCategory",
+      "actual": "HTTP 200 {\"range\":\"1h\",\"bucketSec\":30,\"series\":[],\"byCategory\":[{\"key\":\"video\",\"label\":\"视频流媒体\",\"up\":0,\"down\":0,\"share\":0,\"color\":\"#22d3ee\"},{\"key\":\"game\",\"label\":\"游戏\",\"up\":0,\"down\":0,\"share\":0,\"color\":\"#a78bfa …(已截断)",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/policies",
+      "url": "/api/policies",
+      "expect": "HTTP 200，policies 数组",
+      "actual": "HTTP 200 {\"policies\":[]}",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/events",
+      "url": "/api/events?limit=100",
+      "expect": "HTTP 200，events 数组 + summary",
+      "actual": "HTTP 200 {\"events\":[{\"id\":\"e-1793441430-648\",\"ts\":1793441430,\"severity\":\"info\",\"type\":\"device_online\",\"title\":\"设备上线：192.168.1.47\",\"detail\":\"设备 192.168.1.47（192.168.1.47）重新上线\",\"deviceIp\":\"192.168.1.47\",\"deviceN …(已截断)",
+      "ok": {
+        "critical": 0,
+        "warn": 8,
+        "info": 492,
+        "total": 500
+      },
+      "note": ""
+    },
+    {
+      "name": "GET /api/enforce/dns",
+      "url": "/api/enforce/dns",
+      "expect": "HTTP 200，domains 为字符串数组（已防拤域名明细）",
+      "actual": "HTTP 200 {\"domains\":[]}",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/enforce/status",
+      "url": "/api/enforce/status",
+      "expect": "HTTP 200，含 iptablesRules/tcDevices/dnsBlockedDomains/activePolicies/dnsTap",
+      "actual": "HTTP 200 {\"iptablesRules\":0,\"tcDevices\":0,\"dnsBlockedDomains\":0,\"activePolicies\":0,\"dnsTap\":false}",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/traffic?range=6h",
+      "url": "/api/traffic?range=6h",
+      "expect": "HTTP 200，range 匹配且 series 为数组",
+      "actual": "HTTP 200 bucketSec=120 len=0",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/traffic?range=24h",
+      "url": "/api/traffic?range=24h",
+      "expect": "HTTP 200，range 匹配且 series 为数组",
+      "actual": "HTTP 200 bucketSec=300 len=0",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/traffic?range=7d",
+      "url": "/api/traffic?range=7d",
+      "expect": "HTTP 200，range 匹配且 series 为数组",
+      "actual": "HTTP 200 bucketSec=1800 len=0",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/settings",
+      "url": "/api/settings",
+      "expect": "HTTP 200 且返回 JSON",
+      "actual": "HTTP 200 {\"enabled\":false,\"collect\":false,\"dnsTap\":false,\"deviceControl\":false,\"domainBlock\":false,\"schedule\":false,\"alerts\":false,\"history\":false,\"collectIntervalSec\":2,\"retentionDays\":14,\"alert\":{\"enable\":tr …(已截断)",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/system",
+      "url": "/api/system",
+      "expect": "HTTP 200 且返回 JSON",
+      "actual": "HTTP 200 {\"model\":\"\",\"arch\":\"\",\"kernel\":\"\",\"openwrt\":\"\",\"uptimeSec\":0,\"memTotalMb\":0,\"memFreeMb\":0,\"diskFreeMb\":0,\"hostname\":\"\",\"rssMb\":0,\"cpuPct\":0}",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/security/risk",
+      "url": "/api/security/risk",
+      "expect": "HTTP 200 且返回 JSON",
+      "actual": "HTTP 200 {\"level\":\"low\",\"devices\":[]}",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/settings（开关字段）",
+      "url": "/api/settings",
+      "expect": "含 enabled + 7 个功能开关（enabled, collect, dnsTap, deviceControl, domainBlock, schedule, alerts, history）",
+      "actual": "HTTP 200 缺失=无 enabled=false",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "POST /api/settings/toggle（enabled=false）",
+      "url": "/api/settings/toggle",
+      "expect": "HTTP 200，返回变更后的 settings",
+      "actual": "HTTP 200 {\"applied\":[],\"hint\":\"系统未启用：不采集、不管控、不影响路由器现有功能\",\"ok\":true,\"pending\":[\"collect\",\"dnsTap\",\"deviceControl\",\"domainBlock\",\"schedule\",\"alerts\",\"history\"],\"revoked\":[],\"settings\":{\"enabled\":false,\"collect\": …(已截断)",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/overview（未启用时）",
+      "url": "/api/overview",
+      "expect": "HTTP 200（不得 5xx），devices 空数组，kpi 全 0",
+      "actual": "HTTP 200 devices=0 kpiAllZero=true",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/devices（未启用）",
+      "url": "/api/devices",
+      "expect": "HTTP 200（不得 5xx）",
+      "actual": "HTTP 200 {\"devices\":[]}",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/traffic（未启用）",
+      "url": "/api/traffic?range=1h",
+      "expect": "HTTP 200（不得 5xx）",
+      "actual": "HTTP 200 {\"range\":\"1h\",\"bucketSec\":30,\"series\":[],\"byCategory\":[{\"key\":\"video\",\"label\":\"视频流媒体\",\"up\":0,\"down\":0,\"share\":0,\"color\": …(已截断)",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/events（未启用）",
+      "url": "/api/events?limit=100",
+      "expect": "HTTP 200（不得 5xx）",
+      "actual": "HTTP 200 {\"events\":[{\"id\":\"e-1793441430-648\",\"ts\":1793441430,\"severity\":\"info\",\"type\":\"device_online\",\"title\":\"设备上线：192.168.1.47\" …(已截断)",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/enforce/status（未启用）",
+      "url": "/api/enforce/status",
+      "expect": "HTTP 200（不得 5xx）",
+      "actual": "HTTP 200 {\"iptablesRules\":0,\"tcDevices\":0,\"dnsBlockedDomains\":0,\"activePolicies\":0,\"dnsTap\":false}",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "POST /api/settings/toggle（enabled=true，语义 A）",
+      "url": "/api/settings/toggle",
+      "expect": "HTTP 200，返回 pending（仍关闭的子开关）与 hint",
+      "actual": "HTTP 200 pending=7项 hint=有",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "PUT /api/settings（开启子开关）",
+      "url": "/api/settings",
+      "expect": "HTTP 200，接受 enabled/collect/alerts/history/dnsTap 子集",
+      "actual": "HTTP 200 {\"applied\":[\"已开启 dnsmasq 日志旁挂（UCI + stop/start + 健康检查）\",\"已启动流量采集\",\"安全告警研判已启用\",\"历史统计已启用\"],\"hint\":\"系统已启用；以下功能开关仍为关闭状态：deviceControl, domainBlock, schedule\",\"ok\":t …(已截断)",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /api/overview（子开关开启后）",
+      "url": "/api/overview",
+      "expect": "HTTP 200，devices 非空、kpi 有数据",
+      "actual": "HTTP 200 devices=5 kpiHasData=true",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "PUT /api/settings（恢复原开关集）",
+      "url": "/api/settings",
+      "expect": "HTTP 200，子开关逐项恢复原值",
+      "actual": "HTTP 200 {\"applied\":[],\"hint\":\"系统未启用：不采集、不管控、不影响路由器现有功能\",\"ok\":true,\"pending\":[\"collect\",\"dnsTap\",\"deviceControl\",\"domainBlock\",\"schedule\",\"alerts\",\"history\"],\"revoked\":[ …(已截断)",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "开关状态恢复确认",
+      "url": "/api/settings",
+      "expect": "enabled === false（原状态）",
+      "actual": "HTTP 200 enabled=false",
+      "ok": true,
+      "note": ""
+    },
+    {
+      "name": "GET /healthz（含 enabled 字段）",
+      "url": "/healthz",
+      "expect": "HTTP 200 且含 enabled 字段",
+      "actual": "HTTP 200 {\"enabled\":false,\"ok\":true,\"uptimeSec\":49}",
+      "ok": true,
+      "note": ""
+    }
+  ],
+  "snippets": {
+    "/healthz": {
+      "status": 200,
+      "latencyMs": 41,
+      "body": {
+        "enabled": false,
+        "ok": true,
+        "uptimeSec": 32
+      }
+    },
+    "/api/login": {
+      "status": 200,
+      "body": {
+        "expiresIn": 86400,
+        "ok": true
+      },
+      "cookieSet": true
+    },
+    "/api/session": {
+      "status": 200,
+      "body": {
+        "authed": true,
+        "username": "admin"
+      }
+    },
+    "GET /api/overview": {
+      "status": 200,
+      "latencyMs": 18,
+      "body": {
+        "kpi": {
+          "online": 0,
+          "devices": 0,
+          "conns": 0,
+          "newConns": 0,
+          "dnsQps": 0,
+          "alerts": 0,
+          "upBps": 0,
+          "downBps": 0,
+          "riskLevel": "low"
+        },
+        "sys": {
+          "cpuPct": 0,
+          "memPct": 0,
+          "memUsedMb": 0,
+          "load1": 0,
+          "uptimeSec": 0,
+          "tempC": 0,
+          "connCount": 0
+        },
+        "categoriesCount": 8,
+        "categories": [
+          {
+            "key": "video",
+            "label": "视频流媒体",
+            "share": 0
+          },
+          {
+            "key": "game",
+            "label": "游戏",
+            "share": 0
+          },
+          {
+            "key": "social",
+            "label": "社交聊天",
+            "share": 0
+          },
+          {
+            "key": "web",
+            "label": "网页浏览",
+            "share": 0
+          },
+          {
+            "key": "download",
+            "label": "下载更新",
+            "share": 0
+          },
+          {
+            "key": "mail",
+            "label": "邮件",
+            "share": 0
+          },
+          {
+            "key": "cloud",
+            "label": "云盘存储",
+            "share": 0
+          },
+          {
+            "key": "other",
+            "label": "其他",
+            "share": 0
+          }
+        ],
+        "trendLen": 0,
+        "topDevices": [],
+        "alerts": 0
+      }
+    },
+    "GET /api/devices": {
+      "status": 200,
+      "latencyMs": 17,
+      "body": {
+        "count": 0,
+        "online": 0,
+        "sample": []
+      }
+    },
+    "GET /api/traffic?range=1h": {
+      "status": 200,
+      "latencyMs": 10,
+      "body": {
+        "range": "1h",
+        "bucketSec": 30,
+        "seriesLen": 0,
+        "seriesTail": [],
+        "byCategory": [
+          {
+            "key": "video",
+            "label": "视频流媒体",
+            "share": 0
+          },
+          {
+            "key": "game",
+            "label": "游戏",
+            "share": 0
+          },
+          {
+            "key": "social",
+            "label": "社交聊天",
+            "share": 0
+          },
+          {
+            "key": "web",
+            "label": "网页浏览",
+            "share": 0
+          },
+          {
+            "key": "download",
+            "label": "下载更新",
+            "share": 0
+          },
+          {
+            "key": "mail",
+            "label": "邮件",
+            "share": 0
+          },
+          {
+            "key": "cloud",
+            "label": "云盘存储",
+            "share": 0
+          },
+          {
+            "key": "other",
+            "label": "其他",
+            "share": 0
+          }
+        ],
+        "byDeviceTop": [],
+        "byAppTop": [
+          {
+            "key": "video",
+            "label": "视频流媒体",
+            "share": 0
+          },
+          {
+            "key": "game",
+            "label": "游戏",
+            "share": 0
+          },
+          {
+            "key": "social",
+            "label": "社交聊天",
+            "share": 0
+          }
+        ]
+      }
+    },
+    "GET /api/policies": {
+      "status": 200,
+      "latencyMs": 14,
+      "body": {
+        "count": 0,
+        "sample": []
+      }
+    },
+    "GET /api/events": {
+      "status": 200,
+      "latencyMs": 28,
+      "body": {
+        "summary": {
+          "critical": 0,
+          "warn": 8,
+          "info": 492,
+          "total": 500
+        },
+        "count": 100,
+        "sample": [
+          {
+            "id": "e-1793441430-648",
+            "ts": 1793441430,
+            "severity": "info",
+            "type": "device_online",
+            "title": "设备上线：192.168.1.47",
+            "deviceIp": "192.168.1.47"
+          },
+          {
+            "id": "e-1793441430-647",
+            "ts": 1793441430,
+            "severity": "info",
+            "type": "device_online",
+            "title": "设备上线：10.3.181.95",
+            "deviceIp": "10.3.181.95"
+          },
+          {
+            "id": "e-1793441430-646",
+            "ts": 1793441430,
+            "severity": "info",
+            "type": "device_online",
+            "title": "设备上线：10.10.10.3",
+            "deviceIp": "10.10.10.3"
+          }
+        ]
+      }
+    },
+    "GET /api/enforce/dns": {
+      "status": 200,
+      "latencyMs": 21,
+      "body": {
+        "count": 0,
+        "domains": []
+      }
+    },
+    "GET /api/enforce/status": {
+      "status": 200,
+      "latencyMs": 8,
+      "body": {
+        "iptablesRules": 0,
+        "tcDevices": 0,
+        "dnsBlockedDomains": 0,
+        "activePolicies": 0,
+        "dnsTap": false
+      }
+    },
+    "GET /api/settings": {
+      "status": 200,
+      "body": {
+        "enabled": false,
+        "collect": false,
+        "dnsTap": false,
+        "deviceControl": false,
+        "domainBlock": false,
+        "schedule": false,
+        "alerts": false,
+        "history": false,
+        "collectIntervalSec": 2,
+        "retentionDays": 14,
+        "alert": {
+          "enable": true,
+          "scanPorts": 20,
+          "trafficMbPerHour": 500
+        },
+        "version": "1.0.0",
+        "dataDir": "/mnt/mmcblk2p4/guanlan/data"
+      }
+    },
+    "GET /api/system": {
+      "status": 200,
+      "body": {
+        "model": "",
+        "arch": "",
+        "kernel": "",
+        "openwrt": "",
+        "uptimeSec": 0,
+        "memTotalMb": 0,
+        "memFreeMb": 0,
+        "diskFreeMb": 0,
+        "hostname": "",
+        "rssMb": 0,
+        "cpuPct": 0
+      }
+    },
+    "GET /api/security/risk": {
+      "status": 200,
+      "body": {
+        "level": "low",
+        "devices": []
+      }
+    },
+    "GET /api/settings（开关字段）": {
+      "status": 200,
+      "body": {
+        "enabled": false,
+        "collect": false,
+        "dnsTap": false,
+        "deviceControl": false,
+        "domainBlock": false,
+        "schedule": false,
+        "alerts": false,
+        "history": false,
+        "collectIntervalSec": 2,
+        "retentionDays": 14,
+        "alert": {
+          "enable": true,
+          "scanPorts": 20,
+          "trafficMbPerHour": 500
+        },
+        "version": "1.0.0",
+        "dataDir": "/mnt/mmcblk2p4/guanlan/data"
+      }
+    },
+    "POST /api/settings/toggle（enabled=false）": {
+      "status": 200,
+      "body": {
+        "applied": [],
+        "hint": "系统未启用：不采集、不管控、不影响路由器现有功能",
+        "ok": true,
+        "pending": [
+          "collect",
+          "dnsTap",
+          "deviceControl",
+          "domainBlock",
+          "schedule",
+          "alerts",
+          "history"
+        ],
+        "revoked": [],
+        "settings": {
+          "enabled": false,
+          "collect": false,
+          "dnsTap": false,
+          "deviceControl": false,
+          "domainBlock": false,
+          "schedule": false,
+          "alerts": false,
+          "history": false,
+          "collectIntervalSec": 2,
+          "retentionDays": 14,
+          "alert": {
+            "enable": true,
+            "scanPorts": 20,
+            "trafficMbPerHour": 500
+          },
+          "version": "1.0.0",
+          "dataDir": "/mnt/mmcblk2p4/guanlan/data"
+        }
+      }
+    },
+    "GET /api/overview（未启用时）": {
+      "status": 200,
+      "deviceCount": 0,
+      "kpi": {
+        "online": 0,
+        "devices": 0,
+        "conns": 0,
+        "newConns": 0,
+        "dnsQps": 0,
+        "alerts": 0,
+        "upBps": 0,
+        "downBps": 0,
+        "riskLevel": "low"
+      },
+      "latencyMs": 13
+    },
+    "POST /api/settings/toggle（enabled=true）": {
+      "status": 200,
+      "pending": [
+        "collect",
+        "dnsTap",
+        "deviceControl",
+        "domainBlock",
+        "schedule",
+        "alerts",
+        "history"
+      ],
+      "hint": "系统已启用，但功能开关均未开启，数据仍为空；请按需开启流量采集等开关",
+      "applied": [
+        "系统总开关已开启"
+      ],
+      "revoked": [],
+      "settings": {
+        "enabled": true,
+        "collect": false,
+        "dnsTap": false,
+        "deviceControl": false,
+        "domainBlock": false,
+        "schedule": false,
+        "alerts": false,
+        "history": false,
+        "collectIntervalSec": 2,
+        "retentionDays": 14,
+        "alert": {
+          "enable": true,
+          "scanPorts": 20,
+          "trafficMbPerHour": 500
+        },
+        "version": "1.0.0",
+        "dataDir": "/mnt/mmcblk2p4/guanlan/data"
+      }
+    },
+    "PUT /api/settings（开启子开关）": {
+      "status": 200,
+      "body": {
+        "applied": [
+          "已开启 dnsmasq 日志旁挂（UCI + stop/start + 健康检查）",
+          "已启动流量采集",
+          "安全告警研判已启用",
+          "历史统计已启用"
+        ],
+        "hint": "系统已启用；以下功能开关仍为关闭状态：deviceControl, domainBlock, schedule",
+        "ok": true,
+        "pending": [
+          "deviceControl",
+          "domainBlock",
+          "schedule"
+        ],
+        "revoked": [],
+        "settings": {
+          "enabled": true,
+          "collect": true,
+          "dnsTap": true,
+          "deviceControl": false,
+          "domainBlock": false,
+          "schedule": false,
+          "alerts": true,
+          "history": true,
+          "collectIntervalSec": 2,
+          "retentionDays": 14,
+          "alert": {
+            "enable": true,
+            "scanPorts": 20,
+            "trafficMbPerHour": 500
+          },
+          "version": "1.0.0",
+          "dataDir": "/mnt/mmcblk2p4/guanlan/data"
+        }
+      }
+    },
+    "GET /api/overview（恢复后）": {
+      "status": 200,
+      "deviceCount": 5,
+      "kpi": {
+        "online": 115,
+        "devices": 115,
+        "conns": 6354,
+        "newConns": 4308,
+        "dnsQps": 0,
+        "alerts": 500,
+        "upBps": 6520956,
+        "downBps": 6451624,
+        "riskLevel": "guard"
+      }
+    }
+  }
+}

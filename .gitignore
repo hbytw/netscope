@@ -1,0 +1,21 @@
+# ---------- 构建产物 ----------
+dist/
+/temp/
+app/tmpdata/
+
+# ---------- 依赖 ----------
+node_modules/
+tools/verify/node_modules/
+
+# ---------- 调试/临时产物 ----------
+tools/verify/shot-*.png
+tools/verify/dbg-*.mjs
+docs/shots-3d/
+docs/shots-ui/
+*.log
+*.tmp
+
+# ---------- 系统 ----------
+.DS_Store
+Thumbs.db
+desktop.ini

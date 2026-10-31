@@ -1,0 +1,17 @@
+{
+  "name": "guanlan-verify",
+  "version": "1.0.0",
+  "private": true,
+  "description": "观澜 NetScope 验收取证工具：无头 Chrome 截图 + 接口自检",
+  "type": "module",
+  "main": "shots.mjs",
+  "scripts": {
+    "shots": "node shots.mjs",
+    "selftest": "node selftest.mjs",
+    "verify": "node selftest.mjs && node shots.mjs && node report.mjs",
+    "report": "node report.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.64.1"
+  }
+}

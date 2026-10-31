@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#05070d">
+<meta name="description" content="观澜 NetScope · 3D 托盘态势大屏（独立窗口）">
+<title>观澜 NetScope · 3D 托盘态势大屏</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%2322d3ee' stroke-width='2.5'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%2322d3ee'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="./css/theme.css">
+<link rel="stylesheet" href="./css/screen.css">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #05070d; overflow: hidden; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    color: var(--text-1, #9fb0cc);
+    -webkit-font-smoothing: antialiased;
+  }
+  #gl-screen-host { position: fixed; inset: 0; }
+  .gl-boot {
+    position: fixed; inset: 0; z-index: 20;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+    background: radial-gradient(1200px 800px at 50% 40%, #08101c, #04060b 76%);
+    text-align: center; padding: 24px;
+  }
+  .gl-boot-mark {
+    width: 56px; height: 56px; border-radius: 16px; display: grid; place-items: center;
+    font-size: 15px; font-weight: 700; letter-spacing: .18em; color: #05070d;
+    background: conic-gradient(from 210deg, #22d3ee, #7c5cff, #22d3ee);
+    box-shadow: 0 0 42px rgba(34, 211, 238, .35);
+  }
+  .gl-boot-title { font-size: 18px; font-weight: 600; letter-spacing: .08em; color: var(--text-0, #e8eefc); }
+  .gl-boot-sub { max-width: 420px; font-size: 12.5px; line-height: 1.75; color: var(--text-2, #5d6f8c); }
+  .gl-boot-btn {
+    display: inline-flex; align-items: center; gap: 8px; margin-top: 6px;
+    padding: 9px 18px; border-radius: 9px; text-decoration: none;
+    font-size: 13px; font-weight: 600; color: #05070d; background: var(--brand, #22d3ee);
+    box-shadow: 0 0 24px rgba(34, 211, 238, .3);
+  }
+  .gl-boot-btn:hover { filter: brightness(1.08); }
+  .gl-boot-spinner {
+    width: 18px; height: 18px; border-radius: 50%;
+    border: 2px solid rgba(34, 211, 238, .2); border-top-color: #22d3ee;
+    animation: gl-boot-spin .9s linear infinite;
+  }
+  @keyframes gl-boot-spin { to { transform: rotate(360deg); } }
+</style>
+<script type="importmap">
+{"imports":{"three":"./js/vendor/three.module.js","three/addons/":"./js/vendor/addons/"}}
+</script>
+</head>
+<body>
+<div id="gl-screen-host"></div>
+
+<div class="gl-boot" id="gl-boot">
+  <div class="gl-boot-mark">观澜</div>
+  <div class="gl-boot-spinner"></div>
+  <div class="gl-boot-sub">正在加载 3D 托盘态势大屏…</div>
+</div>
+
+<script type="module">
+  import { api, MOCK_MODE, onUnauthorized } from './js/api.js';
+
+  const host = document.getElementById('gl-screen-host');
+  const boot = document.getElementById('gl-boot');
+  let mounted = false;
+
+  function showLogin(message) {
+    if (mounted) return;
+    boot.innerHTML = '';
+    const mark = document.createElement('div');
+    mark.className = 'gl-boot-mark';
+    mark.textContent = '观澜';
+    const title = document.createElement('div');
+    title.className = 'gl-boot-title';
+    title.textContent = '请先登录';
+    const sub = document.createElement('div');
+    sub.className = 'gl-boot-sub';
+    sub.textContent = message || '3D 托盘态势大屏需要登录后访问，请先返回管理界面登录。';
+    const link = document.createElement('a');
+    link.className = 'gl-boot-btn';
+    link.href = './index.html';
+    link.textContent = '返回登录页';
+    boot.appendChild(mark);
+    boot.appendChild(title);
+    boot.appendChild(sub);
+    boot.appendChild(link);
+  }
+
+  function showError(message) {
+    boot.innerHTML = '';
+    const mark = document.createElement('div');
+    mark.className = 'gl-boot-mark';
+    mark.textContent = '观澜';
+    const title = document.createElement('div');
+    title.className = 'gl-boot-title';
+    title.textContent = '大屏加载失败';
+    const sub = document.createElement('div');
+    sub.className = 'gl-boot-sub';
+    sub.textContent = String(message || '未知错误');
+    const link = document.createElement('a');
+    link.className = 'gl-boot-btn';
+    link.href = './index.html';
+    link.textContent = '返回管理界面';
+    boot.appendChild(mark);
+    boot.appendChild(title);
+    boot.appendChild(sub);
+    boot.appendChild(link);
+  }
+
+  // 会话失效时（模拟/真实）切到登录提示，不依赖 app.js 外壳
+  try {
+    onUnauthorized(() => showLogin('登录状态已失效，请重新登录。'));
+  } catch (_) {
+    /* ignore */
+  }
+
+  async function start() {
+    // mock 模式（?mock=1）不请求会话接口；真实环境先校验登录态
+    if (!MOCK_MODE && typeof api.session === 'function') {
+      try {
+        const s = await api.session();
+        if (!s || s.authed === false) {
+          showLogin();
+          return;
+        }
+      } catch (err) {
+        showLogin('登录状态校验失败：' + (err && err.message ? err.message : err));
+        return;
+      }
+    }
+
+    let mod;
+    try {
+      mod = await import('./js/3d/screen.js');
+    } catch (err) {
+      console.error('[screen.html] 3D 模块加载失败：', err);
+      showError('3D 模块加载失败：' + (err && err.message ? err.message : err));
+      return;
+    }
+    if (!mod || typeof mod.mountScreen !== 'function') {
+      showError('3D 模块未导出 mountScreen');
+      return;
+    }
+    try {
+      if (boot && boot.parentNode) boot.parentNode.removeChild(boot);
+      mounted = true;
+      mod.mountScreen(host, api, { standalone: true });
+      document.title = '观澜 NetScope · 3D 托盘态势大屏';
+    } catch (err) {
+      console.error('[screen.html] mountScreen 失败：', err);
+      mounted = false;
+      showError('3D 大屏初始化失败：' + (err && err.message ? err.message : err));
+    }
+  }
+
+  start();
+</script>
+</body>
+</html>

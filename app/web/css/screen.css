@@ -1,0 +1,140 @@
+/* ==========================================================================
+   观澜 NetScope · 大屏 HUD（#/screen）
+   依据 docs/design.md §6.4 HUD 浮层
+   ========================================================================== */
+
+.screen-root {
+  position: fixed; inset: 0; z-index: 10;
+  background: radial-gradient(1200px 800px at 50% 40%, #08101c, #04060b 76%);
+  overflow: hidden;
+}
+.screen-canvas-host { position: absolute; inset: 0; }
+.screen-canvas-host canvas { display: block; width: 100%; height: 100%; }
+
+/* HUD 容器：pointer-events:none，子面板可交互 */
+.screen-hud {
+  position: absolute; inset: 0; pointer-events: none;
+  padding: 20px 24px; display: grid;
+  grid-template-columns: minmax(240px, 300px) 1fr minmax(240px, 320px);
+  grid-template-rows: auto 1fr auto;
+  gap: 16px;
+}
+.screen-hud > * { pointer-events: auto; }
+
+.hud-panel {
+  background: linear-gradient(180deg, rgba(16,24,39,.72), rgba(10,15,26,.80));
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow-2), var(--inset);
+  padding: 13px 15px;
+  position: relative; overflow: hidden;
+}
+.hud-panel::before {
+  content: ''; position: absolute; top: 0; left: 14px; right: 14px; height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(34,211,238,.55), transparent);
+}
+.hud-title {
+  font-size: 11px; font-weight: 600; letter-spacing: .18em; color: var(--text-2);
+  text-transform: uppercase; margin-bottom: 9px; display: flex; align-items: center; gap: 7px;
+}
+.hud-title::before { content: ''; width: 3px; height: 11px; border-radius: 2px; background: var(--brand); box-shadow: 0 0 8px var(--brand); }
+
+/* 左上：品牌 */
+.hud-brand { grid-column: 1; grid-row: 1; align-self: start; }
+.hud-brand-main { display: flex; align-items: center; gap: 11px; }
+.hud-brand-logo {
+  width: 36px; height: 36px; border-radius: 11px; flex: 0 0 auto;
+  display: grid; place-items: center;
+  background: radial-gradient(120% 120% at 28% 18%, rgba(34,211,238,.32), rgba(124,92,255,.14));
+  border: 1px solid rgba(34,211,238,.42); box-shadow: var(--glow-soft);
+}
+.hud-brand-logo::after {
+  content: ''; width: 14px; height: 14px; border-radius: 50%;
+  border: 2px solid var(--brand); border-top-color: transparent; border-right-color: rgba(124,92,255,.9);
+  animation: spin 5.5s linear infinite;
+}
+.hud-brand-name { font-size: 17px; font-weight: 700; letter-spacing: .08em; line-height: 1.15; }
+.hud-brand-name em { font-style: normal; color: var(--brand); }
+.hud-brand-sub { font-size: 11px; color: var(--text-2); letter-spacing: .16em; margin-top: 2px; }
+.hud-clock { margin-top: 11px; padding-top: 10px; border-top: 1px solid var(--line-soft); display: flex; align-items: baseline; gap: 9px; }
+.hud-clock .t { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: .04em; }
+.hud-clock .d { font-size: 11.5px; color: var(--text-2); }
+
+/* 右上：KPI */
+.hud-kpis { grid-column: 3; grid-row: 1; align-self: start; }
+.hud-kpi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.hud-kpi {
+  padding: 9px 11px; border-radius: var(--radius-sm);
+  background: rgba(148,163,184,.055); border: 1px solid var(--line-soft);
+  position: relative; overflow: hidden;
+}
+.hud-kpi::after {
+  content: ''; position: absolute; inset: auto -12px -18px auto; width: 68px; height: 68px; border-radius: 50%;
+  background: radial-gradient(circle, color-mix(in srgb, var(--sem, var(--brand)) 20%, transparent), transparent 70%);
+}
+.hud-kpi .k { font-size: 11px; color: var(--text-2); }
+.hud-kpi .v { font-size: 25px; font-weight: 700; line-height: 1.2; color: var(--text-0); font-variant-numeric: tabular-nums; }
+.hud-kpi .v .u { font-size: 11px; color: var(--text-2); margin-left: 3px; font-weight: 500; }
+.hud-kpi .v.crit { color: var(--crit); }
+
+/* 右侧：告警流 */
+.hud-alerts { grid-column: 3; grid-row: 2; align-self: start; max-height: 40vh; overflow: hidden; display: flex; flex-direction: column; }
+.hud-alert-list { display: flex; flex-direction: column; gap: 7px; overflow: hidden; }
+.hud-alert {
+  display: flex; gap: 8px; align-items: flex-start;
+  padding: 7px 9px; border-radius: 8px;
+  background: rgba(148,163,184,.06); border-left: 2px solid var(--sem, var(--info));
+}
+.hud-alert .t { font-size: 11.5px; color: var(--text-0); line-height: 1.35; }
+.hud-alert .m { font-size: 10.5px; color: var(--text-2); margin-top: 1px; }
+
+/* 左下：分类图例 */
+.hud-legend { grid-column: 1; grid-row: 3; align-self: end; }
+.hud-legend-list { display: flex; flex-direction: column; gap: 6px; }
+.hud-legend-row { display: grid; grid-template-columns: 10px 1fr 54px; align-items: center; gap: 8px; font-size: 11.5px; }
+.hud-legend-row .sw { width: 9px; height: 9px; border-radius: 3px; background: var(--c); box-shadow: 0 0 8px var(--c); }
+.hud-legend-row .n { color: var(--text-1); }
+.hud-legend-row .p { text-align: right; color: var(--text-0); font-variant-numeric: tabular-nums; }
+
+/* 底部中央：Top 5 */
+.hud-top { grid-column: 2; grid-row: 3; align-self: end; justify-self: center; width: min(640px, 100%); }
+.hud-top-list { display: flex; flex-direction: column; gap: 7px; }
+.hud-top-row { display: grid; grid-template-columns: 110px 1fr 74px; align-items: center; gap: 10px; font-size: 11.5px; }
+.hud-top-row .n { color: var(--text-1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hud-top-row .bar { height: 7px; border-radius: 4px; background: rgba(148,163,184,.10); overflow: hidden; }
+.hud-top-row .bar > i { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, var(--brand), var(--brand-2)); box-shadow: 0 0 9px rgba(34,211,238,.5); }
+.hud-top-row .v { text-align: right; color: var(--text-0); font-variant-numeric: tabular-nums; }
+
+/* 中部：3D 场景标题 */
+.hud-center { grid-column: 2; grid-row: 2; align-self: start; justify-self: center; text-align: center; pointer-events: none; }
+.hud-center-title { font-size: 12px; letter-spacing: .38em; color: rgba(159,176,204,.5); text-transform: uppercase; }
+.hud-center-line { width: 200px; height: 1px; margin: 9px auto 0; background: linear-gradient(90deg, transparent, rgba(34,211,238,.42), transparent); }
+
+/* 退出提示 */
+.hud-exit {
+  position: absolute; right: 24px; bottom: 20px; pointer-events: auto;
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 11px; border-radius: var(--radius-pill);
+  background: rgba(16,24,39,.75); border: 1px solid var(--line);
+  font-size: 11.5px; color: var(--text-2); cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+.hud-exit:hover { color: var(--brand); border-color: rgba(34,211,238,.42); }
+
+/* 降级提示条 */
+.screen-fallback-note {
+  position: absolute; left: 50%; top: 14px; transform: translateX(-50%);
+  z-index: 12; pointer-events: none;
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 13px; border-radius: var(--radius-pill);
+  background: rgba(251,191,36,.12); border: 1px solid rgba(251,191,36,.4);
+  color: #ffe0a3; font-size: 11.5px;
+  backdrop-filter: blur(8px);
+}
+
+@media (max-width: 1200px) {
+  .screen-hud { grid-template-columns: minmax(200px, 250px) 1fr; grid-template-rows: auto 1fr auto; }
+  .hud-kpis { grid-column: 2; grid-row: 1; }
+  .hud-alerts { display: none; }
+  .hud-top { grid-column: 1 / -1; }
+}

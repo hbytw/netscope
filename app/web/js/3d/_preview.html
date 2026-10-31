@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>NetScope 3D Tray · Preview OK</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05070d; overflow: hidden; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; color: #9fb0cc; }
+  #stage { position: fixed; inset: 0; }
+  .panel {
+    position: fixed; z-index: 10; display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+    padding: 10px 12px; border-radius: 12px; border: 1px solid rgba(148,163,184,.16);
+    background: linear-gradient(180deg, rgba(16,24,39,.82), rgba(10,15,26,.9));
+    backdrop-filter: blur(12px); font-size: 12px; pointer-events: auto;
+  }
+  #controls { left: 16px; top: 16px; max-width: 520px; }
+  #status { left: 16px; bottom: 16px; font-variant-numeric: tabular-nums; color: #8fa6c4; }
+  #status b { color: #22d3ee; font-weight: 600; }
+  button {
+    height: 28px; padding: 0 10px; border-radius: 7px; cursor: pointer; font-size: 12px;
+    color: #cfe3f5; background: rgba(34,211,238,.08); border: 1px solid rgba(34,211,238,.32);
+  }
+  button:hover { background: rgba(34,211,238,.18); }
+  button.active { background: rgba(34,211,238,.28); color: #eafcff; border-color: rgba(34,211,238,.72); }
+  .sep { width: 1px; height: 18px; background: rgba(148,163,184,.2); margin: 0 4px; }
+  #err {
+    position: fixed; right: 16px; bottom: 16px; z-index: 11; max-width: 46vw; max-height: 34vh;
+    overflow: auto; margin: 0; padding: 10px 12px; border-radius: 10px; display: none;
+    background: rgba(60,12,20,.94); border: 1px solid rgba(251,113,133,.6); color: #ffc8d2;
+    font: 11px/1.5 ui-monospace, Consolas, monospace; white-space: pre-wrap;
+  }
+  #err.show { display: block; }
+  .title { color: #e8eefc; font-weight: 600; letter-spacing: .02em; }
+  .dim { color: #5d6f8c; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "../vendor/three.module.js",
+    "three/addons/": "../vendor/addons/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="stage"></div>
+
+<div id="controls" class="panel">
+  <span class="title">3D 托盘自测</span>
+  <span class="sep"></span>
+  <button data-count="8" class="active">8 台</button>
+  <button data-count="24">24 台</button>
+  <span class="sep"></span>
+  <button id="btn-pause">暂停</button>
+  <span class="sep"></span>
+  <button data-quality="high" class="active">high</button>
+  <button data-quality="medium">medium</button>
+  <span class="sep"></span>
+  <button id="btn-focus">聚焦首个设备</button>
+  <button id="btn-reset">复位视角</button>
+</div>
+
+<div id="status" class="panel"><span id="stat-text">booting…</span></div>
+<pre id="err"></pre>
+
+<script type="module">
+  const errBox = document.getElementById('err');
+  const errors = [];
+  function showError(msg) {
+    errors.push(String(msg));
+    errBox.textContent = errors.join('\n\n');
+    errBox.classList.add('show');
+    document.title = 'NetScope 3D Tray · ERROR';
+  }
+  window.addEventListener('error', (e) => showError(e.error && e.error.stack ? e.error.stack : e.message));
+  window.addEventListener('unhandledrejection', (e) => showError('unhandledrejection: ' + (e.reason && e.reason.stack ? e.reason.stack : e.reason)));
+  const origError = console.error.bind(console);
+  console.error = (...args) => { showError(args.map((a) => (a && a.stack) || String(a)).join(' ')); origError(...args); };
+
+  const { createTrayScene, CATEGORY_META } = await import('./tray.js');
+
+  /* ------------------------------------------------------------------
+   * 合成数据（字段严格按 docs/api.md §8）
+   * ------------------------------------------------------------------ */
+  const DEVICE_POOL = [
+    ['192.168.1.31', 'MEIZU-Note-16', '妈妈的手机', 'video', 0.2],
+    ['192.168.1.32', 'iPhone-15-Pro', '客厅 iPhone', 'social', 0.1],
+    ['192.168.1.33', 'Redmi-Turbo-3', '我的手机', 'game', 0.8],
+    ['192.168.1.34', 'Xiaomi-TV-6', '客厅电视', 'video', 0.05],
+    ['192.168.1.35', 'MacBook-Pro', '书房 Mac', 'web', 0.15],
+    ['192.168.1.36', 'DESKTOP-N1', '工作台', 'download', 0.3],
+    ['192.168.1.37', 'iPad-Air', '平板', 'video', 0.1],
+    ['192.168.1.38', 'Switch-OLED', '游戏机', 'game', 0.35],
+    ['192.168.1.39', 'Echo-Dot', '小爱音箱', 'other', 0.05],
+    ['192.168.1.40', 'Pixel-8', '测试机', 'web', 0.25],
+    ['192.168.1.41', 'HUAWEI-Mate60', '爸爸的手机', 'social', 0.1],
+    ['192.168.1.42', 'ThinkPad-X1', '办公本', 'mail', 0.2],
+    ['192.168.1.43', 'NAS-Synology', '家庭云盘', 'cloud', 0.15],
+    ['192.168.1.44', 'Raspberry-Pi', '树莓派', 'download', 0.45],
+    ['192.168.1.45', 'OPPO-Find-X6', '妹妹手机', 'social', 0.2],
+    ['192.168.1.46', 'Sony-Bravia', '卧室电视', 'video', 0.05],
+    ['192.168.1.47', 'OnePlus-12', '备用手机', 'game', 0.55],
+    ['192.168.1.48', 'Surface-Pro', '会议平板', 'web', 0.15],
+    ['192.168.1.49', 'HP-Printer', '打印机', 'other', 0.05],
+    ['192.168.1.50', 'Google-Nest', '智能门铃', 'other', 0.1],
+    ['192.168.1.51', 'Steam-Deck', '掌机', 'game', 0.65],
+    ['192.168.1.52', 'VM-Ubuntu', '虚拟机', 'download', 0.4],
+    ['192.168.1.53', 'Kindle-PW', '电纸书', 'other', 0.05],
+    ['192.168.1.54', 'Sonos-One', '音响', 'cloud', 0.05],
+  ];
+
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+  const randn = () => (Math.random() + Math.random() + Math.random() - 1.5) / 1.5;
+
+  const categoryTotals = new Map(CATEGORY_META.map((c) => [c.key, 0]));
+  const trendHistory = [];
+
+  let deviceCount = 8;
+  let devices = [];
+  let paused = false;
+  let tickNo = 0;
+
+  function buildDevices(n) {
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const p = DEVICE_POOL[i % DEVICE_POOL.length];
+      const [ip, hostname, alias, topCat, risk] = p;
+      const blocked = i === 2 && n >= 8;
+      const limited = i === 4 && n >= 8;
+      out.push({
+        ip: ip.replace(/\.\d+$/, (m) => '.' + (31 + i)),
+        name: hostname,
+        alias,
+        online: !(i === n - 1 && n > 16),
+        upBps: Math.round(rnd(2e3, 9e4)),
+        downBps: Math.round(rnd(2e5, 6e6)),
+        conns: Math.round(rnd(4, 60)),
+        risk: blocked ? 0.82 : limited ? 0.1 : risk,
+        blocked,
+        limitKbps: limited ? { down: 2000, up: 0 } : { down: 0, up: 0 },
+        topCat,
+      });
+    }
+    return out;
+  }
+
+  function tickState() {
+    tickNo += 1;
+    for (const d of devices) {
+      // 随机游走 + 突发
+      const burst = Math.random() < 0.06 ? rnd(2, 8) : 1;
+      d.downBps = Math.max(0, Math.round(d.downBps * rnd(0.82, 1.18) * burst));
+      d.upBps = Math.max(0, Math.round(d.upBps * rnd(0.85, 1.22)));
+      if (d.downBps > 1.2e7) d.downBps = 1.2e7;
+      d.conns = Math.max(1, Math.round(d.conns * rnd(0.9, 1.1)));
+      if (!d.blocked && Math.random() < 0.1) d.risk = Math.min(1, Math.max(0, d.risk + randn() * 0.08));
+    }
+    // 断网设备流量归零
+    for (const d of devices) if (d.blocked) { d.downBps = 0; d.upBps = 0; }
+
+    categoryTotals.forEach((v, k) => categoryTotals.set(k, 0));
+    for (const d of devices) {
+      const cat = d.topCat || 'other';
+      categoryTotals.set(cat, (categoryTotals.get(cat) || 0) + d.downBps + d.upBps);
+    }
+    const total = [...categoryTotals.values()].reduce((a, b) => a + b, 0) || 1;
+    const categories = CATEGORY_META.map((c) => ({
+      key: c.key,
+      upBps: Math.round((categoryTotals.get(c.key) || 0) * 0.06),
+      downBps: Math.round(categoryTotals.get(c.key) || 0),
+      share: (categoryTotals.get(c.key) || 0) / total,
+    }));
+
+    const totalDown = devices.reduce((a, d) => a + d.downBps, 0);
+    const totalUp = devices.reduce((a, d) => a + d.upBps, 0);
+    const ts = Math.floor(Date.now() / 1000);
+    trendHistory.push({ t: ts, up: totalUp, down: totalDown });
+    while (trendHistory.length > 60) trendHistory.shift();
+
+    return {
+      ts,
+      kpi: {
+        online: devices.filter((d) => !d.blocked && d.online !== false).length,
+        devices: devices.length,
+        conns: devices.reduce((a, d) => a + d.conns, 0),
+        newConns: Math.round(rnd(10, 80)),
+        dnsQps: rnd(1, 6),
+        alerts: 2,
+        upBps: totalUp,
+        downBps: totalDown,
+        riskLevel: 'low',
+      },
+      sys: { cpuPct: rnd(12, 38), memPct: rnd(30, 52), memUsedMb: 760, load1: 0.4, uptimeSec: 3600, tempC: 51, wanRxBps: totalDown, wanTxBps: totalUp, connCount: 14000 },
+      devices,
+      categories,
+      trendPoint: { t: ts, up: totalUp, down: totalDown },
+      wan: { rxBps: totalDown, txBps: totalUp },
+      trend: tickNo === 1 ? trendHistory.slice() : undefined,
+    };
+  }
+
+  /* ------------------------------------------------------------------
+   * HUD 模式用的 overview 合成数据（验证 screen.js 用）
+   * ------------------------------------------------------------------ */
+  function buildFakeAlerts() {
+    const now = Math.floor(Date.now() / 1000);
+    return [
+      { id: 'e-1', ts: now - 42, severity: 'warn', type: 'port_scan', title: '疑似端口扫描：192.168.1.33', deviceIp: '192.168.1.33', deviceName: '我的手机', acked: false },
+      { id: 'e-2', ts: now - 130, severity: 'critical', type: 'blacklist_domain', title: '命中黑名单域名：ads.tracker.example', deviceIp: '192.168.1.45', deviceName: '妹妹手机', acked: false },
+      { id: 'e-3', ts: now - 380, severity: 'info', type: 'new_device', title: '新设备入网：192.168.1.54', deviceIp: '192.168.1.54', deviceName: 'Sonos-One', acked: false },
+    ];
+  }
+
+  function buildOverview() {
+    const st = tickState();
+    const catState = new Map(st.categories.map((c) => [c.key, c]));
+    return {
+      ts: st.ts,
+      kpi: { ...st.kpi, devices: devices.length, online: devices.filter((d) => !d.blocked).length },
+      sys: st.sys,
+      categories: CATEGORY_META.map((c) => {
+        const s = catState.get(c.key) || { share: 0, upBps: 0, downBps: 0 };
+        return { key: c.key, label: c.label, color: c.color, share: s.share, upBps: s.upBps, downBps: s.downBps };
+      }),
+      trend: trendHistory.slice(),
+      topDevices: devices.map((d) => ({
+        ip: d.ip,
+        name: d.name,
+        alias: d.alias,
+        online: d.online !== false,
+        upBps: d.upBps,
+        downBps: d.downBps,
+        totalDown: 0,
+        risk: d.risk,
+        blocked: d.blocked,
+        topCat: d.topCat,
+      })),
+      alerts: buildFakeAlerts(),
+    };
+  }
+
+  /* ------------------------------------------------------------------
+   * 场景
+   * ------------------------------------------------------------------ */
+  const stage = document.getElementById('stage');
+  const params = new URLSearchParams(location.search);
+  if (params.get('devices')) deviceCount = Number(params.get('devices')) || deviceCount;
+  const qualityParam = params.get('q') === 'medium' ? 'medium' : 'high';
+  const hudMode = params.get('hud') === '1';
+  let scene = null;
+  let screenHandle = null;
+
+  if (hudMode) {
+    document.getElementById('controls').style.display = 'none';
+    document.getElementById('status').style.display = 'none';
+    for (let i = 0; i < 60; i++) trendHistory.push({ t: Math.floor(Date.now() / 1000) - (60 - i) * 2, up: 5e4, down: 3e6 });
+    devices = buildDevices(deviceCount);
+    const { mountScreen } = await import('./screen.js');
+    const disabledMode = params.get('disabled') === '1';
+    const incMode = params.get('inc') === '1';
+    const framesUrl = params.get('frames');
+
+    function emptyOverview() {
+      const ts = Math.floor(Date.now() / 1000);
+      return {
+        ts,
+        kpi: { online: 0, devices: 0, conns: 0, newConns: 0, dnsQps: 0, alerts: 0, upBps: 0, downBps: 0, riskLevel: 'low' },
+        sys: { cpuPct: 0, memPct: 0, memUsedMb: 0, load1: 0, uptimeSec: 0, tempC: 0, wanRxBps: 0, wanTxBps: 0, connCount: 0 },
+        categories: CATEGORY_META.map((c) => ({ key: c.key, label: c.label, color: c.color, share: 0, upBps: 0, downBps: 0 })),
+        trend: [],
+        topDevices: [],
+        alerts: [],
+      };
+    }
+
+    function emptyTick() {
+      const ts = Math.floor(Date.now() / 1000);
+      return {
+        ts,
+        kpi: { online: 0, devices: 0, conns: 0, newConns: 0, dnsQps: 0, alerts: 0, upBps: 0, downBps: 0, riskLevel: 'low' },
+        sys: {},
+        devices: [],
+        full: true,
+        deviceCount: 0,
+        categories: CATEGORY_META.map((c) => ({ key: c.key, upBps: 0, downBps: 0, share: 0 })),
+        trendPoint: { t: ts, up: 0, down: 0 },
+        wan: { rxBps: 0, txBps: 0 },
+      };
+    }
+
+    const mapDev = (d) => ({
+      ip: d.ip, name: d.name, alias: d.alias, online: d.online, upBps: d.upBps, downBps: d.downBps,
+      conns: d.conns, risk: d.risk, blocked: d.blocked, topCat: d.topCat,
+    });
+
+    let incFrame = 0;
+    let fakeApi;
+
+    if (framesUrl) {
+      // 用 backend 抓的真实 SSE JSONL 做增量回归：
+      //   /js/3d/_preview.html?hud=1&frames=./_sse_fixture.jsonl
+      //   /js/3d/_preview.html?hud=1&frames=./_sse_fixture.jsonl&removed=1   （附加一帧合成 removed 增量）
+      const text = await (await fetch(framesUrl)).text();
+      const frames = text
+        .split('\n')
+        .filter((l) => l.trim())
+        .map((l) => JSON.parse(l));
+      const firstFull = frames.find((f) => f.event === 'tick' && f.data && f.data.full);
+      const overview = (() => {
+        const t = firstFull && firstFull.data;
+        if (!t) return emptyOverview();
+        return {
+          ts: t.ts,
+          kpi: t.kpi,
+          sys: t.sys,
+          categories: (t.categories || []).map((c) => {
+            const meta = CATEGORY_META.find((x) => x.key === c.key) || {};
+            return { key: c.key, label: meta.label, color: meta.color, share: c.share, upBps: c.upBps, downBps: c.downBps };
+          }),
+          trend: [],
+          topDevices: (t.devices || []).map((d) => ({ ...d, totalDown: 0 })),
+          alerts: [],
+        };
+      })();
+      fakeApi = {
+        getSettings: () => Promise.resolve({ enabled: true }),
+        getOverview: () => Promise.resolve(overview),
+        subscribe: (handler) => {
+          let i = 0;
+          let timerId = 0;
+          let stop = false;
+          const finishReplay = () => {
+            if (stop) return;
+            if (scene) scene.warmup(1.2);
+            const perf = scene && typeof scene.getPerf === 'function' ? scene.getPerf() : null;
+            const top5Node = document.querySelector('[data-ref="top5-sub"]');
+            const onlineNode = document.querySelector('[data-ref="kpi-online"]');
+            const lastTick = [...frames].reverse().find((f) => f.event === 'tick' && f.data);
+            const lastData = (lastTick && lastTick.data) || {};
+            const removedIps = frames
+              .filter((f) => f.event === 'tick' && f.data && Array.isArray(f.data.removed))
+              .flatMap((f) => f.data.removed);
+            const removedSorted = removedIps.slice().sort();
+            const info = {
+              frames: frames.length,
+              ticks: frames.filter((f) => f.event === 'tick').length,
+              sceneDevices: perf ? perf.deviceCount : null,
+              expectedDeviceCount: Number.isFinite(Number(lastData.deviceCount)) ? Number(lastData.deviceCount) : null,
+              removedIps,
+              removedSorted,
+              removedUnique: new Set(removedIps).size,
+              hudTop5Sub: top5Node ? top5Node.textContent : '',
+              online: onlineNode ? onlineNode.textContent : '',
+              removedTest: params.get('removed') === '1',
+            };
+            info.ok = info.sceneDevices === info.expectedDeviceCount;
+            document.body.dataset.sseReplay = JSON.stringify(info);
+            document.title =
+              'SSE replay ' +
+              (info.ok ? 'OK' : 'MISMATCH') +
+              ' · scene ' +
+              info.sceneDevices +
+              '/' +
+              info.expectedDeviceCount +
+              ' · ' +
+              info.hudTop5Sub +
+              ' · online ' +
+              info.online;
+          };
+          const step = () => {
+            if (stop) return;
+            if (i >= frames.length) {
+              if (params.get('removed') === '1') {
+                const last = [...frames].reverse().find((f) => f.event === 'tick' && f.data) || {};
+                const d = last.data || {};
+                const victim = d.devices && d.devices[0] && d.devices[0].ip;
+                const total = Math.max(0, (Number(d.deviceCount) || 14) - 1);
+                handler('tick', {
+                  ...d,
+                  ts: (Number(d.ts) || 0) + 2,
+                  full: false,
+                  devices: [],
+                  removed: victim ? [victim] : [],
+                  deviceCount: total,
+                  kpi: { ...(d.kpi || {}), devices: total },
+                  trendPoint: d.trendPoint ? { ...d.trendPoint, t: (Number(d.trendPoint.t) || 0) + 2 } : undefined,
+                });
+              }
+              timerId = setTimeout(finishReplay, 700);
+              return;
+            }
+            const f = frames[i++];
+            if (f.event === 'hello') handler('hello', f.data);
+            else if (f.event === 'tick') handler('tick', f.data);
+            else if (f.event === 'alert') handler('alert', f.data);
+            timerId = setTimeout(step, 150);
+          };
+          step();
+          return () => {
+            stop = true;
+            clearTimeout(timerId);
+          };
+        },
+      };
+    } else if (disabledMode) {
+      fakeApi = {
+        getSettings: () => Promise.resolve({ enabled: false, collect: false, dnsTap: false, deviceControl: false, domainBlock: false, schedule: false, alerts: false, history: false }),
+        getOverview: () => Promise.resolve(emptyOverview()),
+        subscribe: (handler) => {
+          const id = setInterval(() => handler('tick', emptyTick()), 2000);
+          return () => clearInterval(id);
+        },
+      };
+    } else {
+      fakeApi = {
+        getSettings: () => Promise.resolve({ enabled: true, collect: true, dnsTap: true, deviceControl: true, domainBlock: true, schedule: true, alerts: true, history: true }),
+        getOverview: () => Promise.resolve(buildOverview()),
+        subscribe: (handler) => {
+          const id = setInterval(() => {
+            if (paused) return;
+            if (incMode) {
+              incFrame += 1;
+              const ts = tickState();
+              if (incFrame % 5 === 1) {
+                handler('tick', { ...ts, full: true, deviceCount: devices.length });
+              } else {
+                const picks = [devices[incFrame % devices.length], devices[(incFrame + 3) % devices.length]].filter(Boolean);
+                handler('tick', { ...ts, devices: picks.map(mapDev), full: false, deviceCount: devices.length });
+              }
+            } else {
+              // 兼容 ui/api.js 的 handler(type, payload) 签名
+              handler('tick', tickState());
+            }
+          }, 2000);
+          return () => clearInterval(id);
+        },
+      };
+    }
+    screenHandle = mountScreen(stage, fakeApi);
+    scene = screenHandle.scene;
+    // 卸载/重挂循环自检（验证 dispose 不泄漏、不抛异常）：?hud=1&cycle=6
+    const cycleCount = Number(params.get('cycle')) || 0;
+    if (cycleCount > 0) {
+      for (let i = 0; i < cycleCount; i++) {
+        screenHandle.unmount();
+        screenHandle = mountScreen(stage, fakeApi);
+      }
+      scene = screenHandle.scene;
+      document.title = 'NetScope HUD Preview · cycle ' + cycleCount + ' OK';
+      document.body.dataset.cycle = String(cycleCount);
+      document.body.dataset.cycleOk = '1';
+    }
+    if (scene) {
+      // 无头截图：等 HUD 首帧数据后多次预热，确保 3D 与 HUD 同帧稳定
+      for (const delay of [120, 900, 2400, 4600]) {
+        setTimeout(() => {
+          if (scene) scene.warmup(1.4);
+        }, delay);
+      }
+    }
+    if (!document.title.includes('cycle') && !document.title.includes('SSE replay')) {
+      document.title = 'NetScope HUD Preview · OK';
+    }
+    window.__previewScreen = screenHandle;
+  } else {
+    scene = createTrayScene(stage, {
+      quality: qualityParam,
+      onSelectDevice: (ip) => {
+        if (ip) console.log('[preview] select', ip);
+        else console.log('[preview] select null');
+      },
+      onHoverDevice: (ip) => {
+        if (ip) console.log('[preview] hover', ip);
+      },
+    });
+
+    // 首次用 60 点趋势填充刻度环
+    for (let i = 0; i < 60; i++) trendHistory.push({ t: Math.floor(Date.now() / 1000) - (60 - i) * 2, up: 5e4, down: 3e6 });
+    devices = buildDevices(deviceCount);
+    scene.update(tickState());
+    // 无头截图/首屏：直接推进到稳定构图（真实浏览器 rAF 会自然播放入场动画）
+    scene.warmup(2.6);
+  }
+
+  let timer = null;
+  function startTimer() {
+    stopTimer();
+    if (hudMode) return; // HUD 模式由 screen.js 自己订阅
+    timer = setInterval(() => {
+      if (paused) return;
+      scene.update(tickState());
+    }, 2000);
+  }
+  function stopTimer() {
+    if (timer) clearInterval(timer);
+    timer = null;
+  }
+  startTimer();
+
+  /* ------------------------------------------------------------------
+   * 控件
+   * ------------------------------------------------------------------ */
+  const controlPanel = document.getElementById('controls');
+  controlPanel.querySelectorAll('[data-count]').forEach((b) => b.classList.toggle('active', Number(b.dataset.count) === deviceCount));
+  controlPanel.querySelectorAll('[data-quality]').forEach((b) => b.classList.toggle('active', b.dataset.quality === qualityParam));
+  controlPanel.addEventListener('click', (e) => {
+    if (hudMode) return; // HUD 模式由 screen.js 管理场景
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    if (btn.dataset.count) {
+      deviceCount = Number(btn.dataset.count);
+      devices = buildDevices(deviceCount);
+      trendHistory.length = 0;
+      for (let i = 0; i < 60; i++) trendHistory.push({ t: Math.floor(Date.now() / 1000) - (60 - i) * 2, up: 3e4, down: 2.5e6 });
+      scene.update(tickState());
+      controlPanel.querySelectorAll('[data-count]').forEach((b) => b.classList.toggle('active', b === btn));
+    } else if (btn.dataset.quality) {
+      const q = btn.dataset.quality;
+      scene.dispose();
+      scene = createTrayScene(stage, {
+        quality: q,
+        onSelectDevice: (ip) => console.log('[preview] select', ip),
+        onHoverDevice: () => {},
+      });
+      scene.update(tickState());
+      controlPanel.querySelectorAll('[data-quality]').forEach((b) => b.classList.toggle('active', b === btn));
+      scene.warmup(1.2);
+    } else if (btn.id === 'btn-pause') {
+      paused = !paused;
+      btn.textContent = paused ? '继续' : '暂停';
+      btn.classList.toggle('active', paused);
+    } else if (btn.id === 'btn-focus') {
+      const ip = devices[0] && devices[0].ip;
+      if (ip) scene.focusDevice(ip);
+    } else if (btn.id === 'btn-reset') {
+      scene.setHighlight(null);
+      scene.resetView();
+    }
+  });
+
+  /* ------------------------------------------------------------------
+   * 状态栏 / 错误可见化
+   * ------------------------------------------------------------------ */
+  const stat = document.getElementById('stat-text');
+  let frames = 0;
+  (function loopCount() {
+    frames++;
+    requestAnimationFrame(loopCount);
+  })();
+  setInterval(() => {
+    try {
+      if (!scene || typeof scene.getPerf !== 'function') return;
+      const p = scene.getPerf();
+      stat.innerHTML =
+        `状态 <b>${p.mode}</b> · fps <b>${p.fps}</b> · 设备 <b>${p.deviceCount}</b> · 绘制 <b>${p.drawCalls}</b> · 三角 <b>${(p.triangles / 1000).toFixed(1)}k</b> · 标签纹理 <b>${p.labelTextures}</b> · DPR <b>${p.pixelRatio}</b> · 相机 <b>${p.camX},${p.camY},${p.camZ}</b> d=<b>${p.camDistance}</b> · t=<b>${p.elapsed}</b> entry=<b>${p.entryT}/${p.entryActive}</b> · 堆 <b>${p.heapMb == null ? 'n/a' : p.heapMb + 'MB'}</b> · 视口 <b>${p.size[0]}x${p.size[1]}</b>` +
+        (errors.length ? ` · <span style="color:#fb7185">错误 ${errors.length}</span>` : ' · 无错误');
+      if (!errors.length && !hudMode) document.title = `NetScope 3D Tray · OK (${p.fps}fps, ${p.deviceCount} devices)`;
+    } catch (e) {
+      showError(e.stack || e);
+    }
+  }, 500);
+
+  window.__preview = {
+    get scene() { return scene; },
+    get devices() { return devices; },
+    get errors() { return errors.slice(); },
+    tick: () => scene && scene.update(tickState()),
+    get paused() { return paused; },
+    get screen() { return screenHandle; },
+  };
+</script>
+</body>
+</html>
