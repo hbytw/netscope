@@ -524,7 +524,7 @@ function makeOverview() {
   const alerts = isSwitchOn('alerts') ? mockState.events.filter((e) => !e.acked).length : 0;
   const categories = live ? makeCategories(1) : makeCategories(0);
   const topDevices = devices.slice().sort((a, b) => b.downBps - a.downBps).slice(0, 8)
-    .map((d) => ({ ip: d.ip, name: d.hostname, alias: d.alias, upBps: d.upBps, downBps: d.downBps, totalDown: d.totalDown, risk: d.risk }));
+    .map((d) => ({ ip: d.ip, name: d.hostname, alias: d.alias, upBps: d.upBps, downBps: d.downBps, totalDown: d.totalDown, risk: d.risk, online: d.online !== false, blocked: !!d.blocked, conns: d.conns || 0 }));
   const topDomains = live ? MOCK_DOMAINS.slice(0, 10).map((d, i) => {
     const s = makeSeed(`td-${d.domain}`);
     return {
@@ -698,7 +698,7 @@ function makeSettings() {
 /**
  * 网络拓扑 mock（docs/api.md / task-5 契约）：
  * - nodes: id/type/name/cidr/up/rxBps/txBps（lan/zerotier/vpn/internet/proxy…）
- * - links: from/to/kind(upBps/downBps)（direct / proxy / zt / vpn）
+ * - links: from/to/kind(upBps/downBps)（direct / proxy / zt / vpn / lan，lan 为 LAN 内网互访自环）
  * 从 mock 设备实时速率推算各出口流量，保证 3D 大屏拓扑与设备/链路数据一致。
  */
 function makeTopology() {

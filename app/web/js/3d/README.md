@@ -59,7 +59,7 @@ scene.getPerf();          // { mode, fps, drawCalls, triangles, points, deviceCo
 | tick 字段 | 场景表现 |
 |---|---|
 | `categories[].share` | 分类扇柱角度与高度（8 项顺序固定，键/色值严格按 api.md §8） |
-| `devices[]` | 外环六边形芯片；状态色：正常 `#22d3ee` / 限速 `#fbbf24` / 断网·离线 `#fb7185` / `risk>0.6` `#a78bfa`；光柱高度 `clamp((downBps+upBps)/200000, 0.8, 7)` |
+| `devices[]` | 外环六边形芯片；状态色：正常 `#22d3ee` / 限速 `#fbbf24` / 已断网 `#fb7185` / 离线 `#5d6f8c` / 未知（字段缺失） `#8a9bb5` / `risk>0.6` `#a78bfa`；光柱高度 `clamp((downBps+upBps)/200000, 0.8, 7)` |
 | `trendPoint` | 累计为 60 点环形缓冲，驱动托盘外缘 60 段刻度柱 |
 | `trend[]`（可选） | 若整帧携带 60 点趋势则整体覆盖缓冲（overview 兼容） |
 | `kpi / sys / wan` | 底座场景不直接使用，由 `screen.js` HUD 消费 |
@@ -209,7 +209,7 @@ HUD（HTML 浮层，容器 `pointer-events:none`、面板 `auto`，样式内联�
 |---|---|
 | 帧率自适应 | rAF 按目标间隔跳帧：常态 **30fps**；`document.hidden` 暂停；`update()` 后 3s 无新数据 → **12fps** 巡航；指针交互（拖拽/hover/滚轮）后 1.2s 内临时 **60fps** |
 | 几何复用 | 设备芯片/光柱/柱底光晕各 1 份共享 geometry；分类扇柱 2 份合并 geometry（顶面/侧面各 8 group，共用 8 套分类材质，顶点色压暗侧面）；刻度环 1 个 InstancedMesh；粒子单个 Points |
-| 材质收敛 | 分类 8 套 + 设备状态 4 套 `MeshStandardMaterial` + 托盘/核心光塔 2 套结构件材质（固定 14 套，不随设备数增长）；辉光线/粒子/刻度用共享 basic/shader 材质 |
+| 材质收敛 | 分类 8 套 + 设备状态 6 套 `MeshStandardMaterial` + 托盘/核心光塔 2 套结构件材质（固定 14 套，不随设备数增长）；辉光线/粒子/刻度用共享 basic/shader 材质 |
 | 光源 | 固定 4 个：Hemisphere + 2 Point + 1 Directional；`shadowMap` 关闭（托盘下方径向渐变假阴影） |
 | 标签纹理 | LRU `CanvasTexture` 缓存（上限 64，refcount 保护在用纹理），仅文本变化重绘，节流 1s |
 | 内存 | 标签纹理 ≤24×512×160×4B ≈ 8MB；几何/顶点总计约 2.5 万三角；不启用后处理 render target；`dispose()` 释放 geometry/material/texture/renderer 并移除全部事件监听 |

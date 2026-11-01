@@ -2,12 +2,13 @@ package main
 
 // 网络接口/拓扑采集与 /api/topology 数据构建。
 //
-// 真机采集：
+// 真机采集（同一类信息只 fork 一次，结果进 10s 级共享缓存）：
 //   - `ip -br addr show`：接口名/状态/IPv4 CIDR（标记 lan/zerotier/vpn/docker）；
 //   - `ip route show`：默认网关（internet 是否 up）、经虚拟接口的远端网段；
 //   - `ip neigh show`：设备刷新时按接口过滤（见 devices.go）；
 //   - 代理探测：`ss -lntp` / `netstat -lntp` 的监听端口与进程名（clash/mihomo/v2ray/xray/sing-box 等）。
-// 流量拆分：Agg 的 DstBps（目的 IP 速率）按虚拟接口 CIDR 归入 zt/vpn 链路，其余归 direct/proxy。
+// 流量拆分：Agg 的 DstBps（目的 IP 速率）按虚拟接口 CIDR 归入 zt/vpn 链路，其余归 direct/proxy；
+//           path=lan（LAN 内网互访）单列为一条 lan 链路，不计入互联网总量。
 //
 // 所有采集命令结果做 10s 级缓存，避免每次 API 请求都 fork 命令。
 
@@ -18,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const (
@@ -25,6 +27,102 @@ const (
 	topoCacheSec  = 5
 	proxyCacheSec = 15
 )
+
+// ---------------- 采集命令缓存（每个 App 一份） ----------------
+
+// cmdCacheRegistry 把采集缓存按 *App 挂载。
+//
+// App 结构体定义在 main.go（本模块不修改），因此这里用包级注册表实现「每个 App 一份缓存」：
+// 单测里多个 App 实例互不串扰，也不需要改动其它 agent 负责的文件。
+var cmdCacheRegistry sync.Map // map[*App]*cmdCache
+
+// cmdCache 缓存三类外部命令的采集结果；每类一把独立锁，
+// 慢命令（ip neigh show）不会阻塞其它命令的读取。
+type cmdCache struct {
+	addr  cmdCacheText
+	route cmdCacheLines
+	neigh cmdCacheNeigh
+}
+
+// cmdCacheText 缓存一段命令输出（带采集时间）。
+type cmdCacheText struct {
+	mu    sync.Mutex
+	text  string
+	at    int64
+	valid bool
+}
+
+// cmdCacheLines 缓存命令输出的行切片（带采集时间）。
+type cmdCacheLines struct {
+	mu    sync.Mutex
+	lines []string
+	at    int64
+	valid bool
+}
+
+// cmdCacheNeigh 缓存 ip neigh 的解析结果（带采集时间）。
+type cmdCacheNeigh struct {
+	mu    sync.Mutex
+	items []neighEntry
+	at    int64
+	valid bool
+}
+
+// cmdCacheOf 返回本 App 的采集缓存（懒创建，线程安全）。
+func (a *App) cmdCacheOf() *cmdCache {
+	if v, ok := cmdCacheRegistry.Load(a); ok {
+		return v.(*cmdCache)
+	}
+	c := &cmdCache{}
+	v, _ := cmdCacheRegistry.LoadOrStore(a, c)
+	return v.(*cmdCache)
+}
+
+// ipAddrText 返回 `ip -br addr show` 的原始输出（10s 缓存）。
+//
+// 接口采集（interfaces）与本机保护集合（protectedSet）都需要这份输出，
+// 统一走这里：同一个 10s 窗口内只 fork 一次 ip 命令。
+// 采集失败（输出为空）不写缓存，保持既有「失败即重试」的自愈行为。
+func (a *App) ipAddrText() string {
+	if a.cfg.Demo {
+		return ""
+	}
+	c := &a.cmdCacheOf().addr
+	now := nowUnix()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.valid && now-c.at < ifaceCacheSec {
+		return c.text
+	}
+	out, _ := a.shellQuietOutput("ip -br addr show 2>/dev/null")
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return ""
+	}
+	c.text, c.at, c.valid = out, now, true
+	return out
+}
+
+// neighEntries 返回 `ip neigh show` 的解析结果（10s 缓存）。
+//
+// 供设备刷新（devices.go）复用：设备刷新本身每 10s 一次，
+// 走缓存后同一窗口内不会重复 fork neigh 命令。
+func (a *App) neighEntries() []neighEntry {
+	if a.cfg.Demo {
+		return nil
+	}
+	c := &a.cmdCacheOf().neigh
+	now := nowUnix()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.valid && now-c.at < ifaceCacheSec {
+		return c.items
+	}
+	out, _ := a.shellQuietOutput("ip neigh show 2>/dev/null")
+	items := parseNeigh(out)
+	c.items, c.at, c.valid = items, now, true
+	return items
+}
 
 // ifaceInfo 接口信息。
 type ifaceInfo struct {
@@ -90,6 +188,9 @@ func ifaceKind(name string) (network string, internal bool) {
 // ---------------- 采集（带缓存） ----------------
 
 // interfaces 返回本机接口（10s 缓存）。
+//
+// 数据源是共享的 `ip -br addr show` 缓存（ipAddrText），
+// 与 protectedSet 共用同一份原始输出，同一 10s 窗口内只 fork 一次。
 func (a *App) interfaces() []ifaceInfo {
 	now := nowUnix()
 	a.ifMu.Lock()
@@ -101,8 +202,7 @@ func (a *App) interfaces() []ifaceInfo {
 	if a.cfg.Demo {
 		list = demoInterfaces()
 	} else {
-		out, _ := a.shellQuietOutput("ip -br addr show 2>/dev/null")
-		list = parseIPBrAddr(out)
+		list = parseIPBrAddr(a.ipAddrText())
 	}
 	if len(list) == 0 {
 		// 采集失败时至少保留 LAN 节点（保证拓扑可用）
@@ -203,31 +303,51 @@ func (a *App) networkForIP(ip string) (network string, internal bool) {
 	return "other", false
 }
 
-// routeLines 返回路由表（10s 缓存，拓扑构建时使用）。
+// routeLines 返回路由表（10s 缓存）。
+//
+// 拓扑构建（buildTopology）、网段同步（syncConnNets）、安全检测（security.go）
+// 与本机保护集合（protectedSet）共用同一份缓存，避免各自 fork `ip route show`。
+// 返回的是共享切片，调用方只读，不得修改。
 func (a *App) routeLines() []string {
 	if a.cfg.Demo {
-		return []string{
-			"default via 192.168.1.1 dev br-lan proto static",
-			"192.168.1.0/24 dev br-lan proto kernel scope link src 192.168.1.254",
-			"192.168.99.0/24 dev zt6vwy3rne proto kernel scope link src 192.168.99.1",
-			// ZeroTier 远端路由网段（设备在 LAN/ZT，目的在这些网段 → path=zerotier）
-			"10.0.2.0/24 dev zt6vwy3rne scope link",
-			"10.10.10.0/24 dev zt6vwy3rne scope link",
-			"10.11.0.0/24 dev zt6vwy3rne scope link",
-			"10.12.0.0/24 dev zt6vwy3rne scope link",
-			"192.168.2.0/24 dev zt6vwy3rne scope link",
-			"192.168.3.0/24 dev zt6vwy3rne scope link",
-			"192.168.8.0/24 dev zt6vwy3rne scope link",
-			"192.168.88.0/24 dev zt6vwy3rne scope link",
-			// VPN 网段（tun0，演示为 down 但仍保留路由用于展示 path=vpn）
-			"10.8.0.0/24 dev tun0 scope link",
-		}
+		return demoRouteLines()
+	}
+	c := &a.cmdCacheOf().route
+	now := nowUnix()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.valid && now-c.at < ifaceCacheSec {
+		return c.lines
 	}
 	out, _ := a.shellQuietOutput("ip route show 2>/dev/null")
-	if strings.TrimSpace(out) == "" {
+	out = strings.TrimSpace(out)
+	if out == "" {
+		// 采集失败不写缓存：保持既有「失败即重试」的自愈行为
 		return nil
 	}
-	return strings.Split(strings.TrimSpace(out), "\n")
+	lines := strings.Split(out, "\n")
+	c.lines, c.at, c.valid = lines, now, true
+	return lines
+}
+
+// demoRouteLines 演示模式的路由表。
+func demoRouteLines() []string {
+	return []string{
+		"default via 192.168.1.1 dev br-lan proto static",
+		"192.168.1.0/24 dev br-lan proto kernel scope link src 192.168.1.254",
+		"192.168.99.0/24 dev zt6vwy3rne proto kernel scope link src 192.168.99.1",
+		// ZeroTier 远端路由网段（设备在 LAN/ZT，目的在这些网段 → path=zerotier）
+		"10.0.2.0/24 dev zt6vwy3rne scope link",
+		"10.10.10.0/24 dev zt6vwy3rne scope link",
+		"10.11.0.0/24 dev zt6vwy3rne scope link",
+		"10.12.0.0/24 dev zt6vwy3rne scope link",
+		"192.168.2.0/24 dev zt6vwy3rne scope link",
+		"192.168.3.0/24 dev zt6vwy3rne scope link",
+		"192.168.8.0/24 dev zt6vwy3rne scope link",
+		"192.168.88.0/24 dev zt6vwy3rne scope link",
+		// VPN 网段（tun0，演示为 down 但仍保留路由用于展示 path=vpn）
+		"10.8.0.0/24 dev tun0 scope link",
+	}
 }
 
 // parseDefaultRoute 解析默认路由（返回出口接口）。
@@ -325,6 +445,14 @@ func parseProxyOutput(out string) bool {
 // ---------------- 拓扑构建 ----------------
 
 // buildTopology 构建拓扑（5s 缓存）。
+//
+// 流量口径（各维度互不重复、彼此自洽）：
+//   - 外发链路：direct（直连出网）/ proxy（代理）/ zt（ZeroTier）/ vpn（VPN）；
+//     互联网节点总量 = 这四条外发链路之和（Internet.Rx/Tx = Σ链路 Down/Up）。
+//   - lan 链路：LAN 内网互访（path=lan），以 LAN→LAN 自环表示；
+//     它不流向互联网，因此既不计入互联网节点总量，也不计入外发链路之和。
+//   - LAN 节点的 rx/tx = lan 链路的流量（内网互访维度），
+//     不用 br-lan 接口的物理计数（那是「内网互访 + 各外发链路」的总和，会重复计算）。
 func (a *App) buildTopology() topologyResp {
 	now := nowUnix()
 	a.topoMu.Lock()
@@ -360,7 +488,7 @@ func (a *App) buildTopology() topologyResp {
 	}
 
 	nodes := make([]topologyNode, 0, len(ifaces)+3)
-	links := make([]topologyLink, 0, len(ifaces)+2)
+	links := make([]topologyLink, 0, len(ifaces)+3)
 
 	lanID := ""
 	virtual := make([]ifaceInfo, 0, len(ifaces))
@@ -370,11 +498,8 @@ func (a *App) buildTopology() topologyResp {
 		default:
 			continue
 		}
-		// 虚拟接口仅 up 时上拓扑；LAN/Docker 常显
-		if !f.Up && (f.Network == "zerotier" || f.Network == "vpn") {
-			continue
-		}
-		if !f.Up && f.Network == "docker" {
+		// 虚拟接口仅 up 时上拓扑；LAN 常显
+		if !f.Up && f.Network != "lan" {
 			continue
 		}
 		display := f.Name
@@ -403,30 +528,11 @@ func (a *App) buildTopology() topologyResp {
 		nodes = append(nodes, topologyNode{ID: lanID, Type: "lan", Name: "内网 LAN", CIDR: a.cfg.LANCIDR, Up: true})
 	}
 
-	// 互联网节点：使用真正的 WAN 接口计数。
-	// 旁路由场景（默认路由在 br-lan）本机没有 WAN 口：计数置 0 并在名称上标注，
-	// 不再拿 br-lan 的总计数（各链路之和）当互联网流量，避免与 direct/proxy/zt/vpn 链路重复计算。
-	// LAN 内部互访（path=lan）不属于互联网流量，已从总量中扣除：
-	// 它只体现在 LAN 节点（br-lan 接口计数）上。
-	wanDev := wanIface(ifaces, routes)
-	internetRx, internetTx := int64(0), int64(0)
-	internetName := "互联网"
-	if wanDev != "" {
-		internetRx, internetTx = rxRate[wanDev], txRate[wanDev]
-	} else {
-		internetName = "互联网（无 WAN）"
-	}
-	nodes = append(nodes, topologyNode{
-		ID: "internet", Type: "internet", Name: internetName,
-		Up: hasDefault, RxBps: internetRx, TxBps: internetTx,
-	})
-	// 代理节点（未探测到也返回，up=false 便于前端展示"未启用"状态）
-	nodes = append(nodes, topologyNode{ID: "proxy", Type: "proxy", Name: "代理", Up: proxyUp})
-
 	// 链路流量按连接 path 聚合（conntrack mark 拆分），不再把全部公网流量一刀切给 proxy：
 	//   - proxy = mark>0 / 代理端口连接的实时速率（含 docker0/本机代理流量）；
 	//   - direct = 设备非代理公网连接的实时速率；
-	//   - zerotier/vpn = 各自流向的实时速率（无连接时用接口计数器兜底）。
+	//   - zerotier/vpn = 各自流向的实时速率（无连接时用接口计数器兜底）；
+	//   - lan = LAN 内网互访（内网设备之间），不流向互联网，单列一条 lan 链路。
 	pathRate := func(path string) [2]int64 {
 		if rates.PathBps != nil {
 			if v, ok := rates.PathBps[path]; ok {
@@ -439,6 +545,7 @@ func (a *App) buildTopology() topologyResp {
 	proxyRate := pathRate("proxy")
 	ztRate := pathRate("zerotier")
 	vpnRate := pathRate("vpn")
+	lanRate := pathRate("lan")
 
 	virtualRates := map[string][2]int64{}
 	for _, f := range virtual {
@@ -453,9 +560,7 @@ func (a *App) buildTopology() topologyResp {
 		virtualRates[f.Name] = r
 	}
 
-	// 链路：LAN -> internet(direct) / proxy / 各虚拟网络
-	// 注：LAN 内部互访（path=lan）没有对外链路，已从互联网总量中扣除，
-	// 它只体现在 LAN 节点（br-lan 接口计数）上。
+	// 链路：LAN -> internet(direct) / proxy / 各虚拟网络 / LAN 自身（内网互访）
 	directLink := topologyLink{
 		From: lanID, To: "internet", Kind: "direct",
 		UpBps: directRate[0], DownBps: directRate[1],
@@ -474,6 +579,47 @@ func (a *App) buildTopology() topologyResp {
 		}
 		links = append(links, topologyLink{From: lanID, To: f.Name, Kind: kind, UpBps: v[0], DownBps: v[1]})
 	}
+	// LAN 内网互访（path=lan）：内网设备之间的流量不流向互联网，
+	// 单独成一条 LAN→LAN 自环链路（kind=lan），不计入互联网节点总量。
+	lanLink := topologyLink{
+		From: lanID, To: lanID, Kind: "lan",
+		UpBps: lanRate[0], DownBps: lanRate[1],
+	}
+	links = append(links, lanLink)
+
+	// 互联网节点总量 = 各外发链路之和（direct + proxy + zt + vpn）。
+	//
+	// 口径（自洽、不重复计算）：
+	//   - 「各外发链路之和」严格等于互联网节点总量，二者是同一份数据的两种视图；
+	//   - 不再采用「默认路由出口接口」的物理计数：旁路由场景默认路由在 br-lan，
+	//     该计数 = LAN 内网互访 + 各外发链路，直接用它会与各链路重复计算；
+	//   - LAN 内网互访（path=lan）不流向互联网，既不进互联网总量，也不出现在
+	//     外发链路里，只体现为 lan 链路与 LAN 节点。
+	extUp := directLink.UpBps + proxyLink.UpBps
+	extDown := directLink.DownBps + proxyLink.DownBps
+	for _, v := range virtualRates {
+		extUp += v[0]
+		extDown += v[1]
+	}
+	wanDev := wanIface(ifaces, routes)
+	if extUp == 0 && extDown == 0 && wanDev != "" {
+		// 无 conntrack 归因数据（采集关闭）且存在真正的物理 WAN 口：
+		// 回落到该接口的物理计数，避免节点恒为 0（此时各链路同样为 0，
+		// 口径退化为「物理计数」，不再是链路之和）。
+		extUp, extDown = txRate[wanDev], rxRate[wanDev]
+	}
+	internetRx, internetTx := extDown, extUp
+	internetName := "互联网"
+	if wanDev == "" {
+		internetName = "互联网（无 WAN）"
+	}
+	nodes = append(nodes, topologyNode{
+		ID: "internet", Type: "internet", Name: internetName,
+		Up: hasDefault, RxBps: internetRx, TxBps: internetTx,
+	})
+	// 代理节点（未探测到也返回，up=false 便于前端展示"未启用"状态）
+	nodes = append(nodes, topologyNode{ID: "proxy", Type: "proxy", Name: "代理", Up: proxyUp})
+
 	// 节点 rx/tx 与链路保持一致（proxy/zt/vpn 节点展示链路实时流量，不再出现链路有值而节点为 0）
 	for i := range nodes {
 		switch nodes[i].ID {
@@ -484,6 +630,11 @@ func (a *App) buildTopology() topologyResp {
 			if proxyLink.UpBps > 0 || proxyLink.DownBps > 0 {
 				nodes[i].Up = true
 			}
+		case lanID:
+			// LAN 节点展示「LAN 内网互访」（lan 链路）的流量：
+			// br-lan 接口的物理计数 = 内网互访 + 各外发链路，直接用会与各链路重复计算。
+			// 取值方向与 lan 链路一致（tx=上行、rx=下行）。
+			nodes[i].RxBps, nodes[i].TxBps = lanLink.DownBps, lanLink.UpBps
 		default:
 			if v, ok := virtualRates[nodes[i].ID]; ok {
 				nodes[i].RxBps, nodes[i].TxBps = v[0], v[1]
@@ -685,8 +836,9 @@ func (a *App) protectedSet() map[string]bool {
 		add("192.168.1.254")
 		add("192.168.99.1")
 	} else {
-		out, _ := a.shellQuietOutput("ip -br addr show 2>/dev/null")
-		for _, ip := range parseAllIPv4Addrs(out) {
+		// 复用共享的 `ip -br addr show` 缓存：与 interfaces() 共用同一份输出，
+		// 同一 10s 窗口内不再重复 fork ip 命令。
+		for _, ip := range parseAllIPv4Addrs(a.ipAddrText()) {
 			add(ip)
 		}
 		// 接口采集失败时至少保护 LAN 接口地址

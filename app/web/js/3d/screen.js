@@ -44,6 +44,24 @@ function formatPct(share) {
   return (p >= 10 ? p.toFixed(0) : p.toFixed(1)) + '%';
 }
 
+/**
+ * 三态取值：字段缺失或非法 → null（未知）。
+ * 状态字段（online/blocked）绝不用「缺失即在线」的乐观默认，
+ * 否则离线/被断网设备会在大屏里被显示成正常在线。
+ */
+function numOrNull(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  if (typeof v === 'string' && v.trim() !== '') {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function boolOrNull(v) {
+  return typeof v === 'boolean' ? v : null;
+}
+
 function timeHM(ts) {
   const d = new Date((Number(ts) || 0) * 1000);
   if (Number.isNaN(d.getTime())) return '--:--';
@@ -618,13 +636,31 @@ function mountScreen(el, api, opts = {}) {
     if (refs['top5-sub']) refs['top5-sub'].textContent = '实时下行 + 上行 · 共 ' + total + ' 台';
   }
 
+  /**
+   * 合并设备字段：只写入源数据中确实存在的字段。
+   * null / undefined 一律视为「未知」，不得覆盖已有的真实状态（如 online / blocked）。
+   */
+  function mergeDeviceFields(prev, next) {
+    const out = { ...(prev || {}) };
+    if (!next || typeof next !== 'object') return out;
+    for (const key of Object.keys(next)) {
+      const v = next[key];
+      if (v === undefined || v === null) continue;
+      out[key] = v;
+    }
+    return out;
+  }
+
   /** @param {Array} list @param {boolean} full true=整体替换；false=按 ip 合并（后端增量语义） */
   function mergeHudDevices(list, full) {
     if (!Array.isArray(list)) return;
     if (full) state.deviceMap.clear();
     for (const d of list) {
       if (!d || !d.ip) continue;
-      state.deviceMap.set(String(d.ip), d);
+      const key = String(d.ip);
+      const prev = full ? null : state.deviceMap.get(key);
+      // 增量帧只带部分字段 → 逐字段合并，避免用默认值冲掉已有真实状态
+      state.deviceMap.set(key, prev ? mergeDeviceFields(prev, d) : { ...d });
     }
   }
 
@@ -798,12 +834,14 @@ function mountScreen(el, api, opts = {}) {
         ip: d.ip,
         name: d.name,
         alias: d.alias,
-        online: d.online !== false,
-        upBps: d.upBps,
-        downBps: d.downBps,
-        conns: d.conns,
-        risk: d.risk,
-        blocked: !!d.blocked,
+        // 状态字段缺失 → null（未知）：绝不用「缺失即在线」的乐观默认，
+        // 否则离线/被断网设备在大屏里会被显示成正常在线（与「设备」页不一致）。
+        online: boolOrNull(d.online),
+        upBps: numOrNull(d.upBps),
+        downBps: numOrNull(d.downBps),
+        conns: numOrNull(d.conns),
+        risk: numOrNull(d.risk),
+        blocked: boolOrNull(d.blocked),
         topCat: d.topCat,
       })),
       trend: Array.isArray(ov.trend) ? ov.trend : undefined,

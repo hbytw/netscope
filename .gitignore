@@ -7,6 +7,8 @@ app/tmpdata/
 node_modules/
 tools/verify/node_modules/
 __pycache__/
+*.exe
+*.dll
 *.pyc
 *.pyo
 

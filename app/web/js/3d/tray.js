@@ -46,12 +46,18 @@ export const CATEGORY_META = Object.freeze([
 
 const CATEGORY_INDEX = new Map(CATEGORY_META.map((c, i) => [c.key, i]));
 
-/** 设备状态色（docs/design.md §6.2 / 任务书） */
+/**
+ * 设备状态色（docs/design.md §6.2 / 任务书）
+ * 语义与「设备」页（ui/devices.js）一致：已断网 = crit 红、离线 = mute 灰。
+ * unknown：状态字段缺失时的「未知」灰，既不冒充正常在线，也不误报离线。
+ */
 const STATUS_META = {
   normal: '#22d3ee', // 正常
   limit: '#fbbf24', // 限速
-  offline: '#fb7185', // 断网 / 离线
+  blocked: '#fb7185', // 已断网（crit 红，同「设备」页）
+  offline: '#5d6f8c', // 离线（mute 灰，同「设备」页）
   risk: '#a78bfa', // 风险 > 0.6
+  unknown: '#8a9bb5', // 状态未知（online/blocked 字段缺失）
 };
 
 const BRAND = '#22d3ee';
@@ -110,6 +116,16 @@ const CFG = {
 /* ---------- 数值工具 ---------- */
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+
+/** 三态取值：字段缺失或非法 → null（未知），不做乐观默认 */
+function numOrNull(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  if (typeof v === 'string' && v.trim() !== '') {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
 
 /** 帧率无关的指数平滑：cur → target，lambda 越大越快 */
 function damp(cur, target, lambda, dt) {
@@ -1501,27 +1517,70 @@ export function createTrayScene(container, options = {}) {
     trendReady = true;
   }
 
+  /**
+   * 归一化设备记录：字段缺失一律记为 null（未知），不使用乐观默认值。
+   * online 不得因为「字段没传」就当成在线，blocked 也不得当成未断网；
+   * 否则离线/被断网设备会在大屏里被显示成正常在线（与「设备」页不一致）。
+   */
   function normalizeDevice(d) {
-    const serverStatus = resolveStatus(d);
-    const name = d.alias || d.name || d.hostname || d.ip || '未知设备';
+    const src = d || {};
     return {
-      ip: String(d.ip || ''),
-      name: String(name),
-      online: d.online !== false,
-      up: Number(d.upBps) || 0,
-      down: Number(d.downBps) || 0,
-      risk: Number(d.risk) || 0,
-      blocked: !!d.blocked,
-      limited: !!(d.limitKbps && ((Number(d.limitKbps.down) || 0) > 0 || (Number(d.limitKbps.up) || 0) > 0)),
-      status: serverStatus,
-      topCat: d.topCat || null,
+      ip: String(src.ip || ''),
+      // 名称缺失时留 null（未知），避免用 IP 兜底覆盖掉已知的别名/主机名
+      name: src.alias || src.name || src.hostname || null,
+      online: typeof src.online === 'boolean' ? src.online : null,
+      blocked: typeof src.blocked === 'boolean' ? src.blocked : null,
+      up: numOrNull(src.upBps),
+      down: numOrNull(src.downBps),
+      conns: numOrNull(src.conns),
+      risk: numOrNull(src.risk),
+      limited: src.limitKbps
+        ? (Number(src.limitKbps.down) > 0 || Number(src.limitKbps.up) > 0)
+        : null,
+      topCat: src.topCat || null,
     };
   }
 
-  function resolveStatus(d) {
-    if (d.blocked || d.online === false) return 'offline';
-    if ((Number(d.risk) || 0) > 0.6) return 'risk';
-    if (d.limitKbps && ((Number(d.limitKbps.down) || 0) > 0 || (Number(d.limitKbps.up) || 0) > 0)) return 'limit';
+  /**
+   * 合并设备记录：只写入源数据中确实存在的字段。
+   * null / undefined 一律视为「未知」，不得覆盖已有的真实状态（online / blocked 尤其关键）；
+   * 状态在合并完成后按合并结果重新解析，避免用默认值冲掉真实状态。
+   */
+  function mergeDeviceRecord(prev, next) {
+    const out = prev ? { ...prev } : {};
+    if (next && typeof next === 'object') {
+      for (const key of Object.keys(next)) {
+        if (key === 'status') continue;
+        const v = next[key];
+        if (v === undefined || v === null) continue; // 未知 → 保留已有真实值
+        out[key] = v;
+      }
+    }
+    if (typeof out.online !== 'boolean') out.online = null;
+    if (typeof out.blocked !== 'boolean') out.blocked = null;
+    if (!Number.isFinite(out.down)) out.down = 0;
+    if (!Number.isFinite(out.up)) out.up = 0;
+    if (!Number.isFinite(out.risk)) out.risk = null;
+    if (!Number.isFinite(out.conns)) out.conns = null;
+    if (typeof out.limited !== 'boolean') out.limited = null;
+    if (!out.name) out.name = out.ip || '未知设备';
+    if (!out.topCat) out.topCat = null;
+    out.status = resolveStatus(out);
+    return out;
+  }
+
+  /**
+   * 设备状态：与「设备」页（ui/devices.js）一致 —— 已断网 > 离线 > 风险 > 限速 > 正常。
+   * online / blocked 未知（null）时返回 'unknown'，不伪装成「正常在线」。
+   */
+  function resolveStatus(rec) {
+    const blocked = rec.blocked === true;
+    const online = rec.online;
+    if (blocked) return 'blocked'; // 已断网
+    if (online === false) return 'offline'; // 离线
+    if ((Number(rec.risk) || 0) > 0.6) return 'risk';
+    if (rec.limited === true) return 'limit';
+    if (online !== true) return 'unknown'; // 在线状态未知
     return 'normal';
   }
 
@@ -1536,10 +1595,12 @@ export function createTrayScene(container, options = {}) {
       for (const nd of picked) {
         const dev = devices.get(nd.ip);
         if (!dev) continue;
-        dev.target.down = nd.down;
-        dev.target.up = nd.up;
+        const down = Number.isFinite(nd.down) ? nd.down : 0;
+        const up = Number.isFinite(nd.up) ? nd.up : 0;
+        dev.target.down = down;
+        dev.target.up = up;
         dev.target.height = clamp(
-          (nd.down + nd.up) / 200000,
+          (down + up) / 200000,
           CFG.pillarMinHeight,
           CFG.pillarMaxHeight,
         );
@@ -1560,7 +1621,8 @@ export function createTrayScene(container, options = {}) {
     // 流量 Top-N + 已在场的设备给一点粘性，避免每帧换人
     const scored = normalized.map((d) => ({
       d,
-      score: (d.down + d.up) * (devices.has(d.ip) ? 1.35 : 1),
+      score:
+        ((Number(d.down) || 0) + (Number(d.up) || 0)) * (devices.has(d.ip) ? 1.35 : 1),
     }));
     scored.sort((a, b) => b.score - a.score || (a.d.ip < b.d.ip ? -1 : 1));
     return scored
@@ -1650,6 +1712,14 @@ export function createTrayScene(container, options = {}) {
       chip.userData.ip = nd.ip;
       chipMeshes.push(chip);
 
+      const devDown = Number.isFinite(nd.down) ? nd.down : 0;
+      const devUp = Number.isFinite(nd.up) ? nd.up : 0;
+      const devHeight = clamp(
+        (devDown + devUp) / 200000,
+        CFG.pillarMinHeight,
+        CFG.pillarMaxHeight,
+      );
+
       const dev = {
         ip: nd.ip,
         name: nd.name,
@@ -1669,14 +1739,14 @@ export function createTrayScene(container, options = {}) {
         labelNameLen: Array.from(nd.name).length,
         slot: i,
         target: {
-          down: nd.down,
-          up: nd.up,
-          height: clamp((nd.down + nd.up) / 200000, CFG.pillarMinHeight, CFG.pillarMaxHeight),
+          down: devDown,
+          up: devUp,
+          height: devHeight,
         },
         cur: {
-          down: nd.down,
-          up: nd.up,
-          height: clamp((nd.down + nd.up) / 200000, CFG.pillarMinHeight, CFG.pillarMaxHeight),
+          down: devDown,
+          up: devUp,
+          height: devHeight,
           scale: 1,
         },
         curve: new THREE.QuadraticBezierCurve3(
@@ -2479,7 +2549,9 @@ export function createTrayScene(container, options = {}) {
       addLink(target, link.kind, link.upBps, link.downBps);
     }
 
-    // LAN 节点隐式链路（拓扑 links 通常以 LAN 为 from，未显式给出 LAN↔核心）
+    // LAN 节点链路：后端已显式给出 kind='lan' 自环链路（LAN 内网互访）。
+    // 仅当后端未给出时才用节点计数兜底，避免与显式链路重复绘制（管线/粒子重影）。
+    const hasExplicitLan = (topo.links || []).some((l) => l && l.kind === 'lan');
     let lanNode = null;
     for (const rec of topoNodes.values()) {
       if (rec.type === 'lan') {
@@ -2487,7 +2559,7 @@ export function createTrayScene(container, options = {}) {
         break;
       }
     }
-    if (lanNode) {
+    if (lanNode && !hasExplicitLan) {
       topoLinkFrom = lanNode.id;
       addLink(lanNode, 'lan', lanNode.txBps, lanNode.rxBps);
     }
@@ -3150,7 +3222,9 @@ export function createTrayScene(container, options = {}) {
         // 增量帧：只更新本帧变化的设备，字典里其余设备保持
         for (const d of state.devices) {
           if (!d || !d.ip) continue;
-          knownDevices.set(String(d.ip), normalizeDevice(d));
+          const key = String(d.ip);
+          // 逐字段合并：帧里没带的字段（如 online/blocked）不覆盖已有真实状态
+          knownDevices.set(key, mergeDeviceRecord(knownDevices.get(key), normalizeDevice(d)));
         }
         // removed：仅增量帧出现（被 forget/隐藏的设备），先合并 devices 再删除
         if (Array.isArray(state.removed)) {
@@ -3163,7 +3237,7 @@ export function createTrayScene(container, options = {}) {
         knownDevices.clear();
         for (const d of state.devices) {
           if (!d || !d.ip) continue;
-          knownDevices.set(String(d.ip), normalizeDevice(d));
+          knownDevices.set(String(d.ip), mergeDeviceRecord(null, normalizeDevice(d)));
         }
       }
       applyDevices([...knownDevices.values()]);
@@ -3172,13 +3246,14 @@ export function createTrayScene(container, options = {}) {
       if (state.full === false && knownDevices.size) {
         for (const d of state.topDevices) {
           if (!d || !d.ip) continue;
-          knownDevices.set(String(d.ip), normalizeDevice(d));
+          const key = String(d.ip);
+          knownDevices.set(key, mergeDeviceRecord(knownDevices.get(key), normalizeDevice(d)));
         }
       } else {
         knownDevices.clear();
         for (const d of state.topDevices) {
           if (!d || !d.ip) continue;
-          knownDevices.set(String(d.ip), normalizeDevice(d));
+          knownDevices.set(String(d.ip), mergeDeviceRecord(null, normalizeDevice(d)));
         }
       }
       applyDevices([...knownDevices.values()]);

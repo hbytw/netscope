@@ -32,7 +32,7 @@
   "categories": [{"key":"video","label":"视频流媒体","upBps":1200,"downBps":5200000,"share":0.42,"color":"#22d3ee"}],
   "trend": [{"t":1761899000,"up":1200,"down":5200000}],
   "topDevices": [{"ip":"192.168.1.31","name":"MEIZU-Note-16","alias":"妈妈的手机",
-                  "upBps":1234,"downBps":5678,"totalDown":1048576,"risk":0.2}],
+                  "upBps":1234,"downBps":5678,"totalDown":1048576,"risk":0.2,"online":true,"blocked":false,"conns":12}],
   "topDomains": [{"domain":"bilibili.com","label":"哔哩哔哩","category":"video","hits":123,"downBps":520000}],
   "alerts": [Event]
 }

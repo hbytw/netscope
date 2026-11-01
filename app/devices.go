@@ -3,6 +3,8 @@ package main
 // 设备发现与管理。
 //
 // 三源合并：/tmp/dhcp.leases（租约）+ `ip neigh`（ARP/邻居表）+ conntrack 源 IP。
+// 其中 `ip neigh show` 走共享缓存（见 topology.go 的 neighEntries，10s 级）：
+// 设备刷新每 10s 一次，同一缓存窗口内不会重复 fork 外部命令。
 // 在线判定：最近 5 分钟内有邻居记录或流量。
 // 事件：new_device / device_online / device_offline 交给研判层（去重后落库并推 SSE）。
 // 状态结构以小对象为主，设备数量级通常 < 100，内存可忽略。
@@ -247,8 +249,9 @@ func (m *DeviceMgr) Refresh(now int64) {
 		return
 	}
 	leases := readDHCPSLeases(dhcpLeasePath)
-	neighOut, _ := m.app.shellQuietOutput("ip neigh show 2>/dev/null")
-	neighs := parseNeigh(neighOut)
+	// 邻居表走共享缓存（topology.go neighEntries，10s）：
+	// 设备刷新本身每 10s 一次，同一窗口内不会重复 fork `ip neigh show`。
+	neighs := m.app.neighEntries()
 
 	ifaces := m.app.interfaces()
 	ifaceNet := make(map[string]string, len(ifaces))

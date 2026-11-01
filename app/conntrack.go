@@ -409,6 +409,11 @@ func (e *ConnEngine) emitFlow(emit func(FlowDelta), d FlowDelta) {
 	e.publishFlow(FlowContext{})
 }
 
+// tproxySport TPROXY 劫持使用的源端口特征。
+// passwall/xray 的透明代理会把「设备 → 真实目标」改写成 dst=路由器IP:16384，
+// 据此可把代理流量准确归到对应设备与 proxy 链路（否则代理流量会丢失或被记成直连）。
+const tproxySport = 16384
+
 // normalize 判断方向并生成规范化 key，同时返回设备方向的上/下行累计字节与流向元信息。
 func (e *ConnEngine) normalize(ent ctEntry) (flowKey, int64, int64, flowMeta, bool) {
 	k := flowKey{Proto: protoCode(ent.Proto)}
@@ -424,6 +429,29 @@ func (e *ConnEngine) normalize(ent ctEntry) (flowKey, int64, int64, flowMeta, bo
 		k.Dir = 0
 		path := e.pathFor(ent.DstIP, ent.DPort, ent.Mark)
 		return k, ent.OrigBytes, ent.ReplyBytes, flowMeta{path: path, device: false}, true
+	}
+	// 目的地址是本机（dst=路由器）：
+	//  · TPROXY 劫持记录（sport=16384）：设备 → 真实目标 被内核改写成 dst=本机IP:16384，
+	//    这是**设备流量**（经代理），必须计入设备与 proxy 链路，否则代理流量全部丢失；
+	//  · 其它指向本机的连接（访问路由器自身 Web/SSH/DNS 服务）：不是用户设备流量，
+	//    只计入链路流向，避免这些字节记到路由器自己名下（Top 设备里出现路由器自身）。
+	if e.netsSnapshot().self[ent.DstIP] {
+		if ent.SPort == tproxySport {
+			// TPROXY 劫持：按设备流量处理，流向固定为 proxy
+			k.Dev = ent.SrcIP
+			k.SPort = uint16(ent.SPort)
+			k.Dst = ent.DstIP
+			k.DPort = uint16(ent.DPort)
+			k.Dir = 0
+			return k, ent.OrigBytes, ent.ReplyBytes, flowMeta{path: "proxy", device: true}, true
+		}
+		k.Dev = ent.DstIP
+		k.SPort = uint16(ent.DPort)
+		k.Dst = ent.SrcIP
+		k.DPort = uint16(ent.SPort)
+		k.Dir = 1
+		path := e.pathFor(ent.SrcIP, ent.SPort, ent.Mark)
+		return k, ent.ReplyBytes, ent.OrigBytes, flowMeta{path: path, device: false}, true
 	}
 	if n, ok := e.matchDevice(ent.SrcIP); ok {
 		k.Dev = ent.SrcIP

@@ -510,12 +510,18 @@ type categoryBrief struct {
 	Color   string  `json:"color"`
 }
 
+// topDeviceJSON 总览里的 Top 设备快照。
+// online/blocked/conns 必须来自设备真实状态（与 /api/devices、SSE tick 同源），
+// 否则 3D 大屏只能靠「字段缺失即在线」的乐观默认，导致离线/被断网设备被显示成正常在线。
 type topDeviceJSON struct {
 	IP        string  `json:"ip"`
 	Name      string  `json:"name"`
 	Alias     string  `json:"alias"`
+	Online    bool    `json:"online"`  // 设备当前是否在线
+	Blocked   bool    `json:"blocked"` // 是否被断网/封禁
 	UpBps     int64   `json:"upBps"`
 	DownBps   int64   `json:"downBps"`
+	Conns     int     `json:"conns"` // 当前连接数
 	TotalDown int64   `json:"totalDown"`
 	Risk      float64 `json:"risk"`
 }
@@ -637,6 +643,8 @@ func (a *App) buildOverview() overviewResp {
 		d := sortedDev[i]
 		topDevices = append(topDevices, topDeviceJSON{
 			IP: d.IP, Name: displayName(d.Hostname, d.IP), Alias: d.Alias,
+			// 状态字段必须透传真实状态：在线 / 被断网 / 当前连接数
+			Online: d.Online, Blocked: d.Blocked, Conns: d.Conns,
 			UpBps: d.UpBps, DownBps: d.DownBps, TotalDown: d.TotalDown, Risk: d.Risk,
 		})
 	}

@@ -77,6 +77,10 @@ type App struct {
 	dnsTapMu sync.Mutex
 	switchMu sync.Mutex // 设置补丁「读—改—写」串行化，避免并发丢更新
 
+	// 开关动作注入点（单测替换以模拟失败；nil = 默认实现）
+	dnsTapApply          func(enabled bool) error
+	deviceControlRestore func() error
+
 	scaleLogN int
 	pidPath   string
 
@@ -299,10 +303,13 @@ func (a *App) ApplySwitchPatch(patch settingsPatch) (Settings, []string, []strin
 	// 依赖关系：关闭依赖项会自动关闭被依赖项
 	normalizeSwitches(&next)
 
-	applied, revoked, err := a.applySwitchTransitions(cur, next)
-	if err != nil {
-		return cur, applied, revoked, err
+	// 开关变更：执行动作；任一动作失败时立即回滚已执行的动作，
+	// 保证「落库状态 == 路由器实际状态」（不会出现界面显示生效、实际已撤销）。
+	res := a.applySwitchTransitions(cur, next)
+	if res.Err != nil {
+		return a.handleSwitchFailure(cur, next, res)
 	}
+	applied, revoked := res.Applied, res.Revoked
 	out := a.store.UpdateSettings(func(s *Settings) { *s = next })
 	// 仅当开关相关补丁变化时才重下发规则/策略恢复，避免修改告警参数（如更新间隔）时也做全量 reconcile
 	switchPatch := patch.Enabled != nil || patch.DeviceControl != nil || patch.Schedule != nil
@@ -323,73 +330,393 @@ func (a *App) ApplySwitchPatch(patch settingsPatch) (Settings, []string, []strin
 	return out, applied, revoked, nil
 }
 
+// ---------------- 开关变更：可逆动作 + 失败回滚 ----------------
+//
+// 设计要点（修复「先撤销、后启用」导致的状态背离）：
+//
+//	原实现：撤销 deviceControl 成功 → 启用 dnsTap 失败 → 返回错误且不落库，
+//	此时 store 仍显示 deviceControl=true，但 iptables/tc 已被撤销，
+//	界面显示「生效」而实际无规则（状态背离）。
+//
+//	现实现：每个动作都配有反向动作（revert）。任一动作失败时按相反顺序回滚
+//	已执行的动作：
+//	  - 全部回滚成功 → 路由器实际状态 == 旧设置 → 不落库（设置保持旧值）；
+//	  - 存在回滚失败 → 部分成功 → 按路由器实际状态落库，并在错误信息中标注
+//	    「部分成功」，前端可如实提示。
+//
+//	两种情况都保证：ApplySwitchPatch 返回的设置 == 路由器实际状态。
+
+// switchStep 开关变更中的单个原子动作。
+type switchStep struct {
+	key    string       // 对应 Settings 字段（回滚失败时用于校正落库值）
+	label  string       // 中文短名（错误信息用）
+	turnOn bool         // 动作目标状态：true=启用，false=撤销
+	desc   string       // 完成后的中文描述（写入 applied / revoked）
+	run    func() error // 执行动作（返回 error 表示动作失败）
+	revert func() error // 反向动作：恢复旧状态（nil = 无需恢复）
+}
+
+// switchFailure 一个未能回滚的动作（实际状态无法恢复 → 需按实际状态落库）。
+type switchFailure struct {
+	Key   string
+	Label string
+}
+
+// switchRunResult 开关动作执行结果。
+type switchRunResult struct {
+	Applied []string        // 已生效动作描述
+	Revoked []string        // 已撤销动作描述
+	Err     error           // 首个失败动作的错误（nil = 全部成功）
+	Failed  string          // 失败动作对应的设置字段
+	Undone  []switchFailure // 回滚失败的动作（实际状态未能恢复）
+}
+
+// runSwitchSteps 顺序执行开关动作，并在失败时回滚已执行的动作。
+//
+// 失败动作本身不回滚：各动作的失败路径自行负责清理（如 ApplyDNSTap 内部
+// 已反做还原），此处只回滚「此前已成功执行」的动作。
+func runSwitchSteps(steps []switchStep) switchRunResult {
+	var res switchRunResult
+	done := make([]switchStep, 0, len(steps))
+	for _, st := range steps {
+		if st.run != nil {
+			if err := st.run(); err != nil {
+				res.Err = err
+				res.Failed = st.key
+				// 回滚已执行的动作（逆序：后撤销的先恢复）
+				for i := len(done) - 1; i >= 0; i-- {
+					d := done[i]
+					if d.revert == nil {
+						continue
+					}
+					if rerr := d.revert(); rerr != nil {
+						logf("开关回滚失败: %s: %v", d.label, rerr)
+						res.Undone = append(res.Undone, switchFailure{Key: d.key, Label: d.label})
+					}
+				}
+				return res
+			}
+		}
+		done = append(done, st)
+		if st.turnOn {
+			res.Applied = append(res.Applied, st.desc)
+		} else {
+			res.Revoked = append(res.Revoked, st.desc)
+		}
+	}
+	return res
+}
+
 // applySwitchTransitions 执行实际启停动作并给出中文描述。
-func (a *App) applySwitchTransitions(old, next Settings) ([]string, []string, error) {
-	var applied, revoked []string
+//
+// 顺序：先撤销（安全），再启用；任一动作失败时自动回滚已撤销项。
+func (a *App) applySwitchTransitions(old, next Settings) switchRunResult {
+	// 撤销前的管控层快照（回滚时精确还原域名封堵 / 策略命中状态）
+	snap := a.enf.snapshotEnforce()
+
+	var steps []switchStep
 
 	// 1) 撤销（先关闭，保证不残留规则）
 	if old.DNSTap && !next.DNSTap {
-		if err := a.ApplyDNSTap(false); err != nil {
-			return applied, revoked, &switchError{status: 500, msg: err.Error()}
-		}
-		revoked = append(revoked, "已关闭 dnsmasq 日志旁挂并还原 UCI 选项")
+		steps = append(steps, switchStep{
+			key: "dnsTap", label: "DNS 日志旁挂", turnOn: false,
+			desc:   "已关闭 dnsmasq 日志旁挂并还原 UCI 选项",
+			run:    func() error { return a.applyDNSTapSwitch(false) },
+			revert: func() error { return a.applyDNSTapSwitch(true) },
+		})
 	}
 	if old.DeviceControl && !next.DeviceControl {
-		a.enf.RevokeDeviceControl()
-		revoked = append(revoked, "已撤销 UBM_FWD/UBM_IN 断网规则并清理 tc 限速配置")
+		steps = append(steps, switchStep{
+			key: "deviceControl", label: "设备管控", turnOn: false,
+			desc:   "已撤销 UBM_FWD/UBM_IN 断网规则并清理 tc 限速配置",
+			run:    func() error { a.enf.RevokeDeviceControl(); return nil },
+			revert: func() error { return a.restoreDeviceControl(snap) },
+		})
 	}
 	if old.DomainBlock && !next.DomainBlock {
-		a.enf.RevokeDomainBlock()
-		revoked = append(revoked, "已销毁 ipset ubm_block 并删除域名拦截规则")
+		steps = append(steps, switchStep{
+			key: "domainBlock", label: "域名封堵", turnOn: false,
+			desc:   "已销毁 ipset ubm_block 并删除域名拦截规则",
+			run:    func() error { a.enf.RevokeDomainBlock(); return nil },
+			revert: func() error { return a.restoreDomainBlock(snap) },
+		})
 	}
 	if old.Enabled && !next.Enabled {
-		a.enf.RevokeAll()
-		revoked = append(revoked, "系统总开关已关闭：全部采集与管控静默，已撤销全部下发规则")
+		steps = append(steps, switchStep{
+			key: "enabled", label: "系统总开关", turnOn: false,
+			desc:   "系统总开关已关闭：全部采集与管控静默，已撤销全部下发规则",
+			run:    func() error { a.enf.RevokeAll(); return nil },
+			revert: func() error { return a.restoreAllControl(snap) },
+		})
 	}
 	if old.Schedule && !next.Schedule {
-		revoked = append(revoked, "已停止定时策略自动启停")
+		steps = append(steps, switchStep{
+			key: "schedule", label: "定时策略", turnOn: false,
+			desc: "已停止定时策略自动启停",
+			run:  func() error { return nil },
+		})
 	}
 	if old.Alerts && !next.Alerts {
-		a.sec.ResetRuntime()
-		revoked = append(revoked, "已停止安全研判（历史事件保留）")
+		steps = append(steps, switchStep{
+			key: "alerts", label: "安全告警研判", turnOn: false,
+			desc: "已停止安全研判（历史事件保留）",
+			run:  func() error { a.sec.ResetRuntime(); return nil },
+		})
 	}
 	if old.History && !next.History {
-		revoked = append(revoked, "已停止历史流量落盘")
+		steps = append(steps, switchStep{
+			key: "history", label: "历史流量落盘", turnOn: false,
+			desc: "已停止历史流量落盘",
+			run:  func() error { return nil },
+		})
 	}
 	if old.Collect && !next.Collect {
-		a.clearCollectedData()
-		revoked = append(revoked, "已停止流量采集并清空实时数据")
+		steps = append(steps, switchStep{
+			key: "collect", label: "流量采集", turnOn: false,
+			desc: "已停止流量采集并清空实时数据",
+			run:  func() error { a.clearCollectedData(); return nil },
+		})
 	}
 
-	// 2) 启用（dnsTap 先试，失败则不落库）
+	// 2) 启用（dnsTap 先试：失败则回滚上面已撤销的项并保持旧设置）
 	if !old.DNSTap && next.DNSTap {
-		if err := a.ApplyDNSTap(true); err != nil {
-			return applied, revoked, &switchError{status: 500, msg: err.Error()}
-		}
-		applied = append(applied, "已开启 dnsmasq 日志旁挂（UCI + stop/start + 健康检查）")
+		steps = append(steps, switchStep{
+			key: "dnsTap", label: "DNS 日志旁挂", turnOn: true,
+			desc:   "已开启 dnsmasq 日志旁挂（UCI + stop/start + 健康检查）",
+			run:    func() error { return a.applyDNSTapSwitch(true) },
+			revert: func() error { return a.applyDNSTapSwitch(false) },
+		})
 	}
 	if !old.Enabled && next.Enabled {
-		applied = append(applied, "系统总开关已开启")
+		steps = append(steps, switchStep{
+			key: "enabled", label: "系统总开关", turnOn: true,
+			desc: "系统总开关已开启",
+			run:  func() error { return nil },
+		})
 	}
 	if !old.Collect && next.Collect {
-		applied = append(applied, "已启动流量采集")
+		steps = append(steps, switchStep{
+			key: "collect", label: "流量采集", turnOn: true,
+			desc: "已启动流量采集",
+			run:  func() error { return nil },
+		})
 	}
 	if !old.DeviceControl && next.DeviceControl {
-		applied = append(applied, "设备管控已启用")
+		steps = append(steps, switchStep{
+			key: "deviceControl", label: "设备管控", turnOn: true,
+			desc: "设备管控已启用",
+			run:  func() error { return nil },
+		})
 	}
 	if !old.DomainBlock && next.DomainBlock {
-		applied = append(applied, "域名封堵已启用")
+		steps = append(steps, switchStep{
+			key: "domainBlock", label: "域名封堵", turnOn: true,
+			desc: "域名封堵已启用",
+			run:  func() error { return nil },
+		})
 	}
 	if !old.Schedule && next.Schedule {
-		applied = append(applied, "定时策略已启用")
+		steps = append(steps, switchStep{
+			key: "schedule", label: "定时策略", turnOn: true,
+			desc: "定时策略已启用",
+			run:  func() error { return nil },
+		})
 	}
 	if !old.Alerts && next.Alerts {
-		applied = append(applied, "安全告警研判已启用")
+		steps = append(steps, switchStep{
+			key: "alerts", label: "安全告警研判", turnOn: true,
+			desc: "安全告警研判已启用",
+			run:  func() error { return nil },
+		})
 	}
 	if !old.History && next.History {
-		applied = append(applied, "历史统计已启用")
+		steps = append(steps, switchStep{
+			key: "history", label: "历史流量落盘", turnOn: true,
+			desc: "历史统计已启用",
+			run:  func() error { return nil },
+		})
 	}
-	return applied, revoked, nil
+	return runSwitchSteps(steps)
+}
+
+// handleSwitchFailure 处理开关动作失败。
+//
+// 能全部回滚 → 路由器实际状态与旧设置一致 → 不落库（保持旧设置）；
+// 不能全部回滚（部分成功）→ 按路由器实际状态落库，并在错误信息中标注「部分成功」。
+func (a *App) handleSwitchFailure(cur, next Settings, res switchRunResult) (Settings, []string, []string, error) {
+	if len(res.Undone) == 0 {
+		// 已撤销的开关全部恢复 → 系统状态 == 旧设置 → 不落库
+		msg := "（已回滚到操作前状态：设置与路由器实际状态一致）"
+		if len(res.Applied) == 0 && len(res.Revoked) == 0 {
+			msg = "（未做任何变更：设置与路由器实际状态一致）"
+		}
+		return cur, res.Applied, res.Revoked, &switchError{
+			status: 500,
+			msg:    fmt.Sprintf("%v%s", res.Err, msg),
+		}
+	}
+	// 部分成功：把实际生效的状态落库（设置必须与路由器实际状态一致）
+	names := make([]string, 0, len(res.Undone))
+	effective := cur
+	for _, f := range res.Undone {
+		names = append(names, f.Label)
+		applySwitchKey(&effective, f.Key, next)
+	}
+	normalizeSwitches(&effective)
+	out := a.store.UpdateSettings(func(s *Settings) { *s = effective })
+	logf("开关变更部分成功：%s 未能恢复，已按路由器实际状态落库", strings.Join(names, "、"))
+	return out, res.Applied, res.Revoked, &switchError{
+		status: 500,
+		msg: fmt.Sprintf("%v；部分成功：%s 未能恢复，已按路由器实际状态记录（请刷新页面确认）",
+			res.Err, strings.Join(names, "、")),
+	}
+}
+
+// applySwitchKey 按字段名把「目标设置」的值写入 s（部分成功时校正落库值）。
+func applySwitchKey(s *Settings, key string, ref Settings) {
+	switch key {
+	case "enabled":
+		s.Enabled = ref.Enabled
+	case "collect":
+		s.Collect = ref.Collect
+	case "dnsTap":
+		s.DNSTap = ref.DNSTap
+	case "deviceControl":
+		s.DeviceControl = ref.DeviceControl
+	case "domainBlock":
+		s.DomainBlock = ref.DomainBlock
+	case "schedule":
+		s.Schedule = ref.Schedule
+	case "alerts":
+		s.Alerts = ref.Alerts
+	case "history":
+		s.History = ref.History
+	}
+}
+
+// applyDNSTapSwitch 执行 DNS 旁挂开关（单测可注入失败）。
+func (a *App) applyDNSTapSwitch(enabled bool) error {
+	if a.dnsTapApply != nil {
+		return a.dnsTapApply(enabled)
+	}
+	return a.ApplyDNSTap(enabled)
+}
+
+// restoreDeviceControl 恢复设备管控（回滚用）。
+//
+// 撤销设备管控会清空内存中的管控状态并拆掉 iptables/tc 规则；
+// 回滚时从 store 恢复持久化的断网/限速记录并重新下发规则，使实际状态回到操作前。
+//
+// 恢复后自检规则是否真的在位（防火墙重载会静默冲刷自有链）：
+// 自检失败先重试一次，仍失败则如实上报（进入「部分成功」分支，按实际状态落库）。
+func (a *App) restoreDeviceControl(snap enforceSnapshot) error {
+	if a.deviceControlRestore != nil {
+		return a.deviceControlRestore()
+	}
+	a.enf.restorePolicyState(snap)
+	a.enf.RestoreFromStore()
+	if err := a.verifyDeviceControl(); err != nil {
+		logf("设备管控回滚自检失败，重试一次: %v", err)
+		a.enf.restorePolicyState(snap)
+		a.enf.RestoreFromStore()
+		if err2 := a.verifyDeviceControl(); err2 != nil {
+			return fmt.Errorf("设备管控回滚失败: %w", err2)
+		}
+	}
+	return nil
+}
+
+// verifyDeviceControl 校验管控规则是否真的在位（回滚后自检）。
+//
+// dry-run/demo 下只记录命令不执行，无法核验系统状态，此时不做校验。
+func (a *App) verifyDeviceControl() error {
+	out, ok := a.enf.iptablesDump()
+	if !ok {
+		return nil // 无法核验 → 视为成功
+	}
+	if !a.enf.rulesPresent(out) {
+		return errors.New("iptables 自有链或管控规则缺失")
+	}
+	return nil
+}
+
+// restoreDomainBlock 恢复域名封堵（回滚用）：按快照重新下发 ipset 与拦截规则。
+func (a *App) restoreDomainBlock(snap enforceSnapshot) error {
+	return a.enf.restoreDomains(snap)
+}
+
+// restoreAllControl 恢复总开关撤销前的全部管控（回滚用）。
+//
+// 域名封堵由「域名封堵」开关自己的回滚步骤单独恢复（各自独立判定成败，
+// 避免重复恢复导致「明明恢复了却报失败」的假象）。
+func (a *App) restoreAllControl(snap enforceSnapshot) error {
+	return a.restoreDeviceControl(snap)
+}
+
+// ---------------- 管控层快照（开关回滚用） ----------------
+//
+// RevokeDeviceControl / RevokeDomainBlock / RevokeAll 会清空 Enforcer 内存中的
+// 管控状态（断网/限速/域名封堵/策略命中）且不可逆。为支持失败回滚，这里在撤销前
+// 做快照，回滚时精确还原：无需重新解析域名，也不会让策略命中数重复累加。
+//
+// 说明：这些方法定义在 main.go —— 本模块只允许改动 main.go（enforce.go 归其它模块维护）。
+
+// enforceSnapshot 管控层可恢复状态快照。
+type enforceSnapshot struct {
+	domains      map[string]bool     // 已下发的域名封堵集合
+	domainIPs    map[string][]uint32 // 域名 → 已解析 IP（回滚时免去重新解析）
+	policyActive map[string]bool     // 已命中的策略集合
+}
+
+// snapshotEnforce 快照当前管控状态（撤销动作前调用）。
+func (e *Enforcer) snapshotEnforce() enforceSnapshot {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	snap := enforceSnapshot{
+		domains:      copyBoolMap(e.dnsDomains),
+		domainIPs:    make(map[string][]uint32, len(e.domainIPs)),
+		policyActive: copyBoolMap(e.policyActive),
+	}
+	for d, ips := range e.domainIPs {
+		snap.domainIPs[d] = append([]uint32(nil), ips...)
+	}
+	return snap
+}
+
+// restorePolicyState 还原策略命中状态（回滚用）。
+//
+// 撤销设备管控/总开关会清空 policyActive；若不回原，回滚后的下一轮策略评估会
+// 把同一批策略当成「新命中」，重复累加命中数并重复推送命中事件。
+func (e *Enforcer) restorePolicyState(snap enforceSnapshot) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.policyActive = copyBoolMap(snap.policyActive)
+}
+
+// restoreDomains 用快照还原域名封堵状态并重新下发 ipset 与拦截规则（回滚用）。
+func (e *Enforcer) restoreDomains(snap enforceSnapshot) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// 先还原已解析的域名 IP 缓存：回滚时无需重新解析（DNS 不可用也能还原）
+	e.domainIPs = make(map[string][]uint32, len(snap.domainIPs))
+	for d, ips := range snap.domainIPs {
+		e.domainIPs[d] = append([]uint32(nil), ips...)
+	}
+	e.dnsDomains = map[string]bool{}
+	e.dnsDesired = map[string]bool{}
+	e.pending = map[string]int64{}
+	if len(snap.domains) == 0 {
+		return nil
+	}
+	if _, err := e.applyDomainState(copyBoolMap(snap.domains)); err != nil {
+		return fmt.Errorf("回滚域名封堵失败: %w", err)
+	}
+	// applyDomainState 重建规则时 dnsDomains 尚未提交（enforce.go 的既有顺序），
+	// 这里再重建一次，确保 ipset 匹配规则被补上。
+	if _, err := e.rebuildDeviceRules(); err != nil {
+		return fmt.Errorf("回滚域名封堵规则失败: %w", err)
+	}
+	return nil
 }
 
 // clearCollectedData 清空运行时采集数据（关闭采集时回到空状态）。
@@ -644,15 +971,28 @@ func (a *App) updateScale() {
 	}
 }
 
+// currentFlowContext 读取 DNS 模块当前持有的流向上下文（回填用）。
+//
+// 说明：DNSResolver 的上下文发布方法（onFlowContext）定义在 dns.go（其它模块维护），
+// 本文件只补一个读取方法，保证「设备级 DNS 回退」使用的上下文始终是当前连接，
+// 不依赖采集侧发布/清理的隐式时序。
+func (d *DNSResolver) currentFlowContext() FlowContext {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.flowCtx
+}
+
 // onDelta 处理一条 conntrack 增量：域名归因 → 聚合 → 设备累计 → 连接明细 → 研判。
 func (a *App) onDelta(d FlowDelta) {
 	now := nowUnix()
-	// 非设备流量（本机 / docker0 等）：只计入链路 path 流量，不进连接表与设备统计
+	// 非设备流量（本机 / docker0 等）：
+	//
+	// 这类记录与「设备侧记录」是同一份用户流量的另一条 conntrack 条目
+	//（例：客户端→目标的 TPROXY 记录 与 路由器(xray)→上游的出口记录），
+	// 若同时计入 path，会让 direct/proxy 链路流量翻倍，与「互联网节点 = 链路之和」
+	// 的口径自相矛盾（实测链路值放大千倍）。
+	// 因此本机流量只保留在连接层展示，不计入 path 链路、不计入全局总量。
 	if d.DeviceIP == "" {
-		if d.Baseline || (d.UpDelta == 0 && d.DownDelta == 0) {
-			return
-		}
-		a.agg.AddPathBytes(d.Path, d.UpDelta, d.DownDelta)
 		return
 	}
 	deviceName := ""
@@ -666,10 +1006,27 @@ func (a *App) onDelta(d FlowDelta) {
 			domain, cat, label, ok = d2, c2, l2, true
 		}
 	}
-	if !ok {
-		// 设备级回退：走代理时 dst 是代理服务器 IP，无法按目的 IP 归因；
+	if !ok && d.Path == "proxy" {
+		// 设备级回退：走代理时 dst 是代理服务器/隧道出口 IP，无法按目的 IP 归因；
 		// 用该设备最近一次 DNS 查询（如 www.youtube.com）归类，解决代理流量 100% other。
-		if d2, c2, l2, ok2 := a.dns.RecentForDevice(d.DeviceIP, now); ok2 {
+		//
+		// 流向限制在此显式判定（只对 proxy 连接生效）：直连/内网连接若也回退，
+		// 会把裸 IP 流量误挂到上一次查询的域名上。
+		// 同时把本条连接的上下文（d.Path / d.DstIP / d.DPort 等）显式发布给 DNS 模块，
+		// 使 DNS 侧的「仅代理连接生效」判断看到的就是当前连接，而不是采集侧
+		// 隐式发布、可能陈旧的上下文；调用后恢复原上下文，不影响采集节奏。
+		prev := a.dns.currentFlowContext()
+		a.dns.onFlowContext(FlowContext{
+			DeviceIP: d.DeviceIP,
+			DstIP:    d.DstIP,
+			SPort:    d.SPort,
+			DPort:    d.DPort,
+			Proto:    d.Proto,
+			Path:     d.Path,
+		})
+		d2, c2, l2, ok2 := a.dns.RecentForDevice(d.DeviceIP, now)
+		a.dns.onFlowContext(prev)
+		if ok2 {
 			domain, cat, label, ok = d2, c2, l2, true
 		}
 	}
