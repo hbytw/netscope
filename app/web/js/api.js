@@ -231,7 +231,9 @@ const mockState = {
     domainBlock: true, schedule: true, alerts: true, history: true,
     collectIntervalSec: 2, retentionDays: 14,
     alert: { enable: true, scanPorts: 20, trafficMbPerHour: 500 },
-    version: '1.0.0', dataDir: '/mnt/mmcblk2p4/guanlan'
+    version: '1.0.0', dataDir: '/mnt/mmcblk2p4/guanlan',
+    // 与后端 Settings.Timezone 默认值一致：定时策略时段按该时区解释
+    timezone: 'Asia/Shanghai'
   }
 };
 
@@ -552,8 +554,24 @@ function makeOverview() {
   };
 }
 
+/**
+ * mock 流量桶配置：基础桶宽与后端 rangeSpec（app/api.go）保持一致
+ * （1h=60s / 6h=120s / 24h=300s / 7d=1800s）。
+ * 此前 1h 用 30 秒桶，mock 下「字节/桶 → 字节/秒」的换算比真机大一倍，
+ * 曲线锯齿与图例均值都和真机对不上。
+ * points 按「时长 ÷ 桶宽」铺满整个时间窗，避免改桶宽后 mock 只覆盖半段。
+ */
+const TRAFFIC_MOCK_RANGE = {
+  '1h': { bucketSec: 60, points: 60 },
+  '6h': { bucketSec: 120, points: 180 },
+  '24h': { bucketSec: 300, points: 288 },
+  '7d': { bucketSec: 1800, points: 336 }
+};
+
 function makeTraffic(range) {
-  const cfg = { '1h': { bucketSec: 30, points: 120 }, '6h': { bucketSec: 120, points: 180 }, '24h': { bucketSec: 300, points: 180 }, '7d': { bucketSec: 1800, points: 168 } }[range] || { bucketSec: 60, points: 120 };
+  // 与后端一致：range 缺省/非法时按 1h 处理。
+  const key = TRAFFIC_MOCK_RANGE[range] ? range : '1h';
+  const cfg = TRAFFIC_MOCK_RANGE[key];
   const now = Math.floor(Date.now() / 1000);
   const cats = catShares();
   const series = [];
@@ -563,19 +581,29 @@ function makeTraffic(range) {
     const night = hour >= 0 && hour < 6 ? 0.28 : hour >= 19 && hour < 23 ? 1.35 : 1.0;
     const wave = 1 + Math.sin(i / 9) * 0.22 + Math.cos(i / 3.1) * 0.08;
     const byCat = {};
-    let up = 0, down = 0;
+    let upBytes = 0, downBytes = 0;
     cats.forEach((c) => {
-      const v = Math.round(c.share * 7_800_000 * night * wave * (0.72 + ((i * 31) % 17) / 20));
-      byCat[c.key] = v;
-      down += v;
-      up += Math.round(v * 0.13);
-    });    series.push({ t, up, down, byCat });
+      // 与后端 aggregateSeries 同口径：byCat 是「该桶内累计字节数」，
+      // 速率再由 字节数 × 8 ÷ 桶宽 得到（bit/s）。旧 mock 把字节数当成 bit/s，
+      // 导致堆叠视图（÷桶宽）与上下行视图（÷8）相差 bucketSec÷8 倍。
+      const bytes = Math.round(c.share * 7_800_000 * night * wave * (0.72 + ((i * 31) % 17) / 20) / 8 * cfg.bucketSec);
+      byCat[c.key] = bytes;
+      downBytes += bytes;
+      upBytes += Math.round(bytes * 0.13);
+    });
+    series.push({
+      t,
+      up: Math.round(upBytes * 8 / cfg.bucketSec),
+      down: Math.round(downBytes * 8 / cfg.bucketSec),
+      byCat
+    });
   }
-  const totalDown = series.reduce((a, x) => a + x.down, 0) || 1;
   const byCategory = cats.map((c) => {
     const v = series.reduce((a, x) => a + (x.byCat[c.key] || 0), 0);
-    return { key: c.key, label: c.label, up: Math.round(v * 0.13), down: v, share: v / totalDown, color: c.color };
+    return { key: c.key, label: c.label, up: Math.round(v * 0.13), down: v, share: 0, color: c.color };
   });
+  const totalDown = byCategory.reduce((a, x) => a + x.down, 0) || 1;
+  byCategory.forEach((c) => { c.share = c.down / totalDown; });
   const byDevice = mockState.devices.map((d) => {
     const v = Math.round(d.totalDown * 0.22);
     return { ip: d.ip, name: d.hostname, alias: d.alias, up: Math.round(v * 0.13), down: v, share: 0 };
@@ -583,7 +611,7 @@ function makeTraffic(range) {
   const sumDev = byDevice.reduce((a, x) => a + x.down, 0) || 1;
   byDevice.forEach((d) => { d.share = d.down / sumDev; });
   const byApp = byCategory.map((c) => ({ key: c.key, label: c.label, up: c.up, down: c.down, share: c.share }));
-  return { range, bucketSec: cfg.bucketSec, series, byCategory, byDevice, byApp };
+  return { range: key, bucketSec: cfg.bucketSec, series, byCategory, byDevice, byApp };
 }
 
 function makeDomains(range, limit) {
@@ -1414,16 +1442,34 @@ function notifySettings(s) {
   _settingsListeners.forEach((fn) => { try { fn(s); } catch (e) { console.error('[settings]', e); } });
 }
 
-/** 拉取设置并广播（启动时调用一次） */
+/**
+ * 拉取设置并广播（启动时调用一次）。
+ *
+ * 去重：标签页「重新可见」（visibilitychange）与「窗口重新获得焦点」（focus）
+ * 可能几乎同时触发，页面挂载时也会各拉一次；不去重就会连发两次 GET /api/settings
+ * 并广播两轮，让当前页把同一份数据全量重拉两遍。
+ * 这里复用进行中的请求，并 1 秒内复用上次结果（设置变更走 PUT/toggle 的返回值广播，
+ * 不依赖本函数，因此短缓存不会让刚保存的设置回退）。
+ */
+let _settingsInflight = null;
+let _settingsLoadedAt = 0;
 export async function refreshSettings() {
-  try {
-    const s = await api.getSettings();
-    notifySettings(s);
-    return s;
-  } catch (e) {
-    console.warn('[settings] load failed', e.message);
-    return null;
-  }
+  if (_settingsInflight) return _settingsInflight;
+  if (_settings && Date.now() - _settingsLoadedAt < 1000) return _settings;
+  _settingsInflight = (async () => {
+    try {
+      const s = await api.getSettings();
+      notifySettings(s);
+      _settingsLoadedAt = Date.now();
+      return s;
+    } catch (e) {
+      console.warn('[settings] load failed', e.message);
+      return null;
+    } finally {
+      _settingsInflight = null;
+    }
+  })();
+  return _settingsInflight;
 }
 
 /**

@@ -12,9 +12,15 @@ import {
   skeleton, emptyState, errorBox, toast, confirmDialog, deviceIcon, disabledState
 } from './components.js';
 import { formatNumber, formatTime, CATEGORY_COLOR, CATEGORY_LABEL, CATEGORY_ORDER } from './format.js';
-import { refreshSettings, isEnabled, isFeatureOn, subscribeSettings } from '../api.js';
+import { refreshSettings, isEnabled, isFeatureOn, subscribeSettings, getSettingsCache } from '../api.js';
 
 const DAYS = ['一', '二', '三', '四', '五', '六', '日'];
+
+// 定时策略时区的兜底值（与后端 store.go 的 Settings.Timezone 默认值一致）：
+// OpenWrt 系统时区通常是 UTC，后端统一换算到该时区后再判断生效时段，
+// 所以编辑器的「生效日 / 时段」不能按 UTC 理解。实际值优先取 /api/settings 的
+// timezone 字段（默认 Asia/Shanghai）；GUANLAN_TZ 环境变量覆盖未通过 API 暴露。
+const DEFAULT_SCHEDULE_TZ = 'Asia/Shanghai';
 const ACTIONS = [
   { key: 'block', label: '禁止（断网/拦截分类）', sem: 'crit' },
   { key: 'limit', label: '限速', sem: 'warn' },
@@ -31,6 +37,18 @@ export async function mount(host, ctx) {
   let selectedId = null;
   let editing = null;
   let destroyed = false;
+  let tzHintEl = null;   // 生效时段旁的「时区」提示，设置变化时就地更新
+
+  // 当前生效的定时策略时区：优先取服务端 settings.timezone（与后端 scheduleLocation 同源），
+  // 老版本后端/字段缺失时回退默认值。
+  function scheduleTzName() {
+    const s = getSettingsCache();
+    const tz = s && typeof s.timezone === 'string' ? s.timezone.trim() : '';
+    return tz || DEFAULT_SCHEDULE_TZ;
+  }
+  function refreshTzHint() {
+    if (tzHintEl) tzHintEl.textContent = `时区：${scheduleTzName()}`;
+  }
 
   /* 紧凑空态（减少占屏，替代大图标空态） */
   function hintLine(text, icon = ICONS.list) {
@@ -184,6 +202,7 @@ export async function mount(host, ctx) {
   /* ---------- 渲染：策略编辑器 ---------- */
   function renderEditor() {
     editorHost.innerHTML = '';
+    tzHintEl = null;
     const modeEl = document.getElementById('pol-mode');
     const p = editing || policies.find((x) => x.id === selectedId);
     if (!p) {
@@ -353,6 +372,14 @@ export async function mount(host, ctx) {
       })
     });
 
+    const tzHint = h('span', {
+      class: 'fs-11 dim',
+      text: `时区：${scheduleTzName()}`,
+      title: '定时策略按该时区解释「生效日 / 时段」，与路由器系统时区（常见为 UTC）无关；'
+        + '服务端若用 GUANLAN_TZ 环境变量覆盖，以服务端配置为准'
+    });
+    tzHintEl = tzHint;
+
     editorHost.appendChild(h('div', { class: 'grid', style: { gap: '14px' } }, [
       h('div', { class: 'g6' }, [
         h('div', { class: 'field' }, [
@@ -361,7 +388,10 @@ export async function mount(host, ctx) {
       ]),
       h('div', { class: 'g6' }, [
         h('div', { class: 'field' }, [
-          h('label', { class: 'field-label' }, [h('span', { text: '生效时段' })]),
+          h('label', { class: 'field-label' }, [
+            h('span', { text: '生效时段' }),
+            tzHint
+          ]),
           h('div', { class: 'row-gap-2', style: { flexWrap: 'wrap' } }, [dayPicker, allDayBtn, startInput, h('span', { class: 'dim', text: '至' }), endInput])
         ])
       ]),
@@ -599,6 +629,7 @@ export async function mount(host, ctx) {
   const unsubSettings = subscribeSettings(() => {
     if (destroyed) return;
     applyDisabledState();
+    refreshTzHint();   // 时区等设置变化时就地更新提示（不必重建编辑器）
     reloadDevices();
     reloadPolicies();
   });

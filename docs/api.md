@@ -264,14 +264,14 @@ q 非空时**只返回匹配项**（不返回分页列表）：
 - q 为空走上面的分页行为（`limit`/`counts`/`updatedAt`/`errors`）。
 
 #### POST `/api/threats/update`（需登录）
-同步拉取完整开源源并更新（每源 30s 超时，源之间并发），返回：
-```json
-{"ok":true,"updatedAt":1761900000,"domains":50000,"ips":30000,
- "errors":["ThreatFox: 未配置 THREATFOX_AUTH_KEY（该 API 需要 Auth-Key）"]}
-```
-- 任一源成功即更新该源；全部失败返回 `ok:false` 且**保留旧库**；demo 模式为 mock（返回 ok，不改数据）。
+**异步**拉取完整开源源并更新（每源 30s 超时，源之间并发）：
+
+- 受理：`202 {"accepted":true,"updating":true,"startedAt":…,"updatedAt":…,"domains":…,"ips":…}`，立即返回，不阻塞请求
+- 已在更新：`409 {"ok":false,"code":"threats_updating","updating":true,…}`（单飞去重，避免并发重入重复拉取打满带宽）
+- 进度跟踪：`GET /api/threats` 返回 `updating` / `updateStartedAt` 与最新 `updatedAt` / `domains` / `ips` / `errors`
+- 任一源成功即更新该源；全部失败**保留旧库**；demo 模式为 mock（返回受理，不改数据）。
 - **自动更新**：后台按设置 `alert.threatUpdateHours`（默认 6，可设 1~168 小时；设置页可选 1/6/12/24）定时拉取，独立 goroutine，不阻塞采集/SSE。
-- 增量合并：现有库 + 本次抓取条目去重后按 `confidence` 降序截断到上限，避免异常源撑爆内存/磁盘。
+- 增量合并：现有库 + 本次抓取条目去重后**按源配额**截断到上限（各源均分，内置 curated 规则固定保留），避免单一源独占上限导致其它源永久进不来。
 
 - 匹配规则：域名按**最长后缀**匹配；IP 先精确匹配、再按 CIDR 前缀匹配；内网/回环/链路本地地址永不参与 IP 匹配。
 - 命中告警：域名 → `type=blacklist_domain`，title `命中高危域名：<域名>`；IP → `type=bad_ip`，title `连接高危 IP：<IP>`；`evidence={domain/ip,kind,source}`；c2/botnet/mining/malware 为 `critical`，phishing/scam 为 `warn`，均计入风险分。
@@ -314,7 +314,7 @@ q 非空时**只返回匹配项**（不返回分页列表）：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/settings` | `{"enabled":false,"collect":false,"dnsTap":false,"deviceControl":false,"domainBlock":false,"schedule":false,"alerts":false,"history":false,"collectIntervalSec":2,"retentionDays":14,"alert":{"enable":true,"scanPorts":20,"trafficMbPerHour":500,"threatUpdateHours":6},"version":"1.0.0","dataDir":"/mnt/mmcblk2p4/guanlan"}` |
+| GET | `/api/settings` | `{"enabled":false,"collect":false,"dnsTap":false,"deviceControl":false,"domainBlock":false,"schedule":false,"alerts":false,"history":false,"collectIntervalSec":2,"retentionDays":14,"timezone":"Asia/Shanghai","alert":{"enable":true,"scanPorts":20,"trafficMbPerHour":500,"threatUpdateHours":6},"version":"1.0.0","dataDir":"/mnt/mmcblk2p4/guanlan"}` |
 | PUT | `/api/settings` | 接受上述开关字段的子集；`enabled` 置 false 会级联关闭全部子开关并撤销已下发规则。响应 `{"ok":true,"settings":{...},"applied":["撤销 UBM_FWD 规则 3 条",...],"revoked":["..."]}` |
 | POST | `/api/settings/toggle` | 便捷开关：`{"key":"enabled","value":false}`，语义同上 |
 | GET | `/api/system` | `{"model":"Phicomm N1","arch":"aarch64","kernel":"6.1.114","openwrt":"SNAPSHOT R2024.11.05","uptimeSec":3600,"memTotalMb":1844,"memFreeMb":760,"diskFreeMb":4200,"hostname":"Ytwos-N1","rssMb":28,"cpuPct":1.2}` |

@@ -81,8 +81,11 @@ type Settings struct {
 	CollectIntervalSec int           `json:"collectIntervalSec"`
 	RetentionDays      int           `json:"retentionDays"`
 	Alert              AlertSettings `json:"alert"`
-	Version            string        `json:"version"`
-	DataDir            string        `json:"dataDir"`
+	// Timezone 定时策略时段的解释时区（IANA 名，默认 Asia/Shanghai）。
+	// OpenWrt 默认系统时区是 UTC，策略时段必须显式换算，不能依赖系统时区。
+	Timezone string `json:"timezone"`
+	Version  string `json:"version"`
+	DataDir  string `json:"dataDir"`
 }
 
 // normalizeSwitches 应用开关依赖关系：
@@ -175,6 +178,15 @@ type trafficLine struct {
 	CatDown map[string]int64    `json:"catDown,omitempty"`
 }
 
+// 元数据总量上限：state.json 里这几节都由外部输入（邻接表/接口参数）驱动，
+// 没有上限时异常来源（伪造 IP、批量扫描、脚本灌入）会让文件无限增长，
+// N1 只有 1GB 内存且 state.json 每 30s 全量重写，必须限死。
+const (
+	maxDeviceMeta = 1024 // 设备元数据（别名/分组/断网/限速/首次发现）
+	maxDstBlocks  = 2048 // 目标 IP 封禁记录
+	maxWhitelist  = 512  // 告警白名单
+)
+
 // Store 线程安全的状态存储。
 type Store struct {
 	mu        sync.Mutex
@@ -193,9 +205,24 @@ type Store struct {
 	dirty        bool
 	dirtyGen     int64 // 每次 markDirty 递增；Save 用它判断快照之后是否又有新变更
 
+	// 设备元数据只读快照：deviceVer 每次变更递增，未变更时 AllDeviceMeta 直接复用快照，
+	// 避免 2 秒 tick 全量复制（见 AllDeviceMeta）。
+	deviceVer   int64
+	metaSnap    map[string]DeviceMeta
+	metaSnapVer int64
+
+	// dataVer 数据版本号：流量桶落盘/清理、设置变更时递增，供 /api/traffic 结果缓存失效。
+	dataVer int64
+
+	// capLogAt 上限淘汰日志的节流时间：批量灌入时会连续淘汰，同类日志每分钟最多一条。
+	capLogAt time.Time
+
 	trafficMu      sync.Mutex
 	trafficCacheMu sync.Mutex // 与 trafficMu 分离：读缓存不阻塞分钟桶落盘
 	trafficCache   map[trafficCacheKey]trafficCacheEnt
+
+	trafficResultMu sync.Mutex // /api/traffic 渲染结果缓存（key = range + dataVer）
+	trafficResult   map[string]trafficResultEnt
 }
 
 // NewStore 创建存储。
@@ -222,6 +249,7 @@ func (s *Store) Load() error {
 		CollectIntervalSec: 2,
 		RetentionDays:      14,
 		Alert:              AlertSettings{Enable: true, ScanPorts: 20, TrafficMbPerHour: 500, ThreatUpdateHours: 6},
+		Timezone:           "Asia/Shanghai",
 		Version:            Version,
 		DataDir:            s.dir,
 	}
@@ -260,6 +288,11 @@ func (s *Store) Load() error {
 	if h := s.settings.Alert.ThreatUpdateHours; h <= 0 || h > 168 {
 		s.settings.Alert.ThreatUpdateHours = 6
 	}
+	// 定时策略时区缺省兜底：老版本 state.json 无该字段时保持 Asia/Shanghai，
+	// 避免策略时段按路由器系统时区（OpenWrt 默认 UTC）解释造成 8 小时偏差。
+	if strings.TrimSpace(s.settings.Timezone) == "" {
+		s.settings.Timezone = "Asia/Shanghai"
+	}
 	// alert.enable 缺省兜底：老版本/手改 state.json 缺该字段时若按零值走，
 	// 所有安全告警会被静默关闭；字段存在且为 false（用户主动关闭）则保持不变。
 	var probe struct {
@@ -289,6 +322,8 @@ func (s *Store) Load() error {
 		}
 		s.devices = devs
 	}
+	// 老版本/被灌入的 state.json 可能超上限：加载时收敛到上限内，避免每次启动重写超大文件
+	s.trimDevicesLocked(maxDeviceMeta)
 	for _, p := range st.Policies {
 		if p != nil {
 			s.policies = append(s.policies, p)
@@ -315,12 +350,14 @@ func (s *Store) Load() error {
 			s.dstBlocks[ip] = at
 		}
 	}
+	s.trimDstBlocksLocked(maxDstBlocks)
 	for _, w := range st.Whitelist {
 		if w != nil && w.Type != "" && w.Target != "" {
 			cp := *w
 			s.whitelist = append(s.whitelist, &cp)
 		}
 	}
+	s.trimWhitelistLocked(maxWhitelist)
 	s.seq = st.Seq
 	return nil
 }
@@ -558,9 +595,18 @@ func (s *Store) Save() error {
 	gen := s.dirtyGen
 	s.mu.Unlock()
 
-	data, err := json.MarshalIndent(&st, "", " ")
+	// 紧凑 JSON（无缩进）：state.json 每 30s 全量重写，缩进（每行一个空格）纯属浪费 ——
+	// 文件体积与编码 CPU 都白付，读的只有本进程（排查时可用 jq 格式化）。
+	data, err := json.Marshal(&st)
 	if err != nil {
-		return err
+		// 事件里可能混入不可序列化的 evidence（NaN/Inf、channel 等），
+		// 不能让事件把设置/策略/封禁一起写坏：丢弃事件重试一次，保证其它节正常落盘。
+		logf("state.json 序列化失败（%v），丢弃 %d 条事件后重试", err, len(st.Events))
+		st.Events = nil
+		data, err = json.Marshal(&st)
+		if err != nil {
+			return err
+		}
 	}
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return err
@@ -652,6 +698,9 @@ func (s *Store) UpdateSettings(fn func(*Settings)) Settings {
 	fn(&s.settings)
 	s.settings.Version = Version
 	s.settings.DataDir = s.dir
+	// 开关切换（含关闭采集时的数据清空）必须让 /api/traffic 结果缓存失效，
+	// 否则会返回上一套开关语义下的缓存结果。
+	s.dataVer++
 	s.markDirtyLocked()
 	return s.settings
 }
@@ -672,10 +721,13 @@ func (s *Store) UpdateDeviceMeta(ip string, fn func(*DeviceMeta)) DeviceMeta {
 	defer s.mu.Unlock()
 	m, ok := s.devices[ip]
 	if !ok {
+		// 新增前收敛到上限内：宁可淘汰最旧/最无信息量的一条，也不让 state.json 无限增长
+		s.trimDevicesLocked(maxDeviceMeta - 1)
 		m = &DeviceMeta{FirstSeen: time.Now().Unix()}
 		s.devices[ip] = m
 	}
 	fn(m)
+	s.deviceVer++
 	s.markDirtyLocked()
 	return *m
 }
@@ -684,18 +736,82 @@ func (s *Store) UpdateDeviceMeta(ip string, fn func(*DeviceMeta)) DeviceMeta {
 func (s *Store) DeleteDeviceMeta(ip string) {
 	s.mu.Lock()
 	delete(s.devices, ip)
+	s.deviceVer++
 	s.markDirtyLocked()
 	s.mu.Unlock()
 }
 
-// AllDeviceMeta 返回全部设备元信息拷贝。
+// deviceMetaConfigured 该设备是否带用户配置（别名/分组/断网/限速/隐藏）。
+// 淘汰时优先牺牲没有用户配置的条目，避免把用户手工设置清掉。
+func deviceMetaConfigured(m *DeviceMeta) bool {
+	return m.Alias != "" || m.Group != "" || m.Blocked || m.Hidden ||
+		m.LimitKbps.Down > 0 || m.LimitKbps.Up > 0
+}
+
+// trimDevicesLocked 把设备元数据收敛到 limit 条以内：
+// 先淘汰「无用户配置」中最旧（FirstSeen 最小）的，不够再淘汰有配置中最旧的。
+// 调用方需持有 s.mu。
+func (s *Store) trimDevicesLocked(limit int) {
+	if limit < 0 {
+		limit = 0
+	}
+	if len(s.devices) <= limit {
+		return
+	}
+	type cand struct {
+		ip   string
+		seen int64
+		keep bool
+	}
+	list := make([]cand, 0, len(s.devices))
+	for ip, m := range s.devices {
+		list = append(list, cand{ip: ip, seen: m.FirstSeen, keep: deviceMetaConfigured(m)})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].keep != list[j].keep {
+			return !list[i].keep // 无用户配置的先淘汰
+		}
+		if list[i].seen != list[j].seen {
+			return list[i].seen < list[j].seen // 再按最早发现
+		}
+		return list[i].ip < list[j].ip
+	})
+	drop := len(list) - limit
+	for i := 0; i < drop; i++ {
+		delete(s.devices, list[i].ip)
+	}
+	s.logCapLocked("设备元数据超上限（%d），已淘汰最旧/无配置的 %d 条", limit, drop)
+}
+
+// logCapLocked 上限淘汰日志（三类上限共用一条节流：每分钟最多一条，批量灌入时不刷屏）。
+// 调用方需持有 s.mu。
+func (s *Store) logCapLocked(format string, args ...interface{}) {
+	now := time.Now()
+	if !s.capLogAt.IsZero() && now.Sub(s.capLogAt) < time.Minute {
+		return
+	}
+	s.capLogAt = now
+	logf(format, args...)
+}
+
+// AllDeviceMeta 返回全部设备元信息。
+//
+// 返回的是只读快照：设备元数据未变更时（deviceVer 未变）复用同一份 map，避免
+// SSE 每 2 秒一次的全量复制 —— 1024 台设备 × 每 tick 复制是持续的 GC 压力，
+// 而元数据本身几分钟才变一次。调用方**不得修改**返回的 map（读到的 DeviceMeta
+// 是值拷贝，改它不会影响 store）。变更后下次调用会重建一份新快照，旧快照不受影响。
 func (s *Store) AllDeviceMeta() map[string]DeviceMeta {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.metaSnap != nil && s.metaSnapVer == s.deviceVer {
+		return s.metaSnap
+	}
 	out := make(map[string]DeviceMeta, len(s.devices))
 	for k, v := range s.devices {
 		out[k] = *v
 	}
+	s.metaSnap = out
+	s.metaSnapVer = s.deviceVer
 	return out
 }
 
@@ -955,6 +1071,9 @@ func (s *Store) DstBlocks() map[string]int64 {
 }
 
 // PutDstBlock 新增/更新目标 IP 封禁记录。
+//
+// 总量受限（maxDstBlocks）：超上限按「封禁时间最早」淘汰，保证封禁列表不会无界增长
+// （目标 IP 来自连接明细，是外部输入驱动的高频写入）。
 func (s *Store) PutDstBlock(ip string, at int64) {
 	ip = strings.TrimSpace(ip)
 	if ip == "" {
@@ -964,9 +1083,42 @@ func (s *Store) PutDstBlock(ip string, at int64) {
 	if at <= 0 {
 		at = time.Now().Unix()
 	}
+	if _, exists := s.dstBlocks[ip]; !exists {
+		s.trimDstBlocksLocked(maxDstBlocks - 1) // 给即将插入的新记录留位
+	}
 	s.dstBlocks[ip] = at
 	s.markDirtyLocked()
 	s.mu.Unlock()
+}
+
+// trimDstBlocksLocked 目标封禁记录收敛到 target 条以内（淘汰封禁时间最早的）。
+// 调用方需持有 s.mu。
+func (s *Store) trimDstBlocksLocked(target int) {
+	if target < 0 {
+		target = 0
+	}
+	if len(s.dstBlocks) <= target {
+		return
+	}
+	type ent struct {
+		ip string
+		at int64
+	}
+	list := make([]ent, 0, len(s.dstBlocks))
+	for ip, at := range s.dstBlocks {
+		list = append(list, ent{ip: ip, at: at})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].at != list[j].at {
+			return list[i].at < list[j].at
+		}
+		return list[i].ip < list[j].ip
+	})
+	drop := len(list) - target
+	for i := 0; i < drop; i++ {
+		delete(s.dstBlocks, list[i].ip)
+	}
+	s.logCapLocked("目标封禁列表超上限（%d），已淘汰最早的 %d 条", maxDstBlocks, drop)
 }
 
 // DeleteDstBlock 删除目标 IP 封禁记录。
@@ -1007,6 +1159,8 @@ func (s *Store) Whitelist() []WhitelistEntry {
 }
 
 // PutWhitelist 加白（同 type+target 幂等，重复调用返回已有项）。
+//
+// 总量受限（maxWhitelist）：超上限按「加白时间最早」淘汰，避免脚本灌入把 state.json 撑大。
 func (s *Store) PutWhitelist(typ, target, note string, at int64) WhitelistEntry {
 	typ = strings.TrimSpace(typ)
 	target = strings.TrimSpace(target)
@@ -1020,10 +1174,31 @@ func (s *Store) PutWhitelist(typ, target, note string, at int64) WhitelistEntry 
 			return *w
 		}
 	}
+	s.trimWhitelistLocked(maxWhitelist - 1) // 给即将插入的新项留位
 	w := &WhitelistEntry{ID: wlID(typ, target), Type: typ, Target: target, Note: strings.TrimSpace(note), At: at}
 	s.whitelist = append(s.whitelist, w)
 	s.markDirtyLocked()
 	return *w
+}
+
+// trimWhitelistLocked 白名单收敛到 target 条以内（淘汰加白时间最早的）。
+// 调用方需持有 s.mu。
+func (s *Store) trimWhitelistLocked(target int) {
+	if target < 0 {
+		target = 0
+	}
+	if len(s.whitelist) <= target {
+		return
+	}
+	sort.Slice(s.whitelist, func(i, j int) bool {
+		if s.whitelist[i].At != s.whitelist[j].At {
+			return s.whitelist[i].At < s.whitelist[j].At
+		}
+		return s.whitelist[i].ID < s.whitelist[j].ID
+	})
+	drop := len(s.whitelist) - target
+	s.whitelist = s.whitelist[drop:]
+	s.logCapLocked("告警白名单超上限（%d），已淘汰最早的 %d 项", maxWhitelist, drop)
 }
 
 // DeleteWhitelist 按 ID 取消加白。
@@ -1089,6 +1264,12 @@ func (s *Store) AppendTrafficBucket(b *Bucket) error {
 	}
 	defer f.Close()
 	_, err = f.Write(data)
+	if err == nil {
+		// 历史数据变了：/api/traffic 结果缓存必须失效（下一次请求重建）
+		s.mu.Lock()
+		s.dataVer++
+		s.mu.Unlock()
+	}
 	return err
 }
 
@@ -1262,6 +1443,64 @@ func (s *Store) readTrafficBuckets(from, to int64) []*Bucket {
 	return out
 }
 
+// ---------------- /api/traffic 结果缓存 ----------------
+
+const (
+	// trafficResultTTL /api/traffic 渲染结果缓存时长：前端 30s 轮询，同一范围内的相邻请求
+	// 直接复用上次结果，省掉「重放 JSONL + 全量聚合 + 分类/设备汇总」（7d 在 N1 上是可感知尖峰）。
+	trafficResultTTL = 30 * time.Second
+	// trafficResultMax 缓存条数上限（1h/6h/24h/7d 四条 + 版本切换余量），超出按最旧淘汰。
+	trafficResultMax = 8
+)
+
+// trafficResultEnt 一次 /api/traffic 渲染结果，ver 为生成时的数据版本。
+type trafficResultEnt struct {
+	at  time.Time
+	ver int64
+	v   interface{}
+}
+
+// DataVersion 当前数据版本号：流量桶落盘、历史清理、设置（开关）变更时递增。
+// /api/traffic 用它判断缓存是否还能复用（key = range + 版本）。
+func (s *Store) DataVersion() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dataVer
+}
+
+// CachedTrafficResult 取某 range 的结果缓存（命中要求：版本一致且未超 TTL）。
+func (s *Store) CachedTrafficResult(rangeKey string, ver int64) (interface{}, bool) {
+	s.trafficResultMu.Lock()
+	defer s.trafficResultMu.Unlock()
+	e, ok := s.trafficResult[rangeKey]
+	if !ok || e.ver != ver || time.Since(e.at) >= trafficResultTTL {
+		return nil, false
+	}
+	return e.v, true
+}
+
+// PutTrafficResult 记录一次渲染结果（超出上限按最旧淘汰）。
+func (s *Store) PutTrafficResult(rangeKey string, ver int64, v interface{}) {
+	now := time.Now()
+	s.trafficResultMu.Lock()
+	defer s.trafficResultMu.Unlock()
+	if s.trafficResult == nil {
+		s.trafficResult = map[string]trafficResultEnt{}
+	}
+	for len(s.trafficResult) >= trafficResultMax {
+		var oldKey string
+		var oldAt time.Time
+		first := true
+		for k, e := range s.trafficResult {
+			if first || e.at.Before(oldAt) {
+				oldKey, oldAt, first = k, e.at, false
+			}
+		}
+		delete(s.trafficResult, oldKey)
+	}
+	s.trafficResult[rangeKey] = trafficResultEnt{at: now, ver: ver, v: v}
+}
+
 // PurgeOldTraffic 删除超过留存天数的流量文件。
 func (s *Store) PurgeOldTraffic(retentionDays int) {
 	if retentionDays <= 0 {
@@ -1273,6 +1512,7 @@ func (s *Store) PurgeOldTraffic(retentionDays int) {
 	}
 	cutoff := time.Now().AddDate(0, 0, -(retentionDays - 1))
 	cutoffDay := time.Date(cutoff.Year(), cutoff.Month(), cutoff.Day(), 0, 0, 0, 0, time.Local)
+	removed := false
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasPrefix(name, "traffic-") || !strings.HasSuffix(name, ".jsonl") {
@@ -1283,7 +1523,15 @@ func (s *Store) PurgeOldTraffic(retentionDays int) {
 			continue
 		}
 		if day.Before(cutoffDay) {
-			os.Remove(filepath.Join(s.dir, name))
+			if os.Remove(filepath.Join(s.dir, name)) == nil {
+				removed = true
+			}
 		}
+	}
+	if removed {
+		// 历史文件被清理：结果缓存必须失效，否则过期区间仍返回已删除的数据
+		s.mu.Lock()
+		s.dataVer++
+		s.mu.Unlock()
 	}
 }

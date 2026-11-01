@@ -40,11 +40,12 @@ const (
 
 // EnforceStatus /api/enforce/status 契约。
 type EnforceStatus struct {
-	IPTablesRules     int  `json:"iptablesRules"`
-	TcDevices         int  `json:"tcDevices"`
-	DNSBlockedDomains int  `json:"dnsBlockedDomains"`
-	ActivePolicies    int  `json:"activePolicies"`
-	DNSTap            bool `json:"dnsTap"`
+	IPTablesRules     int    `json:"iptablesRules"`
+	TcDevices         int    `json:"tcDevices"`
+	DNSBlockedDomains int    `json:"dnsBlockedDomains"`
+	ActivePolicies    int    `json:"activePolicies"`
+	DNSTap            bool   `json:"dnsTap"`
+	TcConflict        string `json:"tcConflict,omitempty"` // 非空：br-lan/ifb0 队列归属用户 QoS，已跳过限速下发
 }
 
 // BlockEntry 封禁/限速记录（/api/enforce/blocks 展示用）。
@@ -81,6 +82,7 @@ type Enforcer struct {
 	tcIfbRootOwned bool
 	ifbOwned       bool
 	tcLimited      map[string]bool // 本程序已下发 class/filter 的设备
+	tcConflict     string          // 非空：根队列属于用户 QoS，已跳过限速下发（状态展示用）
 	chainsReady    bool
 }
 
@@ -220,12 +222,21 @@ func (e *Enforcer) rebuildDeviceRules() ([]string, error) {
 			"ipset create ubm_block hash:ip -exist",
 			"iptables -C UBM_FWD -m set --match-set ubm_block dst -m comment --comment guanlan -j DROP 2>/dev/null || iptables -A UBM_FWD -m set --match-set ubm_block dst -m comment --comment guanlan -j DROP")
 	}
-	for _, c := range cmds {
-		if _, err := e.app.shell(c); err != nil {
-			return applied, fmt.Errorf("下发 iptables 规则失败（%s）: %w", c, err)
-		}
+	// 合并为单条 sh -c 脚本一次 fork 下发（原先每条规则 fork 一次，规则多时开销线性增长）。
+	// 失败可回滚：调用方（applyDeviceState）持有 iptables-save 快照，脚本任一步失败
+	// 返回错误后立即 iptables-restore 回滚；成功后再用 iptables -S 逐项校验期望规则。
+	script := "set -e\n" + strings.Join(cmds, "\n")
+	if _, err := e.app.shell(script); err != nil {
+		// 脚本失败可能伴随链被外部冲刷：清掉缓存，下一轮 ensureChains 重新创建。
+		e.chainsReady = false
+		return cmds, fmt.Errorf("下发 iptables 规则失败（批量脚本）: %w", err)
 	}
 	applied = append(applied, cmds...)
+	// 逐项校验：脚本返回成功但规则被并发重载/内核拒绝时，仍要报失败交给上层回滚。
+	if out, ok := e.iptablesDump(); ok && !e.rulesPresent(out) {
+		e.chainsReady = false
+		return applied, fmt.Errorf("下发 iptables 规则后校验失败：自有链或期望规则缺失")
+	}
 	return applied, nil
 }
 
@@ -280,6 +291,40 @@ func (e *Enforcer) tcIngressExists(dev string) bool {
 	return strings.Contains(out, " ingress ")
 }
 
+// tcConflictReason 探测既有根队列归属，返回非空表示与用户 QoS 冲突。
+//
+// 判定口径：内核自动创建的默认根队列句柄为 0:（pfifo_fast / fq_codel / noqueue），
+// 可以被本程序替换，不算冲突；除此之外的非自有句柄（例如 luci-app-sqm 的 1:）
+// 视为用户自建，一律不覆盖、不删除，整轮跳过 tc 下发。
+func (e *Enforcer) tcConflictReason() string {
+	if e.dryRunMode() {
+		return ""
+	}
+	if h, conflict := tcRootConflict(e.tcRootHandles("br-lan"), tcHandleRoot); conflict {
+		return fmt.Sprintf("br-lan 根队列（%s）非本程序创建，与用户 QoS 冲突，已跳过限速下发", h)
+	}
+	for _, l := range e.limits {
+		if l.Up <= 0 {
+			continue
+		}
+		if h, conflict := tcRootConflict(e.tcRootHandles("ifb0"), tcHandleIfb); conflict {
+			return fmt.Sprintf("ifb0 根队列（%s）非本程序创建，与用户 QoS 冲突，已跳过限速下发", h)
+		}
+		break
+	}
+	return ""
+}
+
+// tcRootConflict 判断根队列句柄集合是否被非自有队列占用。
+// 默认句柄 0: 是内核创建的初始队列，可替换，不计入冲突。
+func tcRootConflict(handles map[string]bool, own string) (string, bool) {
+	delete(handles, "0:")
+	if len(handles) == 0 || handles[own] {
+		return "", false
+	}
+	return strings.Join(sortedKeysBool(handles), ","), true
+}
+
 // rebuildTC 按当前 limits 重建限速配置。
 // 根队列句柄固定为 tcHandleRoot/tcHandleIfb（与用户自有 QoS 常用句柄区分），
 // 删除时按句柄比对，确保不误删 luci-app-sqm 等用户配置。
@@ -287,9 +332,20 @@ func (e *Enforcer) tcIngressExists(dev string) bool {
 func (e *Enforcer) rebuildTC() ([]string, error) {
 	var applied []string
 	if len(e.limits) == 0 {
+		e.tcConflict = ""
 		e.teardownTC(false)
 		return applied, nil
 	}
+	// 下发前先探测既有根队列归属：br-lan/ifb0 已被用户 QoS（如 luci-app-sqm）接管时
+	// 不覆盖、不删除，整轮跳过并记录状态，避免 tc 下发整体失败或破坏用户队列。
+	if msg := e.tcConflictReason(); msg != "" {
+		if e.tcConflict != msg {
+			e.tcConflict = msg
+			logf("%s", msg)
+		}
+		return applied, nil
+	}
+	e.tcConflict = ""
 	cmds := []string{}
 	// 下行：br-lan 出口 htb
 	if !e.tcRootOwned {
@@ -399,6 +455,7 @@ func (e *Enforcer) teardownTC(force bool) {
 	// force=true 用于"一键清空/撤销"场景；删除动作一律按句柄比对，
 	// 不再像旧实现那样无条件删除 br-lan 根队列与 ifb0。
 	_ = force
+	e.tcConflict = ""
 	// 本程序下发过的设备 class
 	for ip := range e.tcLimited {
 		e.app.shellQuiet(fmt.Sprintf("tc class del dev br-lan classid %s%d 2>/dev/null", tcHandleRoot, classMinor(ip)))
@@ -474,6 +531,15 @@ func (e *Enforcer) applyDeviceState(blocked, dst map[string]bool, limits map[str
 		if out, ok := e.iptablesDump(); ok && !e.rulesPresent(out) {
 			logf("检测到自有链或规则缺失（防火墙可能被重载），重新下发管控规则")
 			e.chainsReady = false
+			same = false
+		}
+	}
+	if same && e.tcConflict != "" {
+		// 上次因用户 QoS 冲突跳过：期望状态没变也要重新探测，
+		// 用户撤销自有队列后自动恢复限速下发；仍冲突则保持早退，不做无谓下发。
+		if e.tcConflictReason() == "" {
+			logf("用户 QoS 冲突已解除，重新下发 tc 限速")
+			e.tcConflict = ""
 			same = false
 		}
 	}
@@ -891,43 +957,48 @@ func (e *Enforcer) applyDomainState(desired map[string]bool) ([]string, error) {
 			oldIPs[ip] = true
 		}
 	}
-	// 下发 ipset（失败不提交内存状态，失败项放回 pending 供下一轮重试）
+	// 下发 ipset（失败不提交内存状态，失败项放回 pending 供下一轮重试）。
+	// 同一批次的 add/del 合并成一次 `ipset restore`，避免逐条 fork。
 	if len(wantIPs) > 0 {
 		if _, err := e.app.shell("ipset create " + ipsetName + " hash:ip -exist"); err != nil {
 			e.markDomainsPending(desired, now)
 			return applied, fmt.Errorf("创建 ipset 失败: %w", err)
 		}
 	}
+	addIPs := make([]uint32, 0, len(wantIPs))
 	for ip := range wantIPs {
-		if oldIPs[ip] {
-			continue
+		if !oldIPs[ip] {
+			addIPs = append(addIPs, ip)
 		}
-		cmd := fmt.Sprintf("ipset add %s %s -exist", ipsetName, ip4String(ip))
-		if _, err := e.app.shell(cmd); err != nil {
+	}
+	delIPs := make([]uint32, 0, len(oldIPs))
+	for ip := range oldIPs {
+		if !wantIPs[ip] {
+			delIPs = append(delIPs, ip)
+		}
+	}
+	sort.Slice(addIPs, func(i, j int) bool { return addIPs[i] < addIPs[j] })
+	sort.Slice(delIPs, func(i, j int) bool { return delIPs[i] < delIPs[j] })
+	lines := make([]string, 0, len(addIPs)+len(delIPs))
+	for _, ip := range addIPs {
+		lines = append(lines, fmt.Sprintf("add %s %s", ipsetName, ip4String(ip)))
+	}
+	for _, ip := range delIPs {
+		lines = append(lines, fmt.Sprintf("del %s %s", ipsetName, ip4String(ip)))
+	}
+	if len(lines) > 0 {
+		// `-exist` 是 ipset 全局选项：忽略「重复添加/删除不存在条目」，
+		// 其它错误（集合不存在、权限等）仍会让 restore 返回非零。
+		script := "ipset -exist restore <<'EOF'\n" + strings.Join(lines, "\n") + "\nEOF"
+		if _, err := e.app.shell(script); err != nil {
 			e.markDomainsPending(desired, now)
 			return applied, fmt.Errorf("写入 ipset 失败: %w", err)
 		}
-		applied = append(applied, cmd)
+		applied = append(applied, lines...)
 	}
-	for ip := range oldIPs {
-		if wantIPs[ip] {
-			continue
-		}
-		cmd := fmt.Sprintf("ipset del %s %s -exist", ipsetName, ip4String(ip))
-		if _, err := e.app.shell(cmd); err != nil {
-			e.markDomainsPending(desired, now)
-			return applied, fmt.Errorf("移除 ipset 记录失败: %w", err)
-		}
-		applied = append(applied, cmd)
-	}
-	// 确保 iptables 规则存在
-	rules, err := e.rebuildDeviceRules()
-	if err != nil {
-		e.markDomainsPending(desired, now)
-		return applied, err
-	}
-	applied = append(applied, rules...)
-	// 下发成功：提交内存状态（只提交真正封堵成功的域名）
+	// 下发成功后才提交内存状态（只提交真正封堵成功的域名）。
+	// 先提交再重建 iptables：rebuildDeviceRules 依据 dnsDomains 决定是否挂 match-set
+	// 规则，若顺序反过来，首次封堵时 ipset 已写入但规则要等下一轮才补上。
 	e.domainIPs = resolved
 	e.dnsDomains = make(map[string]bool, len(resolved))
 	for d := range desired {
@@ -936,6 +1007,19 @@ func (e *Enforcer) applyDomainState(desired map[string]bool) ([]string, error) {
 			delete(e.pending, d)
 		}
 	}
+	// 已不在期望集合里的域名不再重试
+	for d := range e.pending {
+		if !desired[d] {
+			delete(e.pending, d)
+		}
+	}
+	rules, err := e.rebuildDeviceRules()
+	if err != nil {
+		// ipset 已下发成功（解析没失败）：不把域名放回 pending，避免无意义重试；
+		// 规则缺失由下一轮 applyDeviceState 的规则核对自动补发，这里如实返回错误。
+		return applied, err
+	}
+	applied = append(applied, rules...)
 	return applied, nil
 }
 
@@ -1055,8 +1139,10 @@ func (e *Enforcer) ReconcilePolicies(now time.Time) {
 		e.revokePolicyDomains()
 		return
 	}
-	// 定时策略时区换算：OpenWrt 默认 UTC，直接用本地字段评估会早 8 小时（见 scheduleTimezone）。
-	now = now.In(scheduleTimezone)
+	// 定时策略时区换算：OpenWrt 默认 UTC，直接用本地字段评估会早 8 小时。
+	// 时区取 settings.timezone（默认 Asia/Shanghai，可在 state.json 配置），
+	// 设备无 tzdata 时回退固定 +08:00（见 scheduleLocation）。
+	now = now.In(e.app.scheduleLocation())
 	domainOn := e.app.domainBlockOn()
 	pols := e.app.store.Policies()
 	metas := e.app.store.AllDeviceMeta()
@@ -1067,8 +1153,7 @@ func (e *Enforcer) ReconcilePolicies(now time.Time) {
 	desiredLimits := map[string]LimitKbps{}
 	desiredDst := map[string]bool{}
 	desiredDomains := map[string]bool{}
-	active := map[string]bool{}
-	hitsToSend := map[string]string{} // policyID -> 首个目标设备
+	hitsToSend := map[string]string{} // policyID -> 首个实际生效的目标设备（仅 applied 集合）
 
 	// 手动封禁的目标 IP 来自 store 持久化记录（重启恢复）
 	for ip := range e.app.store.DstBlocks() {
@@ -1107,15 +1192,17 @@ func (e *Enforcer) ReconcilePolicies(now time.Time) {
 				continue
 			}
 			matched = append(matched, p)
-			active[p.ID] = true
 			if p.Action == "allow" {
 				allow = true
 			}
 		}
+		// allow 短路：本设备命中 allow 后不再应用任何 block/limit。
+		// 这些策略只是 matched，没有实际下发，因此都不进入 applied（不计命中、不发事件）。
 		if allow {
 			continue
 		}
 		for _, p := range matched {
+			appliedThis := false
 			switch p.Action {
 			case "block":
 				if len(p.Categories) == 0 && len(p.Domains) == 0 {
@@ -1123,30 +1210,43 @@ func (e *Enforcer) ReconcilePolicies(now time.Time) {
 						e.warnProtectedOnce(st.IP, "断网")
 					} else {
 						desiredBlocked[st.IP] = true
+						appliedThis = true
 					}
 				} else if domainOn {
 					for _, cat := range p.Categories {
 						for _, d := range DomainsForCategory(cat) {
 							desiredDomains[d] = true
+							appliedThis = true
 						}
 					}
 					for _, d := range p.Domains {
 						if nd := normalizeDomainRule(d); nd != "" {
 							desiredDomains[nd] = true
+							appliedThis = true
 						}
 					}
 				}
+				// domainBlock 开关关闭：域名类 block 未下发 → 不计 applied
 			case "limit":
 				if prot {
 					e.warnProtectedOnce(st.IP, "限速")
 				} else {
 					desiredLimits[st.IP] = p.LimitKbps
+					appliedThis = true
 				}
 			}
-			if _, ok := hitsToSend[p.ID]; !ok {
-				hitsToSend[p.ID] = st.IP
+			if appliedThis {
+				if _, ok := hitsToSend[p.ID]; !ok {
+					hitsToSend[p.ID] = st.IP
+				}
 			}
 		}
+	}
+
+	// applied 集合 = 真正下发了动作的策略（allow 短路/开关降级/受保护目标跳过都不算）
+	applied := make(map[string]bool, len(hitsToSend))
+	for id := range hitsToSend {
+		applied[id] = true
 	}
 
 	e.mu.Lock()
@@ -1158,8 +1258,8 @@ func (e *Enforcer) ReconcilePolicies(now time.Time) {
 			logf("域名封堵下发失败: %v", err)
 		}
 	}
-	// 新命中策略：命中计数 +1 并产生事件
-	for id := range active {
+	// 新命中策略：只有 applied（实际下发）的才 +1 并产生事件
+	for id := range applied {
 		if e.policyActive[id] {
 			continue
 		}
@@ -1180,7 +1280,7 @@ func (e *Enforcer) ReconcilePolicies(now time.Time) {
 			e.app.sec.OnPolicyHit(pol.ID, pol.Name, pol.Action, target, name, ts)
 		}
 	}
-	e.policyActive = active
+	e.policyActive = applied
 	e.mu.Unlock()
 
 	e.retryPendingDomains(ts)
@@ -1206,31 +1306,46 @@ func policyTargets(p Policy, ip, group string) bool {
 	return false
 }
 
-// scheduleTimezone 定时策略时段的解释时区：默认 Asia/Shanghai（东八区）。
+// 定时策略时区：默认 Asia/Shanghai（东八区）。
 //
 // 背景：OpenWrt 默认系统时区是 UTC，ReconcilePolicies 收到的 time.Now() 本地字段
 // 比北京时间早 8 小时，用户设置的「22:00-06:00」会实际在 14:00 生效。
 // 策略评估入口统一把 now 换算到该时区后再取 Hour/Weekday（见 ReconcilePolicies）。
-// 可用环境变量 GUANLAN_TZ 覆盖（IANA 时区名，如 Asia/Tokyo）；
-// 解析失败或设备未安装 tzdata 时回退固定 +08:00 —— 中国大陆 1991 年后无夏令时，
-// 固定偏移与 Asia/Shanghai 语义等价。
 //
-// 时区基准说明（供 UI 文案引用）：定时策略按「Asia/Shanghai（UTC+8）」时间计算，
-// 与路由器系统时区无关。
-var scheduleTimezone = func() *time.Location {
-	if tz := strings.TrimSpace(os.Getenv("GUANLAN_TZ")); tz != "" {
-		if loc, err := time.LoadLocation(tz); err == nil {
-			return loc
-		}
+// 解析优先级：环境变量 GUANLAN_TZ（运维/测试覆盖） > settings.timezone（默认
+// Asia/Shanghai） > 内置默认。设备未安装 tzdata 时 LoadLocation 失败，回退固定
+// +08:00 —— 中国大陆 1991 年后无夏令时，固定偏移与 Asia/Shanghai 语义等价。
+const defaultScheduleTimezone = "Asia/Shanghai"
+
+// scheduleTimezone 内置默认时区（settings/time 环境变量都不可用时的兜底）。
+var scheduleTimezone = loadScheduleLocation(defaultScheduleTimezone)
+
+// loadScheduleLocation 按 IANA 名加载时区，失败回退固定 +08:00。
+func loadScheduleLocation(name string) *time.Location {
+	if loc, err := time.LoadLocation(name); err == nil {
+		return loc
 	}
 	return time.FixedZone("Asia/Shanghai", 8*3600)
-}()
+}
+
+// scheduleLocation 当前生效的定时策略时区（每次评估读取，设置修改后下一轮即生效）。
+func (a *App) scheduleLocation() *time.Location {
+	if tz := strings.TrimSpace(os.Getenv("GUANLAN_TZ")); tz != "" {
+		return loadScheduleLocation(tz)
+	}
+	if a != nil && a.store != nil {
+		if tz := strings.TrimSpace(a.store.Settings().Timezone); tz != "" {
+			return loadScheduleLocation(tz)
+		}
+	}
+	return scheduleTimezone
+}
 
 // scheduleActive 判断当前时间是否在策略生效时段内。支持跨零点。
 //
 // 时区基准：now 的本地字段即策略时段的解释时区。生产路径由 ReconcilePolicies
-// 先把 time.Now() 换算到 scheduleTimezone（Asia/Shanghai，可用 GUANLAN_TZ 覆盖）
-// 再传入；单测可直接构造 time.Local 时间传入，函数本身不做换算。
+// 先把 time.Now() 换算到 scheduleLocation() 再传入；单测可直接构造 time.Local
+// 时间传入，函数本身不做换算。
 func scheduleActive(sc Schedule, now time.Time) bool {
 	if len(sc.Days) > 0 {
 		iso := int(now.Weekday())
@@ -1303,6 +1418,7 @@ func (e *Enforcer) Status() EnforceStatus {
 		TcDevices:         len(e.limits),
 		DNSBlockedDomains: len(e.dnsDomains),
 		ActivePolicies:    len(e.policyActive),
+		TcConflict:        e.tcConflict,
 	}
 	if len(e.dnsDomains) > 0 {
 		st.IPTablesRules++

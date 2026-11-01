@@ -479,28 +479,79 @@ export async function mount(host, ctx) {
       rows.length ? h('div', { class: 'col gap-1' }, rows) : h('div', { class: 'dim fs-12', text: '该事件无结构化证据字段。' }),
       h('div', { class: 'fs-12 muted', style: { lineHeight: '1.6' }, text: e.detail || '' })
     ]);
-    const wlTarget = whitelistTarget(e);
+    /* 加白目标按事件类型给默认项：
+       域名事件 → domain，IP 事件 → dstIp，扫描/设备事件 → device。
+       后端 security.go 的 eventTargets 会把 DeviceIP + evidence.domain/dstIp/target/ip
+       都当作可命中的 target，所以三种目标都能真正抑制告警。 */
+    const wlTargets = whitelistCandidates(e);
+    const wlSel = h('select', { class: 'select', style: { minWidth: '220px', maxWidth: '100%' } },
+      wlTargets.map((t) => h('option', { value: t.value, text: t.label })));
+    const wlNote = h('span', { class: 'fs-11 dim' });
+    const syncWlNote = () => {
+      const cur = wlTargets.find((t) => t.value === wlSel.value);
+      wlNote.textContent = cur ? WL_TARGET_NOTE[cur.kind] : '';
+    };
+    if (wlTargets.length) syncWlNote();
+    wlSel.addEventListener('change', syncWlNote);
+
+    const wlPanel = wlTargets.length
+      ? h('div', { class: 'bg-panel' }, [
+          h('div', { class: 'fs-12 td-strong', style: { marginBottom: '6px' }, text: '加入告警白名单' }),
+          h('div', { class: 'row-gap-2', style: { flexWrap: 'wrap' } }, [
+            h('span', { class: 'fs-12 dim', text: '加白目标' }),
+            wlSel,
+            wlNote
+          ])
+        ])
+      : h('div', { class: 'fs-11 dim', text: '该事件没有可加白的设备 IP / 域名 / 目标 IP。' });
+    body.appendChild(wlPanel);
+
     const wlBtn = button('加入白名单', {
       variant: 'primary', size: 'sm', icon: ICONS.plus,
       onClick: async () => {
+        const target = wlSel.value;
+        if (!target) return;
         try {
-          await api.addWhitelist(e.type || 'other', wlTarget, e.title || '');
-          toast(`已加白：${EVENT_TYPES[e.type] || e.type} · ${wlTarget}，后续同类不再告警`, 'success');
+          await api.addWhitelist(e.type || 'other', target, e.title || '');
+          toast(`已加白：${EVENT_TYPES[e.type] || e.type} · ${target}，后续同类不再告警`, 'success');
           m.close();
           await loadWhitelist();
         } catch (err) { toast(err.message || '加白失败', 'error'); }
       }
     });
+    if (!wlTargets.length) {
+      wlBtn.disabled = true;
+      wlBtn.title = '该事件没有可加白的设备 IP / 域名 / 目标 IP';
+    }
     const m = modal({ title: `事件证据 · ${e.title || EVENT_TYPES[e.type] || e.type}`, width: 560, body: [body], foot: [wlBtn] });
   }
 
-  // 白名单目标：设备事件用 deviceIp；域名类用 evidence.domain；其余 deviceIp
-  function whitelistTarget(e) {
+  // 白名单目标候选：设备 IP / 域名 / 目标 IP（后端 eventTargets 均支持）。
+  // 默认项按事件语义选：域名事件→domain，IP 事件→dstIp，扫描/设备事件→device。
+  const WL_TARGET_LABEL = { device: '设备 IP', domain: '域名', dst: '目标 IP' };
+  const WL_TARGET_NOTE = {
+    device: '该设备后续同类事件不再告警',
+    domain: '该域名后续同类事件不再告警',
+    dst: '该目标 IP 后续同类事件不再告警'
+  };
+  function whitelistCandidates(e) {
     const ev = e.evidence || {};
-    if (e.type === 'blacklist_domain' || e.type === 'dns_tunnel') {
-      return ev.domain || ev.name || e.detail || e.deviceIp || 'unknown';
-    }
-    return e.deviceIp || ev.srcIp || ev.ip || 'unknown';
+    const out = [];
+    const add = (kind, raw) => {
+      const v = typeof raw === 'string' ? raw.trim() : '';
+      if (!v || out.some((x) => x.value === v)) return;
+      out.push({ kind, value: v, label: `${WL_TARGET_LABEL[kind]} · ${v}` });
+    };
+    add('device', e.deviceIp || ev.srcIp);
+    add('domain', ev.domain || ev.qname || ev.name);
+    // dstIp 为后端字段；dst/ip 兼容演示数据与 threat IP 事件
+    add('dst', ev.dstIp || ev.dst || ev.ip || ev.target);
+    const pref = (e.type === 'blacklist_domain' || e.type === 'dns_tunnel') ? 'domain'
+      : (e.type === 'bad_port' || e.type === 'bad_ip') ? 'dst'
+      : 'device';
+    const i = out.findIndex((x) => x.kind === pref);
+    if (i > 0) out.unshift(out.splice(i, 1)[0]);
+    return out;
   }
 
   // 严重度 → 语义色（供威胁研判边框）

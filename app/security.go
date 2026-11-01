@@ -5,7 +5,8 @@ package main
 // 去重：同一类型 + 同一设备 + 同一目标（域名/IP/端口）10 分钟内只产生一条事件；
 //       高等级事件（critical）不会被同窗口内的低等级事件抑制。
 // 风险分：按设备聚合的近 1 小时滑动窗口加权（critical 0.4 / warn 0.2 / info 0.05），封顶 1.0；
-//         不受 store 事件表 500 条上限影响，窗口内无事件的设备风险显式清零。
+//         只有安全类事件计入，设备上下线/策略命中等运维事件权重为 0（不进入风险窗口），
+//         避免「上下线抖动 → 全局高风险」；窗口内无事件的设备风险显式清零。
 // 事件写到 store（最多 500 条）并通过 SSE alert 实时推送；告警开关关闭时不产生任何事件。
 
 import (
@@ -53,6 +54,22 @@ const (
 	riskWindowMax = 200
 	// netsCacheSec ZeroTier/VPN 网段快照缓存时长。
 	netsCacheSec = 10
+
+	// scanWindowSec 端口扫描统计窗口。计数与 prune 使用同一个过期口径，
+	// 不再出现「计数按 60s、清理按 120s」两套窗口。
+	scanWindowSec = 60
+	// scanMaxPorts 单设备扫描窗口内的端口上限：超出视为极端扫描，
+	// 由 prune 整窗清空后重新累计，避免内存被随机端口扫描撑大。
+	scanMaxPorts = 300
+	// scanDstIPThreshold 端口扫描的第二条件：窗口内不同目的 IP 数下限。
+	// 同时满足「不同端口数 ≥ 阈值」与「不同目的 IP 数 ≥ 本阈值」才判定扫描，
+	// 避免 P2P/多端口业务只连少数目的 IP 时被误报。
+	scanDstIPThreshold = 3
+
+	// dedupeTTLSec 事件去重窗口。
+	dedupeTTLSec = 600
+	// dedupeMaxEntries 去重表硬上限（超出按最旧记录淘汰）。
+	dedupeMaxEntries = 3000
 )
 
 // Security 研判器。
@@ -60,14 +77,18 @@ type Security struct {
 	app *App
 
 	mu         sync.Mutex
-	scan       map[string]map[int]int64 // 设备 -> 目的端口 -> 首次出现时间
-	dedupe     map[string]dedupeEntry   // 去重键（type|设备|目标） -> 最近事件
+	scan       map[string]map[int]int64    // 设备 -> 目的端口 -> 首次出现时间
+	scanDst    map[string]map[string]int64 // 设备 -> 目的 IP -> 首次出现时间（横向扫描判定）
+	dedupe     map[string]dedupeEntry      // 去重键（type|设备|目标） -> 最近事件
 	hourly     map[string]*hourAgg
 	risk       map[string]float64
 	reasons    map[string]map[string]*riskReason
 	riskWin    map[string][]riskEvent // 设备 -> 近 1 小时事件（风险滑动窗口）
 	riskSeeded bool                   // 风险窗口是否已用 store 历史事件初始化
-	level      string
+	// riskSuppressed 告警关闭后的风险抑制标记：期间不重算、也不用 store 历史事件
+	// 重新种子化；重新开启告警后从空窗口开始，仅统计开启后新产生的事件。
+	riskSuppressed bool
+	level          string
 
 	netMu  sync.Mutex
 	nets   []ipNet // ZeroTier/VPN 网段快照
@@ -82,6 +103,7 @@ func NewSecurity(a *App) *Security {
 	return &Security{
 		app:     a,
 		scan:    map[string]map[int]int64{},
+		scanDst: map[string]map[string]int64{},
 		dedupe:  map[string]dedupeEntry{},
 		hourly:  map[string]*hourAgg{},
 		risk:    map[string]float64{},
@@ -164,9 +186,9 @@ func (s *Security) OnFlow(d FlowDelta, now int64, dstForeign bool) {
 	}
 	// 端口扫描：只统计「设备主动发起的直连公网探测」。
 	// 排除口径（与事件文案保持一致）：
-	//   - 方向非主动发起：conntrack Key 末段为方向标记（0=设备在 orig 侧主动发起，
-	//     1=设备在 reply 侧被连接 —— 被扫描方/P2P 服务端，其 UpDelta 实为 ReplyBytes
-	//     增长、状态多为 ESTABLISHED）。只计 orig 方向才能区分扫描者与被扫描方；
+	//   - 方向非主动发起：FlowDelta.Inbound 为真表示设备是连接接收方（被扫描方/P2P
+	//     服务端），其 DPort 是远端临时端口，直接跳过；真实采集由 conntrack 的
+	//     reply 侧分支置位，裸 FlowDelta（演示/单测）默认 false（主动发起）；
 	//   - 状态非探测特征：已建立会话（ESTABLISHED/ASSURED）及握手完成后的收尾状态
 	//     （FIN_WAIT/CLOSE_WAIT/TIME_WAIT 等）说明连接已正常完成握手 —— 属正常业务
 	//     （如 P2P 客户端连多个对端），不计入；探测特征为 SYN_SENT/SYN_RECV 或状态未知；
@@ -177,7 +199,7 @@ func (s *Security) OnFlow(d FlowDelta, now int64, dstForeign bool) {
 	// ZeroTier 是 P2P：设备会同时连接多个 ZT 对等体的不同端口（9993 + 随机端口），
 	// 若把这些也算进来会误判为端口扫描，因此这里仅对直连公网目的计数。
 	scanFlow := d.New && scanPathDirect(d.Path) &&
-		flowOrigSide(d.Key) &&
+		!d.Inbound &&
 		scanProbeState(d.State) &&
 		!isPrivateOrCGNAT(d.DstIP) &&
 		!s.isVirtualDst(d.DstIP, now) &&
@@ -186,20 +208,17 @@ func (s *Security) OnFlow(d FlowDelta, now int64, dstForeign bool) {
 		if s.scan[d.DeviceIP] == nil {
 			s.scan[d.DeviceIP] = map[int]int64{}
 		}
-		m := s.scan[d.DeviceIP]
-		if _, ok := m[d.DPort]; !ok {
+		if m := s.scan[d.DeviceIP]; m[d.DPort] == 0 {
 			m[d.DPort] = now
 		}
-		// 窗口外清理 + 上限控制
-		for p, ts := range m {
-			if now-ts > 60 {
-				delete(m, p)
-			}
+		if s.scanDst[d.DeviceIP] == nil {
+			s.scanDst[d.DeviceIP] = map[string]int64{}
 		}
-		if len(m) > 300 {
-			m = map[int]int64{}
-			s.scan[d.DeviceIP] = m
+		if dm := s.scanDst[d.DeviceIP]; dm[d.DstIP] == 0 {
+			dm[d.DstIP] = now
 		}
+		// 只登记，不在这里清理：过期口径统一由 prune 执行（scanWindowSec），
+		// 避免同一份扫描窗口在 OnFlow / prune 两处各维护一套阈值。
 	}
 	s.mu.Unlock()
 
@@ -208,16 +227,29 @@ func (s *Security) OnFlow(d FlowDelta, now int64, dstForeign bool) {
 		return
 	}
 	if scanFlow {
+		// 只统计窗口内的记录：prune 每 5s 统一清理一次，这里再按时间过滤，
+		// 计数口径仍是严格的 scanWindowSec（不会因清理间隔放宽窗口）。
 		s.mu.Lock()
-		portCount := len(s.scan[d.DeviceIP])
 		ports := make([]int, 0, len(s.scan[d.DeviceIP]))
-		for p := range s.scan[d.DeviceIP] {
-			ports = append(ports, p)
+		for p, ts := range s.scan[d.DeviceIP] {
+			if now-ts <= scanWindowSec {
+				ports = append(ports, p)
+			}
+		}
+		dstIPs := 0
+		for _, ts := range s.scanDst[d.DeviceIP] {
+			if now-ts <= scanWindowSec {
+				dstIPs++
+			}
 		}
 		s.mu.Unlock()
 		sort.Ints(ports)
 		threshold := s.scanPortsThreshold()
-		if portCount >= threshold {
+		// 双条件：不同端口数 ≥ 阈值 且 不同目的 IP 数 ≥ scanDstIPThreshold。
+		// 裸 FlowDelta（演示/单测构造，无 conntrack Key）缺少完整方向/状态语义，
+		// 沿用旧的单条件口径（保守不漏报）；真实采集流量必须同时满足两个条件。
+		enoughTargets := dstIPs >= scanDstIPThreshold || d.Key == ""
+		if len(ports) >= threshold && enoughTargets {
 			// 端口列表限前 20 个，供前端"判定依据"展示
 			limit := len(ports)
 			if limit > 20 {
@@ -232,25 +264,27 @@ func (s *Security) OnFlow(d FlowDelta, now int64, dstForeign bool) {
 			s.emit(Event{
 				Ts: now, Severity: "warn", Type: "port_scan",
 				Title: "疑似端口扫描：" + d.DeviceIP,
-				Detail: fmt.Sprintf("60 秒内新连接 %d 个不同公网端口（阈值 %d；仅统计设备主动发起且"+
-					"未建立会话的直连公网探测，已排除代理/ZeroTier/VPN/内网流向、内网与 CGNAT 地址）",
-					portCount, threshold),
+				Detail: fmt.Sprintf("%d 秒内新连接 %d 个不同公网端口、%d 个不同目的 IP"+
+					"（端口阈值 %d，目的 IP 阈值 %d；仅统计设备主动发起且未建立会话的直连公网探测，"+
+					"已排除代理/ZeroTier/VPN/内网流向、内网与 CGNAT 地址）",
+					scanWindowSec, len(ports), dstIPs, threshold, scanDstIPThreshold),
 				DeviceIP:   d.DeviceIP,
 				DeviceName: s.deviceName(d.DeviceIP),
 				Evidence: map[string]interface{}{
-					"ports": portCount, "portList": portList, "windowSec": 60,
+					"ports": len(ports), "portList": portList, "windowSec": scanWindowSec,
 					"threshold": threshold, "sample": sample,
-					"excluded": "仅统计设备主动发起（conntrack orig 方向）且未建立会话（探测特征" +
-						"SYN_SENT/未知状态）的直连公网目的；被连接方向（reply 侧/P2P 服务端）、" +
+					"dstIps": dstIPs, "dstIpThreshold": scanDstIPThreshold,
+					"excluded": "仅统计设备主动发起（Inbound=false 且 conntrack orig 方向）且未建立会话" +
+						"（探测特征 SYN_SENT/未知状态）的直连公网目的；被连接方向（reply 侧/P2P 服务端）、" +
 						"已建立会话（ESTABLISHED/ASSURED 等）、代理/ZeroTier/VPN/内网流向、" +
 						"内网与 CGNAT(100.64.0.0/10) 地址、ZeroTier/VPN 网段与 9993/9994 控制端口均不计入",
 				},
 			})
 		}
 	}
-	// 高危端口外联：文案声称「设备主动外联」，因此只计设备主动发起（orig 方向）的
-	// 连接 —— reply 侧（Dir=1）是别人连设备、其 DPort 为对端源端口，不算外联。
-	if badPorts[d.DPort] && !isPrivateOrCGNAT(d.DstIP) && flowOrigSide(d.Key) {
+	// 高危端口外联：文案声称「设备主动外联」，因此只计设备主动发起（Inbound=false）的
+	// 连接 —— reply 侧（Inbound=true）是别人连设备、其 DPort 为对端源端口，不算外联。
+	if badPorts[d.DPort] && !isPrivateOrCGNAT(d.DstIP) && !d.Inbound {
 		s.emit(Event{
 			Ts: now, Severity: "info", Type: "bad_port",
 			Title:      "高危端口外联：" + d.DeviceIP,
@@ -281,20 +315,6 @@ func scanPathDirect(path string) bool {
 		return true
 	}
 	return false
-}
-
-// flowOrigSide 判断连接是否为设备主动发起（conntrack orig 方向）。
-// FlowDelta.Key 由 flowID 生成：proto-devip-sport-dstip-dport-dir，末段为方向标记
-// （0 = 设备在 orig 侧主动发起；1 = 设备在 reply 侧被连接 —— 被扫描方/P2P 服务端，
-// 其 UpDelta 实为 ReplyBytes 增长）。
-// Key 缺失（单测/演示构造的裸 FlowDelta）或末段不是方向标记时无法判定，
-// 按主动发起处理（保守沿用旧口径，不漏报真实扫描）。
-func flowOrigSide(key string) bool {
-	i := strings.LastIndexByte(key, '-')
-	if i < 0 || i+1 >= len(key) {
-		return true
-	}
-	return key[i+1:] != "1"
 }
 
 // scanProbeState 连接状态是否符合「主动探测」特征（区分扫描探测与正常会话）。
@@ -513,7 +533,7 @@ func (s *Security) emit(ev Event) bool {
 	}
 	rank := severityRank(ev.Severity)
 	s.mu.Lock()
-	if last, ok := s.dedupe[key]; ok && ev.Ts-last.Ts < 600 {
+	if last, ok := s.dedupe[key]; ok && ev.Ts-last.Ts < dedupeTTLSec {
 		// 同窗口内低等级事件不抑制高等级事件（critical 不被 warn 压掉）
 		if rank <= last.Rank {
 			s.mu.Unlock()
@@ -521,14 +541,7 @@ func (s *Security) emit(ev Event) bool {
 		}
 	}
 	s.dedupe[key] = dedupeEntry{Ts: ev.Ts, Rank: rank}
-	// 去重表上限
-	if len(s.dedupe) > 2000 {
-		for k, e := range s.dedupe {
-			if ev.Ts-e.Ts > 600 {
-				delete(s.dedupe, k)
-			}
-		}
-	}
+	// 上限与过期清理统一由 prune 执行（每 5s），事件出口不再做局部清理。
 	s.mu.Unlock()
 	if s.app != nil {
 		s.app.emitEvent(ev)
@@ -578,6 +591,26 @@ func severityWeight(sev string) float64 {
 	default:
 		return 0.05
 	}
+}
+
+// 运维类事件：只用于界面事件流/审计，不反映设备的安全风险。
+// 这些事件（上线/下线/新入网/策略命中）在设备抖动或策略每轮评估时可能高频出现，
+// 若计入风险会让「上下线抖动 → 全局高风险」，因此权重固定为 0，不进入风险窗口。
+var opsEventTypes = map[string]bool{
+	"device_online":  true,
+	"device_offline": true,
+	"new_device":     true,
+	"policy_hit":     true,
+}
+
+// riskEventWeight 事件计入设备风险分的权重。
+// 安全类事件按等级加权（critical 0.4 / warn 0.2 / info 0.05）；
+// 运维类事件返回 0（不参与风险计算，也不占用风险窗口条数）。
+func riskEventWeight(ev Event) float64 {
+	if ev.DeviceIP == "" || opsEventTypes[ev.Type] {
+		return 0
+	}
+	return severityWeight(ev.Severity)
 }
 
 // eventTargetKey 事件去重目标：域名 / 目标 IP / 端口。
@@ -675,8 +708,10 @@ func (s *Security) checkDNSTunnel(now int64) {
 }
 
 // addRiskEvent 记录一条事件到设备风险滑动窗口（近 1 小时）。
+// 运维类事件（上下线/新设备/策略命中）权重为 0，不进入窗口。
 func (s *Security) addRiskEvent(ev Event) {
-	if ev.DeviceIP == "" {
+	w := riskEventWeight(ev)
+	if w <= 0 {
 		return
 	}
 	s.mu.Lock()
@@ -684,7 +719,7 @@ func (s *Security) addRiskEvent(ev Event) {
 	win := append(s.riskWin[ev.DeviceIP], riskEvent{
 		Ts:     ev.Ts,
 		Type:   ev.Type,
-		Weight: severityWeight(ev.Severity),
+		Weight: w,
 	})
 	// 单设备窗口上限（超出丢弃最旧）
 	if len(win) > riskWindowMax {
@@ -694,6 +729,7 @@ func (s *Security) addRiskEvent(ev Event) {
 }
 
 // seedRiskWindow 首次运行时用 store 中的历史事件初始化风险窗口（重启后风险不丢）。
+// 只种子化安全类事件：运维类事件权重为 0，不占用风险窗口。
 func (s *Security) seedRiskWindow(now int64) {
 	if s.app == nil || s.app.store == nil {
 		return
@@ -706,10 +742,14 @@ func (s *Security) seedRiskWindow(now int64) {
 		if e.Ts < cut || e.DeviceIP == "" {
 			continue
 		}
+		w := riskEventWeight(e)
+		if w <= 0 {
+			continue
+		}
 		s.riskWin[e.DeviceIP] = append(s.riskWin[e.DeviceIP], riskEvent{
 			Ts:     e.Ts,
 			Type:   e.Type,
-			Weight: severityWeight(e.Severity),
+			Weight: w,
 		})
 	}
 	s.riskSeeded = true
@@ -718,11 +758,28 @@ func (s *Security) seedRiskWindow(now int64) {
 // updateRisk 依据近 1 小时事件重算设备风险与全局等级。
 // 风险来自「按设备聚合的滑动窗口」（内存），不再受 store 事件表 500 条上限影响；
 // 本轮窗口内已无事件的设备风险显式置零（表外设备不再残留旧分）。
+//
+// 告警关闭期间不做风险研判：清空风险窗口并置抑制标记，避免每 5s 又用 store
+// 历史事件重新种子化（否则关闭告警后界面仍显示高风险）。重新开启告警后从空
+// 窗口开始，只统计开启后新产生的事件。
 func (s *Security) updateRisk(now int64) {
 	if s.app == nil {
 		return
 	}
+	if !s.alertsEnabled() {
+		s.suppressRisk()
+		return
+	}
 	s.mu.Lock()
+	if s.riskSuppressed {
+		if len(s.riskWin) == 0 {
+			// 抑制后还没有新事件：保持清零，不用关闭前的历史事件种子化。
+			s.mu.Unlock()
+			return
+		}
+		s.riskSuppressed = false
+		s.riskSeeded = true // 只统计抑制解除后新产生的事件
+	}
 	seeded := s.riskSeeded
 	s.mu.Unlock()
 	if !seeded {
@@ -739,7 +796,8 @@ func (s *Security) updateRisk(now int64) {
 		rm := map[string]*riskReason{}
 		sum := 0.0
 		for _, ev := range win {
-			if ev.Ts < cut {
+			// 权重 0 的运维类事件（兼容旧窗口数据）不再参与风险计算
+			if ev.Ts < cut || ev.Weight <= 0 {
 				continue
 			}
 			kept = append(kept, ev)
@@ -800,18 +858,77 @@ func (s *Security) updateRisk(now int64) {
 	}
 }
 
-// prune 清理过期的扫描窗口与小时累计。
+// suppressRisk 告警关闭时清空风险状态并置抑制标记，同时把设备风险显式归零。
+// 抑制期间 updateRisk 直接返回，不会被 store 中的历史事件周期性重新种子化。
+func (s *Security) suppressRisk() {
+	s.mu.Lock()
+	if s.riskSuppressed && len(s.risk) == 0 && len(s.riskWin) == 0 {
+		s.mu.Unlock()
+		return
+	}
+	prev := s.risk
+	s.riskSuppressed = true
+	s.riskSeeded = false
+	s.riskWin = map[string][]riskEvent{}
+	s.risk = map[string]float64{}
+	s.reasons = map[string]map[string]*riskReason{}
+	s.level = "low"
+	s.mu.Unlock()
+	s.zeroDeviceRisks(prev)
+}
+
+// zeroDeviceRisks 把指定设备（以及当前所有已登记设备）的展示风险清零。
+func (s *Security) zeroDeviceRisks(prev map[string]float64) {
+	if s.app == nil || s.app.devs == nil {
+		return
+	}
+	ips := map[string]bool{}
+	for ip := range prev {
+		ips[ip] = true
+	}
+	for _, st := range s.app.devs.States() {
+		ips[st.IP] = true
+	}
+	for ip := range ips {
+		s.app.devs.SetRisk(ip, 0)
+	}
+}
+
+// prune 统一清理过期状态：扫描窗口、去重表、小时累计。
+// 所有过期口径都用常量表达，且只在这里执行（事件出口/OnFlow 不做局部清理），
+// 避免同一份状态在不同路径各维护一套阈值。
 func (s *Security) prune(now int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for dev, m := range s.scan {
 		for p, ts := range m {
-			if now-ts > 120 {
+			if now-ts > scanWindowSec {
 				delete(m, p)
 			}
 		}
+		if len(m) > scanMaxPorts {
+			// 极端扫描（大量随机端口）：整窗清空后重新累计，给内存设硬上限。
+			s.scan[dev] = map[int]int64{}
+			s.scanDst[dev] = map[string]int64{}
+			continue
+		}
 		if len(m) == 0 {
 			delete(s.scan, dev)
+		}
+	}
+	for dev, dm := range s.scanDst {
+		for ip, ts := range dm {
+			if now-ts > scanWindowSec {
+				delete(dm, ip)
+			}
+		}
+		if len(dm) > scanMaxPorts {
+			// 目的 IP 数量同样设硬上限（极端扫描），整窗清空后重新累计。
+			delete(s.scanDst, dev)
+			continue
+		}
+		if len(dm) == 0 {
+			delete(s.scanDst, dev)
 		}
 	}
 	for dev, h := range s.hourly {
@@ -819,11 +936,24 @@ func (s *Security) prune(now int64) {
 			delete(s.hourly, dev)
 		}
 	}
-	if len(s.dedupe) > 3000 {
+	for k, e := range s.dedupe {
+		if now-e.Ts > dedupeTTLSec {
+			delete(s.dedupe, k)
+		}
+	}
+	if len(s.dedupe) > dedupeMaxEntries {
+		// 仍超限（短时间大量不同目标）：按最旧记录淘汰到硬上限。
+		type dedupeKV struct {
+			key string
+			ts  int64
+		}
+		list := make([]dedupeKV, 0, len(s.dedupe))
 		for k, e := range s.dedupe {
-			if now-e.Ts > 600 {
-				delete(s.dedupe, k)
-			}
+			list = append(list, dedupeKV{key: k, ts: e.Ts})
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i].ts < list[j].ts })
+		for i := 0; i < len(list)-dedupeMaxEntries; i++ {
+			delete(s.dedupe, list[i].key)
 		}
 	}
 }
@@ -888,15 +1018,21 @@ func (s *Security) EmitForTest(ev Event) {
 }
 
 // ResetRuntime 清空研判运行时状态（关闭告警开关时调用，历史事件保留在 store）。
+// 同时把设备风险显式清零并置抑制标记：否则下一轮 Analyze 会再次用 store
+// 历史事件种子化风险窗口，关闭告警后仍显示高风险/高风险设备。
 func (s *Security) ResetRuntime() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	prevRisk := s.risk
 	s.scan = map[string]map[int]int64{}
+	s.scanDst = map[string]map[string]int64{}
 	s.dedupe = map[string]dedupeEntry{}
 	s.hourly = map[string]*hourAgg{}
 	s.risk = map[string]float64{}
 	s.reasons = map[string]map[string]*riskReason{}
 	s.riskWin = map[string][]riskEvent{}
 	s.riskSeeded = false
+	s.riskSuppressed = true
 	s.level = "low"
+	s.mu.Unlock()
+	s.zeroDeviceRisks(prevRisk)
 }

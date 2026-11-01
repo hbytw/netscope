@@ -100,8 +100,17 @@ func LoadConfig(dataDir string, demo, dryRun bool) (*Config, error) {
 	created := false
 	if data, err := os.ReadFile(cfg.ConfigPath); err == nil {
 		var fc fileConfig
-		if err := json.Unmarshal(data, &fc); err != nil {
-			return nil, fmt.Errorf("解析配置文件 %s 失败: %w", cfg.ConfigPath, err)
+		if uerr := json.Unmarshal(data, &fc); uerr != nil {
+			// 主文件损坏（改密/断电时被截断、手工编辑出错）：回退 config.json.bak，
+			// 用备份内容继续启动并重写主文件（created=true 触发下方 saveFile 自愈）。
+			bak, berr := os.ReadFile(cfg.ConfigPath + ".bak")
+			var bfc fileConfig
+			if berr != nil || json.Unmarshal(bak, &bfc) != nil {
+				return nil, fmt.Errorf("解析配置文件 %s 失败: %w", cfg.ConfigPath, uerr)
+			}
+			logf("config.json 损坏（%v），已回退 config.json.bak", uerr)
+			fc = bfc
+			created = true
 		}
 		cfg.Salt = fc.Salt
 		cfg.PasswordHash = fc.PasswordHash
@@ -137,6 +146,10 @@ func LoadConfig(dataDir string, demo, dryRun bool) (*Config, error) {
 }
 
 // saveFile 原子写配置文件。
+//
+// 落盘顺序：备份现有有效配置到 config.json.bak → 写 tmp → fsync → close → rename。
+// 相比「直接覆盖写」，掉电/被杀进程时不会留下半截 config.json（否则下次启动解析失败、
+// 登录直接不可用）；最坏情况回退 .bak，配置（含密码）不丢。
 func (c *Config) saveFile() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -148,11 +161,13 @@ func (c *Config) saveFile() error {
 	if err := os.MkdirAll(filepath.Dir(c.ConfigPath), 0o755); err != nil {
 		return err
 	}
-	tmp := c.ConfigPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
+	// 只备份语法有效的旧配置（损坏的主文件不该覆盖掉好备份）；备份失败只记日志，不阻断保存。
+	if old, rerr := os.ReadFile(c.ConfigPath); rerr == nil && len(old) > 0 && json.Valid(old) {
+		if berr := writeFileSync(c.ConfigPath+".bak", old, 0o600); berr != nil {
+			logf("写入 config.json.bak 失败: %v", berr)
+		}
 	}
-	return os.Rename(tmp, c.ConfigPath)
+	return writeFileSync(c.ConfigPath, data, 0o600)
 }
 
 // VerifyPassword 校验密码。

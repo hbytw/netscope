@@ -36,13 +36,17 @@ var conntrackPath = "/proc/net/nf_conntrack"
 
 // ctEntry 一行 conntrack 条目（仅解析需要的字段）。
 type ctEntry struct {
-	Proto      string
-	State      string
-	V4         bool
-	SrcIP      uint32
-	DstIP      uint32
-	SPort      int
-	DPort      int
+	Proto string
+	State string
+	V4    bool
+	SrcIP uint32
+	DstIP uint32
+	SPort int
+	DPort int
+	// ReplySPort/ReplyDPort reply 段端口（orig 方向的对方端口/设备端口）。
+	// 目前只解析保存，供后续 TPROXY/REDIRECT 判定使用，不参与现有逻辑。
+	ReplySPort int
+	ReplyDPort int
 	Mark       uint32 // conntrack mark（passwall 等代理常用 0x1/0x2 标记被代理连接）
 	OrigBytes  int64
 	ReplyBytes int64
@@ -68,6 +72,11 @@ type flowSnap struct {
 	Started  int64
 	Gen      uint32
 	LastSeen int64 // 最后一次在 conntrack 表中出现的时间（用于老化淘汰）
+	// goneGen 已通知「条目消失」的轮次标记（0 = 尚未通知）。
+	// 快照在老化前会保留 10 分钟（约 300 轮），同一 key 可能连续多轮缺席；
+	// 只在首次缺席时回调 gone，避免每 2 秒对上万个 key 反复加锁+拼 ID 字符串。
+	// 该 key 重新出现时复位为 0，下次消失仍会通知。
+	goneGen uint32
 }
 
 // FlowDelta 一次采样得到的增量。
@@ -88,6 +97,9 @@ type FlowDelta struct {
 	Started   int64
 	New       bool
 	Baseline  bool // 启动首个采样轮：只登记连接，不参与统计/研判
+	// Inbound 设备是连接的接收方（远端主动连入，如 BT peer 入站 / 被端口扫描）。
+	// 此时 DPort 是远端主机的临时端口，不能用于"该设备扫描了 N 个端口"的研判。
+	Inbound bool
 }
 
 // ipNet 一个网段及其类型/接口（用于多网段设备识别与流向判断）。
@@ -383,6 +395,7 @@ func (e *ConnEngine) Collect(r io.Reader, now int64, emit func(FlowDelta), gone 
 				// 大额新流：保持快照基线为 0，下一轮把累计值一次性计入
 			}
 			snap.Gen = e.gen
+			snap.goneGen = 0
 			snap.LastSeen = now
 			continue
 		}
@@ -392,6 +405,7 @@ func (e *ConnEngine) Collect(r io.Reader, now int64, emit func(FlowDelta), gone 
 		if upv < snap.Up || downv < snap.Down {
 			snap.Up, snap.Down = upv, downv
 			snap.Gen = e.gen
+			snap.goneGen = 0 // 重新出现：允许下次消失时再次通知
 			snap.LastSeen = now
 			continue
 		}
@@ -399,6 +413,7 @@ func (e *ConnEngine) Collect(r io.Reader, now int64, emit func(FlowDelta), gone 
 		dd := int64(downv - snap.Down)
 		snap.Up, snap.Down = upv, downv
 		snap.Gen = e.gen
+		snap.goneGen = 0 // 重新出现：允许下次消失时再次通知
 		snap.LastSeen = now
 		// 增量不设固定上限：只要累计值递增就计入（高速单流不能被永久漏计）。
 		if du > 0 || dd > 0 {
@@ -416,10 +431,13 @@ func (e *ConnEngine) Collect(r io.Reader, now int64, emit func(FlowDelta), gone 
 	// 注意：保留快照（不删除），以记住该 key 的累计字节。
 	// 否则流消失后重现会被当作新流，把累计值当增量重复计入（会造成数量级放大）。
 	// 快照由 evict() 按 LastSeen 老化淘汰。
+	// 同一 key 可能连续数百轮缺席（快照保留期 10 分钟），只在首次缺席时回调 gone：
+	// 否则每 2 秒最多对 2 万个 key 反复加锁 + 拼 flowID 字符串（纯浪费）。
 	for k, snap := range e.flows {
-		if snap.Gen != e.gen {
+		if snap.Gen != e.gen && snap.goneGen == 0 {
 			if gone != nil {
 				gone(flowID(k))
+				snap.goneGen = e.gen
 			}
 		}
 	}
@@ -430,9 +448,10 @@ func (e *ConnEngine) Collect(r io.Reader, now int64, emit func(FlowDelta), gone 
 
 // flowMeta 设备/流向元信息（随 FlowDelta 下发）。
 type flowMeta struct {
-	path   string
-	iface  string
-	device bool // 是否设备侧连接（false = 本机/docker0 等非用户设备流量，只计入链路不展示连接）
+	path    string
+	iface   string
+	device  bool // 是否设备侧连接（false = 本机/docker0 等非用户设备流量，只计入链路不展示连接）
+	inbound bool // 设备是连接的接收方（远端主动连入）
 }
 
 // emitFlow 发布流向上下文后回调（emit 期间上下文有效，emit 后清除，避免陈旧上下文被误用）。
@@ -517,9 +536,10 @@ func (e *ConnEngine) normalize(ent ctEntry) (flowKey, int64, int64, flowMeta, bo
 		k.DPort = uint16(ent.SPort)
 		k.Dir = 1
 		meta := flowMeta{
-			path:   e.pathFor(ent.SrcIP, ent.SPort, ent.Mark),
-			iface:  n.iface,
-			device: true,
+			path:    e.pathFor(ent.SrcIP, ent.SPort, ent.Mark),
+			iface:   n.iface,
+			device:  true,
+			inbound: true, // 设备是接收方：远端主动连入
 		}
 		if meta.iface == "" {
 			meta.iface = "br-lan"
@@ -558,6 +578,7 @@ func (e *ConnEngine) makeDelta(k flowKey, ent ctEntry, meta flowMeta, up, down i
 		TotalDown: down,
 		Started:   started,
 		New:       isNew,
+		Inbound:   meta.inbound,
 	}
 	if e.baseline {
 		return d
@@ -724,6 +745,7 @@ func parseConntrackLine(line []byte) (ctEntry, bool) {
 		origSrc, origDst   uint32
 		origSP, origDP     int
 		replySrc, replyDst uint32
+		replySP, replyDP   int
 		origBytes          int64
 		replyBytes         int64
 		sec                = -1
@@ -736,7 +758,7 @@ func parseConntrackLine(line []byte) (ctEntry, bool) {
 		if sec == 0 {
 			origSrc, origDst, origSP, origDP, origBytes = curSrc, curDst, curSP, curDP, curBytes
 		} else if sec == 1 {
-			replySrc, replyDst, replyBytes = curSrc, curDst, curBytes
+			replySrc, replyDst, replySP, replyDP, replyBytes = curSrc, curDst, curSP, curDP, curBytes
 		}
 	}
 	resetSection := func(s int) {
@@ -825,6 +847,9 @@ func parseConntrackLine(line []byte) (ctEntry, bool) {
 	e.OrigBytes = origBytes
 	if replySrc != 0 && replyDst != 0 {
 		e.ReplyBytes = replyBytes
+		// reply 段端口：供后续 TPROXY/REDIRECT 判定使用（本次不改判定逻辑）
+		e.ReplySPort = replySP
+		e.ReplyDPort = replyDP
 	}
 	return e, true
 }

@@ -77,10 +77,36 @@ type SysInfo struct {
 	prevIface string // 上次差分所用接口（WAN 口出现/消失时重新登记基准）
 	havePrev  bool
 
+	// 静态信息缓存（model/arch/kernel/openwrt/hostname）：读到一次后不再读文件
+	staticMu   sync.Mutex
+	static     staticInfo
+	staticDone bool
+
+	// 低频指标缓存（负载 / 运行时间 / conntrack 条数 / 进程 RSS）
+	slow      SysSnapshot
+	slowAt    int64
+	slowValid bool
+
 	diskFreeMb int64
 	diskAt     int64
 	sampleN    int64
 	demoStart  time.Time
+}
+
+// slowSampleSec 低频指标采样间隔（秒）。
+//
+// CPU / 内存 / 温度 / 接口流量保持每轮采样（采集间隔，默认 2s）；
+// 负载、运行时间、conntrack 条数、进程 RSS 变化慢，且每项都要读一个小文件，
+// 降到 6s 一次后其余轮次直接复用缓存值。
+const slowSampleSec = 6
+
+// staticInfo 不常变化的系统信息（首次读到后缓存，进程生命周期内不再重读）。
+type staticInfo struct {
+	model    string
+	arch     string
+	kernel   string
+	openwrt  string
+	hostname string
 }
 
 type cpuTimes struct {
@@ -102,6 +128,7 @@ func (s *SysInfo) Sample(intervalSec int64) {
 	if intervalSec <= 0 {
 		intervalSec = 2
 	}
+	now := time.Now().Unix()
 	var snap SysSnapshot
 
 	// CPU
@@ -136,13 +163,8 @@ func (s *SysInfo) Sample(intervalSec int64) {
 			}
 		}
 	}
-	// 负载
-	if b, err := os.ReadFile("/proc/loadavg"); err == nil {
-		var l1 float64
-		if _, err := fmtSscan(string(b), &l1); err == nil {
-			snap.Load1 = math.Round(l1*100) / 100
-		}
-	}
+	// 负载 / 运行时间 / conntrack 条数 / 进程 RSS：低频采样（每 slowSampleSec 一次）
+	s.fillSlow(&snap, now)
 	// 温度
 	if b, err := os.ReadFile("/sys/class/thermal/thermal_zone0/temp"); err == nil {
 		milli, ok := atoi64OK(trimSpaceBytes(b))
@@ -150,24 +172,11 @@ func (s *SysInfo) Sample(intervalSec int64) {
 			snap.TempC = math.Round(float64(milli)/100) / 10
 		}
 	}
-	// 运行时间
-	if b, err := os.ReadFile("/proc/uptime"); err == nil {
-		fields := strings.Fields(string(b))
-		if len(fields) > 0 {
-			if sec, err := parseFloat(fields[0]); err == nil {
-				snap.UptimeSec = int64(sec)
-			}
-		}
-	}
-	// conntrack 条数
-	if b, err := os.ReadFile("/proc/sys/net/netfilter/nf_conntrack_count"); err == nil {
-		n, _ := atoi64OK(trimSpaceBytes(b))
-		snap.ConnCount = n
-	}
 	// 接口速率（真 WAN 口优先；无真 WAN 的旁路由形态用 br-lan/eth0 中转计数）
 	usedWAN := false
 	if b, err := os.ReadFile("/proc/net/dev"); err == nil {
-		text := string(b)
+		// 只解析一次（与 topology.go 共用 parseNetDevAll），后续按接口名查表
+		dev := parseNetDevAll(string(b))
 		// 真 WAN 口判定：复用 topology.go 的 wanIface（默认路由出口且非内网桥/隧道），
 		// interfaces()/routeLines() 走 10s 共享命令缓存，采样周期内不会反复 fork。
 		wanName := ""
@@ -177,15 +186,15 @@ func (s *SysInfo) Sample(intervalSec int64) {
 		var physRx, physTx int64
 		iface := ""
 		if wanName != "" {
-			if rx, tx, ok := netDevIfCounters(text, wanName); ok {
-				physRx, physTx, iface, usedWAN = rx, tx, wanName, true
+			if c, ok := dev[wanName]; ok {
+				physRx, physTx, iface, usedWAN = c[0], c[1], wanName, true
 			}
 		}
 		if iface == "" {
-			if rx, tx, ok := netDevIfCounters(text, "br-lan"); ok {
-				physRx, physTx, iface = rx, tx, "br-lan"
-			} else if rx, tx, ok := netDevIfCounters(text, "eth0"); ok {
-				physRx, physTx, iface = rx, tx, "eth0"
+			if c, ok := dev["br-lan"]; ok {
+				physRx, physTx, iface = c[0], c[1], "br-lan"
+			} else if c, ok := dev["eth0"]; ok {
+				physRx, physTx, iface = c[0], c[1], "eth0"
 			}
 		}
 		if iface != "" {
@@ -241,13 +250,12 @@ func (s *SysInfo) Sample(intervalSec int64) {
 	}
 	// 磁盘占用（60s 更新一次，避免频繁 fork df）
 	s.sampleN++
-	if s.sampleN%30 == 1 || time.Now().Unix()-s.diskAt > 60 {
+	if s.sampleN%30 == 1 || now-s.diskAt > 60 {
 		s.diskFreeMb = s.queryDiskFree()
-		s.diskAt = time.Now().Unix()
+		s.diskAt = now
 	}
 	snap.DiskFreeMb = s.diskFreeMb
-	// 进程 RSS
-	snap.RSSMb = readProcessRSSMb()
+	// 静态信息（model/arch/kernel/openwrt/hostname）：首次读到后缓存
 	s.fillStatic(&snap)
 
 	s.mu.Lock()
@@ -255,31 +263,101 @@ func (s *SysInfo) Sample(intervalSec int64) {
 	s.mu.Unlock()
 }
 
-// fillStatic 填充不常变化的系统信息（每轮覆盖，开销极低）。
-func (s *SysInfo) fillStatic(snap *SysSnapshot) {
-	if snap.Model == "" {
-		if b, err := os.ReadFile("/tmp/sysinfo/model"); err == nil {
-			snap.Model = strings.TrimSpace(string(b))
+// fillSlow 填充低频指标（负载 / 运行时间 / conntrack 条数 / 进程 RSS）。
+//
+// 这几项变化慢、但每项每轮都要读一个小文件；按 slowSampleSec 节拍采样并缓存，
+// 其余轮次直接用上次值（CPU / 内存 / 温度 / 接口流量仍每轮采样）。
+// 运行时间按「上次采样值 + 已过秒数」推算：展示仍是逐秒递增，不会出现 6s 一跳。
+func (s *SysInfo) fillSlow(snap *SysSnapshot, now int64) {
+	if !s.slowValid || now-s.slowAt >= slowSampleSec || now < s.slowAt {
+		s.sampleSlow(now)
+	}
+	snap.Load1, snap.ConnCount, snap.RSSMb = s.slow.Load1, s.slow.ConnCount, s.slow.RSSMb
+	up := s.slow.UptimeSec
+	if up > 0 {
+		if d := now - s.slowAt; d > 0 {
+			up += d
 		}
 	}
-	if b, err := os.ReadFile("/proc/sys/kernel/osrelease"); err == nil && snap.Kernel == "" {
-		snap.Kernel = strings.TrimSpace(string(b))
+	snap.UptimeSec = up
+}
+
+// sampleSlow 采样一次低频指标并写入缓存。
+func (s *SysInfo) sampleSlow(now int64) {
+	var v SysSnapshot
+	// 负载
+	if b, err := os.ReadFile("/proc/loadavg"); err == nil {
+		var l1 float64
+		if _, err := fmtSscan(string(b), &l1); err == nil {
+			v.Load1 = math.Round(l1*100) / 100
+		}
 	}
-	if b, err := os.ReadFile("/etc/openwrt_release"); err == nil && snap.OpenWrt == "" {
-		for _, line := range strings.Split(string(b), "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "DISTRIB_DESCRIPTION=") {
-				snap.OpenWrt = strings.Trim(strings.TrimPrefix(line, "DISTRIB_DESCRIPTION="), "'\"")
-				break
+	// 运行时间
+	if b, err := os.ReadFile("/proc/uptime"); err == nil {
+		fields := strings.Fields(string(b))
+		if len(fields) > 0 {
+			if sec, err := parseFloat(fields[0]); err == nil {
+				v.UptimeSec = int64(sec)
 			}
 		}
 	}
-	if snap.Hostname == "" {
-		if h, err := os.Hostname(); err == nil {
-			snap.Hostname = h
-		}
+	// conntrack 条数
+	if b, err := os.ReadFile("/proc/sys/net/netfilter/nf_conntrack_count"); err == nil {
+		n, _ := atoi64OK(trimSpaceBytes(b))
+		v.ConnCount = n
 	}
-	snap.Arch = goArchName()
+	// 进程 RSS
+	v.RSSMb = readProcessRSSMb()
+	s.slow, s.slowAt, s.slowValid = v, now, true
+}
+
+// fillStatic 填充不常变化的系统信息：每个字段首次读到后缓存，不再每轮读文件。
+//
+// 旧实现每轮（默认 2s）都重读 /tmp/sysinfo/model、/proc/sys/kernel/osrelease、
+// /etc/openwrt_release 并调用 os.Hostname（快照每轮是新的空结构，字段永远为空，
+// 因此「只填空字段」从未生效）。现在：
+//   - 读到的字段立刻缓存，后续轮次零文件读取；
+//   - 读不到的字段下轮再试（保持「失败即重试」的自愈行为，如 model 文件晚出现）；
+//   - 全部到齐后完全不再碰这些文件。
+func (s *SysInfo) fillStatic(snap *SysSnapshot) {
+	s.staticMu.Lock()
+	defer s.staticMu.Unlock()
+	if !s.staticDone {
+		st := &s.static
+		if st.model == "" {
+			if b, err := os.ReadFile("/tmp/sysinfo/model"); err == nil {
+				st.model = strings.TrimSpace(string(b))
+			}
+		}
+		if st.kernel == "" {
+			if b, err := os.ReadFile("/proc/sys/kernel/osrelease"); err == nil {
+				st.kernel = strings.TrimSpace(string(b))
+			}
+		}
+		if st.openwrt == "" {
+			if b, err := os.ReadFile("/etc/openwrt_release"); err == nil {
+				for _, line := range strings.Split(string(b), "\n") {
+					line = strings.TrimSpace(line)
+					if strings.HasPrefix(line, "DISTRIB_DESCRIPTION=") {
+						st.openwrt = strings.Trim(strings.TrimPrefix(line, "DISTRIB_DESCRIPTION="), "'\"")
+						break
+					}
+				}
+			}
+		}
+		if st.hostname == "" {
+			if h, err := os.Hostname(); err == nil {
+				st.hostname = h
+			}
+		}
+		if st.arch == "" {
+			st.arch = goArchName()
+		}
+		s.staticDone = st.model != "" && st.kernel != "" && st.openwrt != "" &&
+			st.hostname != "" && st.arch != ""
+	}
+	snap.Model, snap.Arch, snap.Kernel, snap.OpenWrt, snap.Hostname =
+		s.static.model, s.static.arch, s.static.kernel, s.static.openwrt, s.static.hostname
 }
 
 // Snapshot 返回最新系统快照。
@@ -337,7 +415,8 @@ func (s *SysInfo) queryDiskFree() int64 {
 	}
 	// 采集类命令：3s 超时（df 是本地读取，正常毫秒级完成）。
 	// 一条慢命令若按默认 60s 超时执行，会占住 execMu 把采集一起冻结。
-	out, err := s.app.shellQuietOutput("df -k "+s.app.cfg.DataDir+" 2>/dev/null | tail -1", 3*time.Second)
+	// 路径必须安全引用：DataDir 含空格/引号时裸拼接会让 df 的参数错位（解析到别的分区）。
+	out, err := s.app.shellQuietOutput("df -k "+shSingleQuote(s.app.cfg.DataDir)+" 2>/dev/null | tail -1", 3*time.Second)
 	if err != nil {
 		return 0
 	}
@@ -409,17 +488,20 @@ func parseMemInfo(text string) (totalKB, availKB int64, ok bool) {
 	return totalKB, availKB, totalKB > 0
 }
 
-// netDevIfCounters 解析 /proc/net/dev 中指定接口的 rx/tx 累计字节（按接口名精确匹配）。
-func netDevIfCounters(text, name string) (rx, tx int64, ok bool) {
-	if name == "" {
-		return 0, 0, false
-	}
+// parseNetDevAll 解析 /proc/net/dev，返回每个接口的累计 rx/tx 字节。
+//
+// 这是 /proc/net/dev 的唯一解析实现：系统采样（sysinfo.go）与拓扑接口速率
+// （topology.go 的 readIfaceCounters）共用，避免两处口径漂移。
+// 接口名取冒号前的部分并 TrimSpace（/proc/net/dev 会把名字右对齐补空格）。
+func parseNetDevAll(text string) map[string][2]int64 {
+	out := map[string][2]int64{}
 	for _, line := range strings.Split(text, "\n") {
 		colon := strings.IndexByte(line, ':')
 		if colon < 0 {
 			continue
 		}
-		if strings.TrimSpace(line[:colon]) != name {
+		name := strings.TrimSpace(line[:colon])
+		if name == "" {
 			continue
 		}
 		fields := strings.Fields(line[colon+1:])
@@ -431,9 +513,21 @@ func netDevIfCounters(text, name string) (rx, tx int64, ok bool) {
 		if err1 != nil || err2 != nil {
 			continue
 		}
-		return r, t, true
+		out[name] = [2]int64{r, t}
 	}
-	return 0, 0, false
+	return out
+}
+
+// netDevIfCounters 取 /proc/net/dev 中指定接口的 rx/tx 累计字节（接口名精确匹配）。
+func netDevIfCounters(text, name string) (rx, tx int64, ok bool) {
+	if name == "" {
+		return 0, 0, false
+	}
+	c, ok := parseNetDevAll(text)[name]
+	if !ok {
+		return 0, 0, false
+	}
+	return c[0], c[1], true
 }
 
 // parseNetDev 解析 /proc/net/dev，返回 br-lan（或 eth0 兜底）的 rx/tx 累计字节。
@@ -481,3 +575,11 @@ func goArchName() string {
 
 func round1(v float64) float64 { return math.Round(v*10) / 10 }
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
+
+// shSingleQuote 把任意字符串包成 /bin/sh 的单引号字面量（内部单引号按 POSIX 规则转义）。
+//
+// 用于把路径等外部数据安全拼进 shell 命令：含空格/引号/$/反引号时
+// 不加引号会被 shell 拆词或展开，命令参数错位（df 甚至会解析到别的分区）。
+func shSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}

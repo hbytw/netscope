@@ -22,6 +22,14 @@ const RANGES = [
   { key: '7d', label: '7 天' }
 ];
 
+// 实时 2 秒点的保留上限（按当前 range 自适应）：
+//  · 1h：只留最近 30 分钟（900 点）——更早的窗口由后端 60 秒桶覆盖，
+//    曲线形状不变，但每次 tick 重绘的点数减半；
+//  · 6h / 24h：保留最近 1 小时（1800 点）作为细粒度尾段；
+//  · 7d：实时点不参与绘制（见 mergedPoints 的 useLive），只留最近 2 分钟，
+//    避免为不可见的点持续占用内存。
+const LIVE_CAP = { '1h': 900, '6h': 1800, '24h': 1800, '7d': 60 };
+
 export async function mount(host, ctx) {
   const { api } = ctx;
   const charts = {};
@@ -41,6 +49,12 @@ export async function mount(host, ctx) {
   let urlPage = 1;
   let urlRows = [];
 
+  // liveBuf 满时按上限裁掉最旧的点（range 切换后上限可能变小，需一次性裁到目标长度）。
+  function trimLiveBuf() {
+    const cap = LIVE_CAP[range] || LIVE_CAP['1h'];
+    if (liveBuf.length > cap) liveBuf.splice(0, liveBuf.length - cap);
+  }
+
   /* ---------- 头部 ---------- */
   const rangeSeg = h('div', { class: 'segment' });
   RANGES.forEach((r) => {
@@ -50,6 +64,7 @@ export async function mount(host, ctx) {
       range = r.key;
       rangeSeg.querySelectorAll('button').forEach((x) => x.classList.remove('active'));
       b.classList.add('active');
+      trimLiveBuf();          // 新 range 的实时点上限可能更小，先裁再画
       loadTraffic();
     });
     rangeSeg.appendChild(b);
@@ -332,7 +347,8 @@ export async function mount(host, ctx) {
   // 合并「历史桶」与「实时 2 秒细粒度点」，按真实时间排序。
   // 历史桶被实时点覆盖的部分不再重复绘制，避免同一时段两种粒度叠加。
   function mergedPoints() {
-    const bucketSec = Number(data?.bucketSec) || 30;
+    // 与后端 aggregateSeries 的缺省桶宽一致（后端缺省 60s，不是 30s）
+    const bucketSec = Number(data?.bucketSec) || 60;
     const now = Math.floor(Date.now() / 1000);
     const useLive = range !== '7d';
     const live = useLive && liveBuf.length ? liveBuf.slice() : [];
@@ -669,7 +685,8 @@ export async function mount(host, ctx) {
   // tick.trendPoint 是 2 秒粒度的实时速率（bit/s），与 series 的 up/down 同单位。
   // 这里累积成 liveBuf，与历史桶按真实时间合并绘制：
   //   · 曲线整体随时间窗口右移而向前滚动
-  //   · 尾部约 30 分钟为 2 秒细粒度，实时跳动
+  //   · 尾部为 2 秒细粒度（1h 保留 30 分钟、6h/24h 保留 1 小时），实时跳动
+  //   · 更早的窗口由后端历史桶覆盖，liveBuf 上限见 LIVE_CAP
   const onTick = (ev) => {
     const t = ev.detail;
     if (destroyed || !t) return;
@@ -696,15 +713,31 @@ export async function mount(host, ctx) {
     const last = liveBuf[liveBuf.length - 1];
     if (last && last.t >= now) liveBuf[liveBuf.length - 1] = pt;
     else liveBuf.push(pt);
-    if (liveBuf.length > 1800) liveBuf.shift();               // 保留约 1 小时上限
-    if (data) renderMain();
+    trimLiveBuf();                                      // 上限按 range 自适应（见 LIVE_CAP）
+    // 页面隐藏时不做图表重建（画了也看不见）；实时点继续进缓冲，
+    // 回到前台后由下一次 tick 立即补画。
+    if (data && document.visibilityState !== 'hidden') renderMain();
   };
   document.addEventListener('gl:tick', onTick);
   cleanups.push(() => document.removeEventListener('gl:tick', onTick));
+
+  /* ---------- 定时刷新（30 秒）：只补 SSE 拿不到的历史桶 / 连接明细 ---------- */
+  // SSE tick 只带 2 秒瞬时速率与实时点；范围聚合（历史桶、分类占比、Top 域名、
+  // 连接明细）仍需定期拉取。这里加单飞保护：上一次刷新没结束就跳过本次，
+  // 避免 N1 上 7d 聚合较慢时请求一帧叠一帧（旧代码每 30 秒无条件发起）。
+  let refreshBusy = false;
+  async function refreshTrafficAndConns() {
+    if (destroyed || refreshBusy) return;
+    refreshBusy = true;
+    try {
+      await Promise.all([loadTraffic(), loadConns()]);
+    } finally {
+      refreshBusy = false;
+    }
+  }
   const refreshTimer = setInterval(() => {
     if (destroyed || document.visibilityState === 'hidden') return;
-    loadTraffic();
-    loadConns();
+    refreshTrafficAndConns();
   }, 30000);
   cleanups.push(() => clearInterval(refreshTimer));
 

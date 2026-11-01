@@ -99,9 +99,11 @@ type App struct {
 	topoRx  map[string]int64
 	topoTx  map[string]int64
 	topoRAt int64
-	proxyMu sync.Mutex
-	proxyUp bool
-	proxyAt int64
+	// topoRate 接口速率差分结果（采集循环按固定 2s 节拍写入，拓扑读路径只读快照）
+	topoRate map[string][2]int64
+	proxyMu  sync.Mutex
+	proxyUp  bool
+	proxyAt  int64
 
 	// 本机/网关保护集合（防止误封路由器自身导致断网）
 	protMu  sync.Mutex
@@ -260,6 +262,18 @@ func (a *App) ApplySwitchPatch(patch settingsPatch) (Settings, []string, []strin
 	}
 	if patch.History != nil {
 		next.History = *patch.History
+	}
+	if patch.Timezone != nil {
+		// 定时策略时区：必须是合法 IANA 名称（如 Asia/Shanghai）。
+		// 非法值会导致策略时段静默偏移，故直接拒绝而不是回退默认。
+		tz := strings.TrimSpace(*patch.Timezone)
+		if tz == "" || len(tz) > 64 {
+			return cur, nil, nil, badSetting("时区名不能为空且不超过 64 字符")
+		}
+		if _, err := time.LoadLocation(tz); err != nil {
+			return cur, nil, nil, badSetting("时区名无效：" + tz + "（示例 Asia/Shanghai）")
+		}
+		next.Timezone = tz
 	}
 	if patch.CollectIntervalSec != nil {
 		v := *patch.CollectIntervalSec
@@ -951,6 +965,8 @@ func (a *App) collectOnce() {
 	rates := a.agg.Tick(int64(interval), now)
 	a.devs.ApplyRates(rates, now)
 	a.sys.Sample(int64(interval))
+	// 接口计数固定节拍采样：拓扑节点速率不再依赖前端轮询频率的窗口均值
+	a.sampleIfaceCounters(now)
 	a.updateScale()
 	if a.cfg.Demo && a.demo != nil {
 		a.demo.Tick(now)
@@ -1335,6 +1351,24 @@ func (a *App) emitEvent(ev Event) {
 
 // ---------------- 启动 / 退出 ----------------
 
+// withRequestTimeout 给非流式请求加整体处理超时（兜底慢 handler 长期占用 goroutine/fd）。
+//
+// 为什么不设全局 WriteTimeout：/api/stream 是长连接（服务端持续 flush），
+// 全局写超时到点会把 SSE 掐断。因此按路径分流：
+//   - /api/stream 原样透传（保留 http.Flusher 等接口）；
+//   - 其余路径套 http.TimeoutHandler：超时后写 503 并结束 handler，
+//     即使 handler 内部卡住也不会一直占着连接。
+func (a *App) withRequestTimeout(next http.Handler, d time.Duration) http.Handler {
+	limited := http.TimeoutHandler(next, d, "请求处理超时")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/stream") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		limited.ServeHTTP(w, r)
+	})
+}
+
 // Run 启动全部组件并阻塞直到收到退出信号。
 func (a *App) Run() error {
 	if err := a.store.Load(); err != nil {
@@ -1427,9 +1461,13 @@ func (a *App) Run() error {
 
 	srv := &http.Server{
 		Addr:              a.cfg.Addr,
-		Handler:           a.Handler(),
+		Handler:           a.withRequestTimeout(a.Handler(), 30*time.Second),
 		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		// ReadTimeout 约束「读完整个请求」（含 body）：慢连接不能长期占住 goroutine 与 fd
+		//（N1 fd 预算小，几个慢客户端就能把连接槽吃满）。
+		// 刻意不设全局 WriteTimeout：/api/stream 是长连接，全局写超时到点会掐断 SSE。
+		ReadTimeout: 15 * time.Second,
+		IdleTimeout: 60 * time.Second,
 	}
 	errCh := make(chan error, 1)
 	go func() {
@@ -1466,6 +1504,9 @@ func (a *App) Run() error {
 	case <-time.After(3 * time.Second):
 		logf("部分协程未在 3s 内退出，强制结束")
 	}
+	// 释放按 *App 挂载的采集缓存：注册表是包级 sync.Map，不删会让每个 App
+	// （进程退出/单测反复 NewApp）永久留一份缓存。
+	a.releaseCmdCache()
 	logf("观澜 NetScope 已退出")
 	return nil
 }

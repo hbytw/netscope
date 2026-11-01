@@ -78,6 +78,15 @@ func (a *App) cmdCacheOf() *cmdCache {
 	return v.(*cmdCache)
 }
 
+// releaseCmdCache 释放本 App 的采集缓存注册项（App 退出时调用）。
+//
+// 注册表是包级 sync.Map，键是 *App：不显式删除的话，每构造一个 App
+// （进程退出路径不会回收，单测里反复 NewApp 更明显）都会永久留一份缓存，
+// 泄露 App 及其缓存内容。App.Run 的关闭流程末尾调用本方法。
+func (a *App) releaseCmdCache() {
+	cmdCacheRegistry.Delete(a)
+}
+
 // ipAddrText 返回 `ip -br addr show` 的原始输出（10s 缓存）。
 //
 // 接口采集（interfaces）与本机保护集合（protectedSet）都需要这份输出，
@@ -455,37 +464,30 @@ func parseProxyOutput(out string) bool {
 //     不用 br-lan 接口的物理计数（那是「内网互访 + 各外发链路」的总和，会重复计算）。
 func (a *App) buildTopology() topologyResp {
 	now := nowUnix()
-	a.topoMu.Lock()
-	defer a.topoMu.Unlock()
-	if now-a.topoAt < topoCacheSec && a.topoAt > 0 {
-		return a.topo
+	// 快路径：缓存未过期。只碰 topoMu（短暂），不执行命令、不碰 agg 锁。
+	if t, ok := a.cachedTopology(now); ok {
+		return t
 	}
+
+	// ---- 锁外采集 ----
+	// 下面几步都可能 fork 外部命令（ip -br addr / ip route / ss|netstat），
+	// 之前全程持 topoMu：一条慢命令会阻塞所有读拓扑的 API（含 SSE tick 路径）。
+	// 现在先在锁外采集，进锁只做 double-check 与快照替换。
+	a.ensureIfaceSample(now) // 采集循环未运行时兜底（固定节拍，不按轮询频率放大）
 	ifaces := a.interfaces()
 	routes := a.routeLines()
 	proxyUp := a.detectProxy()
 	rates := a.agg.LastRates()
 
+	// 接口速率：后台固定节拍采样写入的差分结果，读路径只读快照，不再自己读 /proc/net/dev
+	ifaceRate := a.ifaceRates()
+	rxRate, txRate := make(map[string]int64, len(ifaceRate)), make(map[string]int64, len(ifaceRate))
+	for name, r := range ifaceRate {
+		rxRate[name], txRate[name] = r[0], r[1]
+	}
+
 	// 接口默认路由出口（internet 是否 up）
 	_, hasDefault := parseDefaultRoute(routes)
-
-	// 网卡累计计数器 -> 速率（用于节点 rx/tx）
-	counters := readIfaceCounters()
-	rxRate, txRate := map[string]int64{}, map[string]int64{}
-	if a.topoRAt > 0 && now > a.topoRAt {
-		elapsed := now - a.topoRAt
-		for name, c := range counters {
-			if prev, ok := a.topoRx[name]; ok && c[0] >= prev {
-				rxRate[name] = (c[0] - prev) * 8 / elapsed
-			}
-			if prev, ok := a.topoTx[name]; ok && c[1] >= prev {
-				txRate[name] = (c[1] - prev) * 8 / elapsed
-			}
-		}
-	}
-	a.topoRx, a.topoTx, a.topoRAt = make(map[string]int64, len(counters)), make(map[string]int64, len(counters)), now
-	for name, c := range counters {
-		a.topoRx[name], a.topoTx[name] = c[0], c[1]
-	}
 
 	nodes := make([]topologyNode, 0, len(ifaces)+3)
 	links := make([]topologyLink, 0, len(ifaces)+3)
@@ -642,36 +644,105 @@ func (a *App) buildTopology() topologyResp {
 		}
 	}
 
-	a.topo = topologyResp{Nodes: nodes, Links: links}
-	a.topoAt = now
-	return a.topo
+	// 拓扑构建全部在锁外完成（纯计算），下面只做「double-check + 快照替换」：
+	// 并发请求同时错过缓存时，先到者发布，后到者直接复用它的结果，
+	// 避免把更旧的快照覆盖上去。发布后的 topo 不再被修改，读路径可无锁读取。
+	topo := topologyResp{Nodes: nodes, Links: links}
+	a.topoMu.Lock()
+	defer a.topoMu.Unlock()
+	if a.topoAt > 0 && now-a.topoAt < topoCacheSec {
+		return a.topo
+	}
+	a.topo, a.topoAt = topo, now
+	return topo
+}
+
+// cachedTopology 返回未过期的拓扑缓存（只短暂持 topoMu）。
+func (a *App) cachedTopology(now int64) (topologyResp, bool) {
+	a.topoMu.Lock()
+	defer a.topoMu.Unlock()
+	if a.topoAt > 0 && now-a.topoAt < topoCacheSec {
+		return a.topo, true
+	}
+	return topologyResp{}, false
+}
+
+// ifaceRates 返回最近一次接口速率快照（每接口 [rx,tx] bit/s）。
+//
+// 快照 map 由 sampleIfaceCounters 整体替换（从不原地修改），因此这里取到引用后
+// 调用方可以在锁外安全读取。
+func (a *App) ifaceRates() map[string][2]int64 {
+	a.topoMu.Lock()
+	defer a.topoMu.Unlock()
+	return a.topoRate
+}
+
+// ifaceSampleSec 接口计数（/proc/net/dev）的固定采样节拍（秒）。
+const ifaceSampleSec = 2
+
+// sampleIfaceCounters 按固定节拍采集 /proc/net/dev 并更新接口速率（采集循环每轮调用）。
+//
+// 拓扑节点速率原先在 buildTopology 里用「两次轮询之间的窗口均值」计算：
+// 前端轮询快慢（3s/5s/重连）会直接改变采样窗口，速率随之抖动。
+// 改为后台按 ifaceSampleSec 固定节拍采样：
+//   - topoRx/topoTx：上一轮的累计计数（差分基准）；
+//   - topoRate：本轮差分出的每接口速率，读路径只读这个快照。
+func (a *App) sampleIfaceCounters(now int64) {
+	a.sampleIfaceCountersAt(now, false)
+}
+
+// ensureIfaceSample 读路径兜底：采集循环未运行（采集关闭/停摆）时，
+// 距上次采样超过 ifaceSampleSec 就补采一次，保证拓扑仍能显示接口流量，
+// 同时不会因为前端轮询加快而提高采样频率。
+func (a *App) ensureIfaceSample(now int64) {
+	a.sampleIfaceCountersAt(now, true)
+}
+
+// sampleIfaceCountersAt 采样实现。throttled=true 时距上次采样不足 ifaceSampleSec 直接返回。
+func (a *App) sampleIfaceCountersAt(now int64, throttled bool) {
+	if throttled {
+		a.topoMu.Lock()
+		recent := a.topoRAt > 0 && now-a.topoRAt < ifaceSampleSec
+		a.topoMu.Unlock()
+		if recent {
+			return
+		}
+	}
+	// /proc/net/dev 在锁外读取（读文件不占拓扑锁）
+	counters := readIfaceCounters()
+	rates := make(map[string][2]int64, len(counters))
+	a.topoMu.Lock()
+	defer a.topoMu.Unlock()
+	if a.topoRAt > 0 && now > a.topoRAt && len(a.topoRx) > 0 {
+		elapsed := now - a.topoRAt
+		for name, c := range counters {
+			var r [2]int64
+			if prev, ok := a.topoRx[name]; ok && c[0] >= prev {
+				r[0] = (c[0] - prev) * 8 / elapsed
+			}
+			if prev, ok := a.topoTx[name]; ok && c[1] >= prev {
+				r[1] = (c[1] - prev) * 8 / elapsed
+			}
+			rates[name] = r
+		}
+	}
+	rx := make(map[string]int64, len(counters))
+	tx := make(map[string]int64, len(counters))
+	for name, c := range counters {
+		rx[name], tx[name] = c[0], c[1]
+	}
+	a.topoRx, a.topoTx, a.topoRate, a.topoRAt = rx, tx, rates, now
 }
 
 // readIfaceCounters 读取 /proc/net/dev，返回接口累计 rx/tx 字节。
+//
+// 解析复用 sysinfo.go 的 parseNetDevAll（与系统采样的 /proc/net/dev 解析同一份实现）。
 func readIfaceCounters() map[string][2]int64 {
-	out := map[string][2]int64{}
 	b, err := os.ReadFile("/proc/net/dev")
 	if err != nil {
-		return out
+		return map[string][2]int64{}
 	}
-	for _, line := range strings.Split(string(b), "\n") {
-		colon := strings.IndexByte(line, ':')
-		if colon < 0 {
-			continue
-		}
-		name := strings.TrimSpace(line[:colon])
-		fields := strings.Fields(line[colon+1:])
-		if len(fields) < 9 {
-			continue
-		}
-		rx, err1 := parseInt64(fields[0])
-		tx, err2 := parseInt64(fields[8])
-		if err1 != nil || err2 != nil {
-			continue
-		}
-		out[name] = [2]int64{rx, tx}
-	}
-	return out
+	return parseNetDevAll(string(b))
 }
 
 // syncConnNets 用拓扑采集结果更新 ConnEngine 的多网段识别：

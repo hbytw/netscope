@@ -7,10 +7,12 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"mime"
 	"net"
@@ -187,11 +189,32 @@ func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
 	return true
 }
 
+// decodeJSON 解析写请求的 JSON 请求体。
+//
+// 加固：
+//   - 媒体类型校验：docs/api.md §9 约定 POST/PUT/DELETE 一律 application/json；
+//     带其它 Content-Type（表单/纯文本/multipart）的写请求直接 415 拒绝，避免
+//     「浏览器表单/跨站简单请求」绕过预期的 JSON 通道。缺省 Content-Type 仍按 JSON
+//     解析（兼容 curl、脚本与老客户端），不会把既有集成打断。
+//   - 尾随内容校验：只接受单个 JSON 值。解出一个值后再探一次 token，若还有内容
+//     （如 `{"a":1}{"b":2}`）则拒绝 —— 原实现会静默忽略尾随数据，调用方以为
+//     参数生效，实际只应用了前半段。
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst interface{}) bool {
+	if ct := strings.TrimSpace(r.Header.Get("Content-Type")); ct != "" {
+		mt, _, err := mime.ParseMediaType(ct)
+		if err != nil || (mt != "application/json" && !strings.HasSuffix(mt, "+json")) {
+			writeErr(w, http.StatusUnsupportedMediaType, "请求体必须是 application/json", "bad_content_type")
+			return false
+		}
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(dst); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求体 JSON 解析失败", "bad_request")
+		return false
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "请求体 JSON 之后存在多余内容", "bad_request")
 		return false
 	}
 	return true
@@ -1157,6 +1180,17 @@ func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request, parts []stri
 		writeJSON(w, http.StatusOK, a.emptyTraffic(rangeParam, bucketSec))
 		return
 	}
+	// 结果缓存（key = range + 数据版本，TTL 30s）：命中时直接返回上次渲染结果，
+	// 不再重放 JSONL、也不再做分类/设备全量汇总 —— 前端 30s 轮询下这是最重的一步。
+	// 版本号在「分钟桶落盘 / 历史清理 / 设置（开关）变更」时递增，因此开关切换、
+	// 数据清空后不会返回旧结果。
+	ver := a.store.DataVersion()
+	if cached, ok := a.store.CachedTrafficResult(rangeParam, ver); ok {
+		if resp, ok := cached.(trafficResp); ok {
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+	}
 	now := nowUnix()
 	from := now - dur
 	buckets := a.bucketsForRange(from, now)
@@ -1245,10 +1279,14 @@ func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request, parts []stri
 		byDevice = byDevice[:20]
 	}
 
-	writeJSON(w, http.StatusOK, trafficResp{
+	resp := trafficResp{
 		Range: rangeParam, BucketSec: bucketSec,
 		Series: series, ByCategory: byCategory, ByDevice: byDevice, ByApp: byCategory,
-	})
+	}
+	// 记录本次结果（版本取计算开始前的 ver：期间若有新数据落盘，索引会立即失效，
+	// 下一次请求重建 —— 宁可少命中一次，也不返回跨版本的结果）。
+	a.store.PutTrafficResult(rangeParam, ver, resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // aggregateSeries 按桶宽聚合分钟桶（up/down 输出平均 bit/s，byCat 输出字节）。
@@ -1811,6 +1849,28 @@ type whitelistResp struct {
 	Items []WhitelistEntry `json:"items"`
 }
 
+// validWhitelistType 校验白名单 type：与事件 type 同构的标识符。
+//
+// 事件类型（port_scan / blacklist_domain / bad_ip …）定义在 security.go，且前端在
+// 事件缺 type 时会兜底提交 "other"，因此这里不采用封闭枚举（新增事件类型会导致
+// 对应加白请求被拒），而是收敛到「小写标识符 + 长度上限」：既能挡住垃圾/超长/注入式
+// 输入，又不会因为事件类型扩充而失效。
+func validWhitelistType(t string) bool {
+	if len(t) < 2 || len(t) > 32 {
+		return false
+	}
+	for i := 0; i < len(t); i++ {
+		c := t[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case i > 0 && (c == '_' || c >= '0' && c <= '9'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // handleWhitelist 告警白名单（用户把"判断不是威胁"的事件加白，以后不再告警）。
 //
 //	GET    /api/security/whitelist
@@ -1834,10 +1894,15 @@ func (a *App) handleWhitelist(w http.ResponseWriter, r *http.Request, parts []st
 			if !decodeJSON(w, r, &req) {
 				return
 			}
-			req.Type = strings.TrimSpace(req.Type)
+			// type 统一小写（事件 type 全小写；大小写混写会造出永远匹配不上的白名单项）
+			req.Type = strings.ToLower(strings.TrimSpace(req.Type))
 			req.Target = strings.TrimSpace(req.Target)
 			if req.Type == "" || req.Target == "" {
 				writeErr(w, http.StatusBadRequest, "type 与 target 不能为空", "bad_whitelist")
+				return
+			}
+			if !validWhitelistType(req.Type) {
+				writeErr(w, http.StatusBadRequest, "type 需为事件类型标识符（小写字母/数字/下划线，2~32 位）", "bad_whitelist")
 				return
 			}
 			if len([]rune(req.Target)) > 128 || len([]rune(req.Note)) > 128 {
@@ -1917,12 +1982,24 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request, parts []str
 // applySettingsAndRespond 应用设置补丁并按 §7.2 返回 {ok,settings,applied,revoked}。
 // 额外附带 pending（仍关闭的子开关）与 hint（中文提示），用于前端表达"总开关已开但功能未开"。
 func (a *App) applySettingsAndRespond(w http.ResponseWriter, patch settingsPatch) {
+	// 变更前的设置快照：用于区分「完全回滚」（设置未落库，仍是旧值）与
+	// 「部分成功」（已按路由器实际状态落库，需要前端刷新确认）。
+	before := a.store.Settings()
 	out, applied, revoked, err := a.ApplySwitchPatch(patch)
 	if err != nil {
 		status := http.StatusBadRequest
 		var se *switchError
 		if errors.As(err, &se) {
 			status = se.status
+		}
+		// 错误码细分：
+		//   settings_partial —— 部分动作未能回滚，设置已按路由器实际状态落库（前端应刷新确认）；
+		//   settings_failed  —— 全部回滚/未做任何变更，设置仍是旧值（前端可提示重试）。
+		if cur := a.store.Settings(); cur != before {
+			writeJSON(w, status, map[string]interface{}{
+				"error": err.Error(), "code": "settings_partial", "settings": cur,
+			})
+			return
 		}
 		writeErr(w, status, err.Error(), "settings_failed")
 		return
@@ -2001,17 +2078,19 @@ func togglePatch(key string, value bool) (settingsPatch, error) {
 
 // settingsPatch 设置补丁（开关 + 阈值，全部可选）。
 type settingsPatch struct {
-	Enabled            *bool       `json:"enabled"`
-	Collect            *bool       `json:"collect"`
-	DNSTap             *bool       `json:"dnsTap"`
-	DeviceControl      *bool       `json:"deviceControl"`
-	DomainBlock        *bool       `json:"domainBlock"`
-	Schedule           *bool       `json:"schedule"`
-	Alerts             *bool       `json:"alerts"`
-	History            *bool       `json:"history"`
-	CollectIntervalSec *int        `json:"collectIntervalSec"`
-	RetentionDays      *int        `json:"retentionDays"`
-	Alert              *alertPatch `json:"alert"`
+	Enabled            *bool `json:"enabled"`
+	Collect            *bool `json:"collect"`
+	DNSTap             *bool `json:"dnsTap"`
+	DeviceControl      *bool `json:"deviceControl"`
+	DomainBlock        *bool `json:"domainBlock"`
+	Schedule           *bool `json:"schedule"`
+	Alerts             *bool `json:"alerts"`
+	History            *bool `json:"history"`
+	CollectIntervalSec *int  `json:"collectIntervalSec"`
+	RetentionDays      *int  `json:"retentionDays"`
+	// Timezone 定时策略使用的 IANA 时区（如 Asia/Shanghai）
+	Timezone *string     `json:"timezone"`
+	Alert    *alertPatch `json:"alert"`
 }
 
 type alertPatch struct {
@@ -2055,10 +2134,80 @@ func (a *App) handleTopology(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.buildTopology())
 }
 
+// ---------------- 威胁情报更新（单飞 + 异步） ----------------
+
+// threatUpdateGate 手动更新的单飞闸门：同一时刻只允许一个更新任务在跑。
+// 一次全量拉取要跑数分钟，原实现同步执行且可并发重入 —— 多个请求会排队各跑一遍，
+// 把 N1 的 CPU/内存与出网带宽反复压满。现在：已在更新则立即返回 409 + 状态。
+type threatUpdateGate struct {
+	mu      sync.Mutex
+	running bool
+	started int64 // 本轮开始的 Unix 秒（0 = 未在跑）
+}
+
+var threatUpdateFlight = &threatUpdateGate{}
+
+// tryStart 尝试抢占更新权；已在更新时返回 false 与本轮开始时间。
+func (g *threatUpdateGate) tryStart(now int64) (bool, int64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.running {
+		return false, g.started
+	}
+	g.running = true
+	g.started = now
+	return true, now
+}
+
+// finish 释放更新权。
+func (g *threatUpdateGate) finish() {
+	g.mu.Lock()
+	g.running = false
+	g.started = 0
+	g.mu.Unlock()
+}
+
+// status 当前是否有手动更新在跑，以及开始时间。
+func (g *threatUpdateGate) status() (bool, int64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.running, g.started
+}
+
+// threatsUpdating 是否有更新在进行（手动任务或定时任务）。
+// 定时任务走 threats_update.go 的同一个更新互斥锁，这里用 TryLock 探测（探测后立即释放，
+// 不会影响真正持锁的更新），因此 /api/threats 的 updating 对两条路径都如实。
+func threatsUpdating() (bool, int64) {
+	if running, started := threatUpdateFlight.status(); running {
+		return true, started
+	}
+	if threatUpdateMu.TryLock() {
+		threatUpdateMu.Unlock()
+		return false, 0
+	}
+	return true, 0
+}
+
+// runThreatUpdateAsync 后台执行一次威胁情报库更新（单飞；panic 只丢这一轮）。
+func (a *App) runThreatUpdateAsync() {
+	defer threatUpdateFlight.finish()
+	defer func() {
+		if rec := recover(); rec != nil {
+			logf("威胁情报更新 panic: %v", rec)
+		}
+	}()
+	res := a.updateThreatsNow()
+	if !res.Ok {
+		logf("威胁情报库手动更新失败（保留旧库）: %v", res.Errors)
+		return
+	}
+	logf("威胁情报库手动更新完成：域名 %d、IP %d（错误源 %d 个）", res.Domains, res.IPs, len(res.Errors))
+}
+
 // handleThreats 开源威胁情报库。
 //
-//	GET  /api/threats           列表 + counts + updatedAt + errors
-//	POST /api/threats/update    手动拉取完整 IOC 源并更新（同步，超时 30s/源）
+//	GET  /api/threats           列表 + counts + updatedAt + errors + updating
+//	POST /api/threats/update    触发一次手动更新（异步：立即返回 202，已在更新返回 409 + 状态）
 func (a *App) handleThreats(w http.ResponseWriter, r *http.Request, parts []string) {
 	if len(parts) > 0 {
 		if parts[0] != "update" || len(parts) > 1 {
@@ -2068,13 +2217,37 @@ func (a *App) handleThreats(w http.ResponseWriter, r *http.Request, parts []stri
 		if !requireMethod(w, r, http.MethodPost) {
 			return
 		}
-		res := a.updateThreatsNow()
-		writeJSON(w, http.StatusOK, res)
+		now := nowUnix()
+		at, errs := ThreatStatus()
+		if errs == nil {
+			errs = []string{}
+		}
+		curD, curI := ThreatCounts()
+		if ok, startedAt := threatUpdateFlight.tryStart(now); !ok {
+			// 单飞：正在跑就不排队重入，直接把当前进度告诉调用方
+			// （前端据此显示"更新中"，并用 GET /api/threats 的 updating/updatedAt 跟踪）。
+			writeJSON(w, http.StatusConflict, map[string]interface{}{
+				"ok": false, "code": "threats_updating",
+				"updating": true, "startedAt": startedAt,
+				"updatedAt": at, "domains": curD, "ips": curI,
+				"errors": []string{"威胁情报库正在更新中，请稍候（完成后刷新即可看到最新条目）"},
+			})
+			return
+		}
+		go a.runThreatUpdateAsync()
+		// 异步执行：一次全量拉取要数分钟，同步接口会一直占着连接并让前端请求超时。
+		// 响应保留 UpdateResult 的字段形状（ok/updatedAt/domains/ips/errors 为「当前库」快照），
+		// 另加 accepted/updating 让调用方知道这是"已受理"，进度用 GET /api/threats 查询。
+		writeJSON(w, http.StatusAccepted, map[string]interface{}{
+			"ok": true, "accepted": true, "updating": true, "startedAt": now,
+			"updatedAt": at, "domains": curD, "ips": curI, "errors": errs,
+		})
 		return
 	}
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
+	updating, updateStartedAt := threatsUpdating()
 	// 查询窗口：q 非空 → 只返回匹配项（不返回分页列表）
 	if q := strings.TrimSpace(r.URL.Query().Get("search")); q != "" {
 		doms, ips, matchedD, matchedI, totalD, totalI := ThreatSearch(q, 500)
@@ -2089,13 +2262,15 @@ func (a *App) handleThreats(w http.ResponseWriter, r *http.Request, parts []stri
 			errs = []string{}
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"query":     q,
-			"domains":   doms,
-			"ips":       ips,
-			"counts":    map[string]int{"domains": totalD, "ips": totalI},
-			"matched":   map[string]int{"domains": matchedD, "ips": matchedI},
-			"updatedAt": updatedAt,
-			"errors":    errs,
+			"query":           q,
+			"domains":         doms,
+			"ips":             ips,
+			"counts":          map[string]int{"domains": totalD, "ips": totalI},
+			"matched":         map[string]int{"domains": matchedD, "ips": matchedI},
+			"updatedAt":       updatedAt,
+			"errors":          errs,
+			"updating":        updating,
+			"updateStartedAt": updateStartedAt,
 		})
 		return
 	}
@@ -2108,14 +2283,16 @@ func (a *App) handleThreats(w http.ResponseWriter, r *http.Request, parts []stri
 		errs = []string{}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"domains":   domains,
-		"ips":       ips,
-		"counts":    map[string]int{"domains": dCount, "ips": iCount},
-		"returned":  map[string]int{"domains": len(domains), "ips": len(ips)},
-		"limit":     limit,
-		"truncated": truncated,
-		"updatedAt": updatedAt,
-		"errors":    errs,
+		"domains":         domains,
+		"ips":             ips,
+		"counts":          map[string]int{"domains": dCount, "ips": iCount},
+		"returned":        map[string]int{"domains": len(domains), "ips": len(ips)},
+		"limit":           limit,
+		"truncated":       truncated,
+		"updatedAt":       updatedAt,
+		"errors":          errs,
+		"updating":        updating,
+		"updateStartedAt": updateStartedAt,
 	})
 }
 
@@ -2346,12 +2523,12 @@ func (a *App) serveStatic(w http.ResponseWriter, r *http.Request) {
 		p = "index.html"
 	}
 	if data, ok := a.readWebFile(p); ok {
-		writeWebFile(w, r, p, data)
+		a.writeWebFile(w, r, p, data)
 		return
 	}
 	// SPA 回退：未知路径返回 index.html（前端用 hash 路由）
 	if data, ok := a.readWebFile("index.html"); ok {
-		writeWebFile(w, r, "index.html", data)
+		a.writeWebFile(w, r, "index.html", data)
 		return
 	}
 	// 前端尚未构建时的占位页
@@ -2388,7 +2565,77 @@ func (a *App) readWebFile(name string) ([]byte, bool) {
 	return data, true
 }
 
-func writeWebFile(w http.ResponseWriter, r *http.Request, name string, data []byte) {
+// staticETagCache 内嵌静态资源的强 ETag 缓存（name -> ETag）。
+// 内嵌资源随二进制固定，按 name 缓存内容哈希，避免每次请求重算 1.3MB 的 three.module.js；
+// -web 开发模式（磁盘目录）下同名文件内容会变，故意不缓存，逐次按内容计算。
+var staticETagCache sync.Map
+
+// etagFor 计算内容强 ETag（内容 sha256 前 8 字节）。
+func (a *App) etagFor(name string, data []byte) string {
+	if a.cfg.WebDir == "" {
+		if v, ok := staticETagCache.Load(name); ok {
+			return v.(string)
+		}
+	}
+	sum := sha256.Sum256(data)
+	tag := `"` + hex.EncodeToString(sum[:8]) + `"`
+	if a.cfg.WebDir == "" {
+		staticETagCache.Store(name, tag)
+	}
+	return tag
+}
+
+// etagMatch 判断 If-None-Match 是否命中（支持逗号列表、W/ 弱前缀与 *）。
+func etagMatch(r *http.Request, tag string) bool {
+	inm := strings.TrimSpace(r.Header.Get("If-None-Match"))
+	if inm == "" {
+		return false
+	}
+	if inm == "*" {
+		return true
+	}
+	for _, part := range strings.Split(inm, ",") {
+		part = strings.TrimPrefix(strings.TrimSpace(part), "W/")
+		if part == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// hasContentHash 文件名里是否含内容哈希段（如 app.3f2a91cd.js、theme-9b1c7d2e.css）。
+// 哈希段长度 ≥8 且全为小写十六进制，视为内容指纹：内容与 URL 绑定，可长期缓存。
+func hasContentHash(base string) bool {
+	for _, seg := range strings.Split(base, ".") {
+		if len(seg) < 8 {
+			continue
+		}
+		hexOnly := true
+		for i := 0; i < len(seg); i++ {
+			c := seg[i]
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				hexOnly = false
+				break
+			}
+		}
+		if hexOnly {
+			return true
+		}
+	}
+	return false
+}
+
+// writeWebFile 输出静态资源。
+//
+// 缓存策略（首屏最大文件是 js/vendor/three.module.js，约 1.3MB）：
+//   - /js/vendor/ 下的第三方库、以及文件名带内容哈希的构建产物：public,max-age=1y,immutable
+//     —— 内容随二进制发布且与 URL 绑定，刷新/二次打开直接用本地缓存，不再重下；
+//   - 其它 JS/CSS（业务代码，内容随版本变但 URL 不变）：no-cache + ETag
+//     —— 每次协商，未变更返回 304（省掉重复传输，又不会拿到旧代码）；
+//   - 其它类型：沿用 no-cache + ETag。
+//
+// 开发模式（-web 磁盘目录）一律不设长缓存：文件随时被改写，长缓存会让浏览器看不到新内容。
+func (a *App) writeWebFile(w http.ResponseWriter, r *http.Request, name string, data []byte) {
 	ext := strings.ToLower(path.Ext(name))
 	ct := mimeTypes[ext]
 	if ct == "" {
@@ -2398,8 +2645,20 @@ func writeWebFile(w http.ResponseWriter, r *http.Request, name string, data []by
 		ct = "application/octet-stream"
 	}
 	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	tag := a.etagFor(name, data)
+	w.Header().Set("ETag", tag)
+	immutable := a.cfg.WebDir == "" &&
+		(strings.HasPrefix(name, "js/vendor/") || hasContentHash(path.Base(name)))
+	if immutable {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
+	if etagMatch(r, tag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {
 		_, _ = w.Write(data)
