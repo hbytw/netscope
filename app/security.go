@@ -162,8 +162,14 @@ func (s *Security) OnFlow(d FlowDelta, now int64, dstForeign bool) {
 			}
 		}
 	}
-	// 端口扫描：只统计「直连公网目的」的新连接。
+	// 端口扫描：只统计「设备主动发起的直连公网探测」。
 	// 排除口径（与事件文案保持一致）：
+	//   - 方向非主动发起：conntrack Key 末段为方向标记（0=设备在 orig 侧主动发起，
+	//     1=设备在 reply 侧被连接 —— 被扫描方/P2P 服务端，其 UpDelta 实为 ReplyBytes
+	//     增长、状态多为 ESTABLISHED）。只计 orig 方向才能区分扫描者与被扫描方；
+	//   - 状态非探测特征：已建立会话（ESTABLISHED/ASSURED）及握手完成后的收尾状态
+	//     （FIN_WAIT/CLOSE_WAIT/TIME_WAIT 等）说明连接已正常完成握手 —— 属正常业务
+	//     （如 P2P 客户端连多个对端），不计入；探测特征为 SYN_SENT/SYN_RECV 或状态未知；
 	//   - 流向非 direct（proxy / ZeroTier / VPN / 内网）；
 	//   - 目的地址为内网或 CGNAT(100.64.0.0/10)；
 	//   - 目的地址落在 ZeroTier/VPN 网段（接口网段 + 经虚拟接口可达的远端路由网段）；
@@ -171,6 +177,8 @@ func (s *Security) OnFlow(d FlowDelta, now int64, dstForeign bool) {
 	// ZeroTier 是 P2P：设备会同时连接多个 ZT 对等体的不同端口（9993 + 随机端口），
 	// 若把这些也算进来会误判为端口扫描，因此这里仅对直连公网目的计数。
 	scanFlow := d.New && scanPathDirect(d.Path) &&
+		flowOrigSide(d.Key) &&
+		scanProbeState(d.State) &&
 		!isPrivateOrCGNAT(d.DstIP) &&
 		!s.isVirtualDst(d.DstIP, now) &&
 		d.DPort != 9993 && d.DPort != 9994
@@ -224,21 +232,25 @@ func (s *Security) OnFlow(d FlowDelta, now int64, dstForeign bool) {
 			s.emit(Event{
 				Ts: now, Severity: "warn", Type: "port_scan",
 				Title: "疑似端口扫描：" + d.DeviceIP,
-				Detail: fmt.Sprintf("60 秒内新连接 %d 个不同公网端口（阈值 %d；仅统计直连公网目的，"+
-					"已排除代理/ZeroTier/VPN/内网流向、内网与 CGNAT 地址）",
+				Detail: fmt.Sprintf("60 秒内新连接 %d 个不同公网端口（阈值 %d；仅统计设备主动发起且"+
+					"未建立会话的直连公网探测，已排除代理/ZeroTier/VPN/内网流向、内网与 CGNAT 地址）",
 					portCount, threshold),
 				DeviceIP:   d.DeviceIP,
 				DeviceName: s.deviceName(d.DeviceIP),
 				Evidence: map[string]interface{}{
 					"ports": portCount, "portList": portList, "windowSec": 60,
 					"threshold": threshold, "sample": sample,
-					"excluded": "仅统计直连（path=direct）公网目的；代理/ZeroTier/VPN/内网流向、" +
+					"excluded": "仅统计设备主动发起（conntrack orig 方向）且未建立会话（探测特征" +
+						"SYN_SENT/未知状态）的直连公网目的；被连接方向（reply 侧/P2P 服务端）、" +
+						"已建立会话（ESTABLISHED/ASSURED 等）、代理/ZeroTier/VPN/内网流向、" +
 						"内网与 CGNAT(100.64.0.0/10) 地址、ZeroTier/VPN 网段与 9993/9994 控制端口均不计入",
 				},
 			})
 		}
 	}
-	if badPorts[d.DPort] && !isPrivateOrCGNAT(d.DstIP) {
+	// 高危端口外联：文案声称「设备主动外联」，因此只计设备主动发起（orig 方向）的
+	// 连接 —— reply 侧（Dir=1）是别人连设备、其 DPort 为对端源端口，不算外联。
+	if badPorts[d.DPort] && !isPrivateOrCGNAT(d.DstIP) && flowOrigSide(d.Key) {
 		s.emit(Event{
 			Ts: now, Severity: "info", Type: "bad_port",
 			Title:      "高危端口外联：" + d.DeviceIP,
@@ -269,6 +281,35 @@ func scanPathDirect(path string) bool {
 		return true
 	}
 	return false
+}
+
+// flowOrigSide 判断连接是否为设备主动发起（conntrack orig 方向）。
+// FlowDelta.Key 由 flowID 生成：proto-devip-sport-dstip-dport-dir，末段为方向标记
+// （0 = 设备在 orig 侧主动发起；1 = 设备在 reply 侧被连接 —— 被扫描方/P2P 服务端，
+// 其 UpDelta 实为 ReplyBytes 增长）。
+// Key 缺失（单测/演示构造的裸 FlowDelta）或末段不是方向标记时无法判定，
+// 按主动发起处理（保守沿用旧口径，不漏报真实扫描）。
+func flowOrigSide(key string) bool {
+	i := strings.LastIndexByte(key, '-')
+	if i < 0 || i+1 >= len(key) {
+		return true
+	}
+	return key[i+1:] != "1"
+}
+
+// scanProbeState 连接状态是否符合「主动探测」特征（区分扫描探测与正常会话）。
+// 只计入 SYN_SENT/SYN_RECV（已发 SYN、未完成握手）或状态未知（UDP / 单测构造）的连接；
+// ESTABLISHED/ASSURED 及握手完成后的收尾状态（FIN_WAIT/CLOSE_WAIT/TIME_WAIT 等）
+// 说明会话已正常建立 —— 属正常业务连接（如 P2P 客户端连多个对端）或被扫描方的
+// 应答方向，不计入扫描计数。
+func scanProbeState(state string) bool {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "ESTABLISHED", "ASSURED",
+		"FIN_WAIT", "FIN_WAIT1", "FIN_WAIT2", "CLOSE_WAIT", "LAST_ACK",
+		"TIME_WAIT", "CLOSE", "CLOSED", "CLOSING":
+		return false
+	}
+	return true
 }
 
 // isPrivateOrCGNAT 判断是否内网地址（RFC1918 / CGNAT 100.64.0.0/10 / 回环 / 链路本地）。

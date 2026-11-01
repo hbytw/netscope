@@ -13,6 +13,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -73,6 +74,7 @@ type Enforcer struct {
 	pending    map[string]int64 // 待重试域名 -> 下次重试时间
 
 	policyActive map[string]bool
+	protWarned   map[string]bool // 已提示过的受保护策略目标（避免 15s 轮询刷日志）
 
 	tcRootOwned    bool
 	tcIngressOwned bool
@@ -96,6 +98,7 @@ func NewEnforcer(a *App) *Enforcer {
 		domainIPs:    map[string][]uint32{},
 		dnsDesired:   map[string]bool{},
 		pending:      map[string]int64{},
+		protWarned:   map[string]bool{},
 		policyActive: map[string]bool{},
 		tcLimited:    map[string]bool{},
 	}
@@ -817,6 +820,14 @@ func (e *Enforcer) RestoreFromStore() {
 	e.limits, e.limitsAt = limits, limitsAt
 	e.mu.Unlock()
 
+	// 策略引擎关闭（如关闭「定时策略」）时，此前策略下发的域名封堵不会被
+	// ReconcilePolicies 清理（runPolicies 已跳过、开关切换处也没有域名撤销步骤）。
+	// 开关切换落库后 ApplySwitchPatch 会调用本函数，这里补上域名单清理路径；
+	// 引擎开启时本调用为空操作（域名仍由 ReconcilePolicies 按策略评估）。
+	if !e.app.policyEngineOn() {
+		e.revokePolicyDomains()
+	}
+
 	// 管控开关已开启（函数开头已检查），直接下发恢复规则
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -978,6 +989,56 @@ func (e *Enforcer) retryPendingDomains(now int64) {
 	}
 }
 
+// warnProtectedOnce 受保护目标（本机/网关/关键内网）被策略或持久化记录标记为
+// 断网/限速/封禁时记日志：目标被跳过、规则不下发，必须让管理员知道有配置无效。
+// 每个「动作+IP」只提示一次，避免 15s 轮询刷屏。
+func (e *Enforcer) warnProtectedOnce(ip, action string) {
+	key := action + "|" + ip
+	e.mu.Lock()
+	if e.protWarned == nil {
+		e.protWarned = map[string]bool{}
+	}
+	if e.protWarned[key] {
+		e.mu.Unlock()
+		return
+	}
+	e.protWarned[key] = true
+	e.mu.Unlock()
+	logf("受保护地址 %s（本机/网关/关键内网）被标记为%s，已跳过下发以避免全网中断", ip, action)
+}
+
+// revokePolicyDomains 撤销策略引擎下发的域名封堵（策略引擎关闭时调用）。
+//
+// 背景：策略评估只在 policyEngineOn() 为真时运行，关闭「定时策略」后 runPolicies
+// 不再调用 ReconcilePolicies，开关切换处也没有域名撤销步骤 —— 此前策略下发的域名
+// 会一直留在 ipset 中持续生效（issue：关闭定时策略不撤销域名封堵）。
+// dnsDomains 只包含策略下发的域名（手工封堵列表存 store.DomainBlocks，仅展示层合并、
+// 不写 ipset —— 见 BlockedDomains），因此整体清空即为撤销策略域名。
+// ipset 集合本身保留（仅 flush），待策略重新开启后由 applyDomainState 复用。
+func (e *Enforcer) revokePolicyDomains() {
+	e.mu.Lock()
+	if len(e.dnsDomains) == 0 && len(e.dnsDesired) == 0 && len(e.pending) == 0 {
+		e.mu.Unlock()
+		return
+	}
+	e.dnsDomains = map[string]bool{}
+	e.dnsDesired = map[string]bool{}
+	e.domainIPs = map[string][]uint32{}
+	e.pending = map[string]int64{}
+	e.app.shellQuiet("ipset flush " + ipsetName + " 2>/dev/null")
+	if e.chainsReady {
+		// dnsDomains 已置空，重建后 UBM 链不再挂 match-set 规则
+		//（rebuildDeviceRules 会先 -F 再按状态重挂）。
+		if _, err := e.rebuildDeviceRules(); err != nil {
+			e.mu.Unlock()
+			logf("撤销策略域名封堵规则失败: %v", err)
+			return
+		}
+	}
+	e.mu.Unlock()
+	logf("定时策略已关闭：策略下发的域名封堵已撤销")
+}
+
 // ---------------- 策略引擎 ----------------
 
 // ReconcilePolicies 每 15s 评估一次策略，下发/撤销对应规则。
@@ -988,8 +1049,14 @@ func (e *Enforcer) ReconcilePolicies(now time.Time) {
 		return
 	}
 	if !e.app.policyEngineOn() {
+		// 定时策略关闭后策略引擎不再评估，但此前策略下发的域名封堵若不清理
+		// 会永久生效（runPolicies 不再调用本函数，开关切换处也不触发域名撤销）。
+		// 这里补上收敛路径：撤销策略域名（手工封堵列表存 store，仅展示合并，不受影响）。
+		e.revokePolicyDomains()
 		return
 	}
+	// 定时策略时区换算：OpenWrt 默认 UTC，直接用本地字段评估会早 8 小时（见 scheduleTimezone）。
+	now = now.In(scheduleTimezone)
 	domainOn := e.app.domainBlockOn()
 	pols := e.app.store.Policies()
 	metas := e.app.store.AllDeviceMeta()
@@ -1005,16 +1072,33 @@ func (e *Enforcer) ReconcilePolicies(now time.Time) {
 
 	// 手动封禁的目标 IP 来自 store 持久化记录（重启恢复）
 	for ip := range e.app.store.DstBlocks() {
+		// 受保护地址（本机/网关/关键内网）即使有历史记录也不得下发，避免全网中断
+		if e.app.isProtectedIP(ip) {
+			e.warnProtectedOnce(ip, "目标封禁")
+			continue
+		}
 		desiredDst[ip] = true
 	}
 
 	for _, st := range devs {
+		// 【防线】策略引擎下发前必须过受保护地址过滤：
+		// 「全部设备 + 断网/限速」策略若把上游网关或路由器本机纳入目标，
+		// 会把整网出口 DROP 掉，造成全网中断。被保护的目标跳过并记日志。
+		prot := e.app.isProtectedIP(st.IP)
 		meta := metas[st.IP]
 		if meta.Blocked {
-			desiredBlocked[st.IP] = true
+			if prot {
+				e.warnProtectedOnce(st.IP, "断网")
+			} else {
+				desiredBlocked[st.IP] = true
+			}
 		}
 		if meta.LimitKbps.Down > 0 || meta.LimitKbps.Up > 0 {
-			desiredLimits[st.IP] = meta.LimitKbps
+			if prot {
+				e.warnProtectedOnce(st.IP, "限速")
+			} else {
+				desiredLimits[st.IP] = meta.LimitKbps
+			}
 		}
 		var matched []Policy
 		allow := false
@@ -1035,7 +1119,11 @@ func (e *Enforcer) ReconcilePolicies(now time.Time) {
 			switch p.Action {
 			case "block":
 				if len(p.Categories) == 0 && len(p.Domains) == 0 {
-					desiredBlocked[st.IP] = true
+					if prot {
+						e.warnProtectedOnce(st.IP, "断网")
+					} else {
+						desiredBlocked[st.IP] = true
+					}
 				} else if domainOn {
 					for _, cat := range p.Categories {
 						for _, d := range DomainsForCategory(cat) {
@@ -1049,7 +1137,11 @@ func (e *Enforcer) ReconcilePolicies(now time.Time) {
 					}
 				}
 			case "limit":
-				desiredLimits[st.IP] = p.LimitKbps
+				if prot {
+					e.warnProtectedOnce(st.IP, "限速")
+				} else {
+					desiredLimits[st.IP] = p.LimitKbps
+				}
 			}
 			if _, ok := hitsToSend[p.ID]; !ok {
 				hitsToSend[p.ID] = st.IP
@@ -1114,7 +1206,31 @@ func policyTargets(p Policy, ip, group string) bool {
 	return false
 }
 
+// scheduleTimezone 定时策略时段的解释时区：默认 Asia/Shanghai（东八区）。
+//
+// 背景：OpenWrt 默认系统时区是 UTC，ReconcilePolicies 收到的 time.Now() 本地字段
+// 比北京时间早 8 小时，用户设置的「22:00-06:00」会实际在 14:00 生效。
+// 策略评估入口统一把 now 换算到该时区后再取 Hour/Weekday（见 ReconcilePolicies）。
+// 可用环境变量 GUANLAN_TZ 覆盖（IANA 时区名，如 Asia/Tokyo）；
+// 解析失败或设备未安装 tzdata 时回退固定 +08:00 —— 中国大陆 1991 年后无夏令时，
+// 固定偏移与 Asia/Shanghai 语义等价。
+//
+// 时区基准说明（供 UI 文案引用）：定时策略按「Asia/Shanghai（UTC+8）」时间计算，
+// 与路由器系统时区无关。
+var scheduleTimezone = func() *time.Location {
+	if tz := strings.TrimSpace(os.Getenv("GUANLAN_TZ")); tz != "" {
+		if loc, err := time.LoadLocation(tz); err == nil {
+			return loc
+		}
+	}
+	return time.FixedZone("Asia/Shanghai", 8*3600)
+}()
+
 // scheduleActive 判断当前时间是否在策略生效时段内。支持跨零点。
+//
+// 时区基准：now 的本地字段即策略时段的解释时区。生产路径由 ReconcilePolicies
+// 先把 time.Now() 换算到 scheduleTimezone（Asia/Shanghai，可用 GUANLAN_TZ 覆盖）
+// 再传入；单测可直接构造 time.Local 时间传入，函数本身不做换算。
 func scheduleActive(sc Schedule, now time.Time) bool {
 	if len(sc.Days) > 0 {
 		iso := int(now.Weekday())

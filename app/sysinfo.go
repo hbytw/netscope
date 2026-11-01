@@ -3,7 +3,13 @@ package main
 // 系统指标采集：/proc/stat、/proc/meminfo、/proc/net/dev、/proc/loadavg、
 // thermal_zone、nf_conntrack_count、/proc/uptime、进程 RSS。
 //
-// 旁路由形态下 WAN 吞吐取 br-lan 双向合计（eth0 兜底）。
+// 接口速率口径（/proc/net/dev）：
+//   - 有真 WAN 口（默认路由出口非内网桥/隧道，复用 topology.go 的 wanIface 判定）
+//     时优先取 WAN 口计数：WAN RX=外网→用户=下行、WAN TX=用户→外网=上行，每字节只计一次；
+//   - 无真 WAN（旁路由，出口是 br-lan）时 br-lan 是中转桥：RX≈TX≈总流量（每字节计两次），
+//     此时 WanRxBps/WanTxBps 仅作总量观察，KPI 的 NetUpBps/NetDownBps 改用
+//     conntrack 归因的设备侧外发链路速率（见 Sample 内注释）。
+//
 // 演示模式生成平滑合成值，不读 /proc。
 
 import (
@@ -25,22 +31,35 @@ type SysSnapshot struct {
 	Load1      float64
 	UptimeSec  int64
 	TempC      float64
-	WanRxBps   int64
-	WanTxBps   int64
-	// NetUpBps/NetDownBps：用户视角的上下行速率（bit/s），来自 LAN 侧接口计数。
-	//   NetUpBps   = LAN RX（用户 → 路由器）= 上行
-	//   NetDownBps = LAN TX（路由器 → 用户）= 下行
-	// 这是物理真实值，作为实时速率的权威来源（conntrack 只负责归因）。
+	// WanRxBps/WanTxBps：物理接口速率（bit/s）。
+	//   有真 WAN 口：WAN 口 RX/TX 计数（RX=下行、TX=上行，每字节各计一次）；
+	//   无真 WAN（旁路由）：退化为 br-lan/eth0 中转计数，RX≈TX≈总流量（中转桥每字节计两次），
+	//   仅作总量观察，不代表用户上下行（KPI 上下行见 NetUpBps/NetDownBps）。
+	WanRxBps int64
+	WanTxBps int64
+	// NetUpBps/NetDownBps：KPI 用户视角上下行速率（bit/s），前端 upBps/downBps 直接取值。
+	//   采到真 WAN 口计数：NetUpBps = WAN TX（用户→外网）、NetDownBps = WAN RX（外网→用户）；
+	//   未采到 WAN 计数（旁路由形态，或 WAN 口临时缺失）：物理计数无法区分用户方向
+	//     （br-lan RX≈TX≈中转总量），改用 conntrack 归因的设备侧外发链路速率
+	//     （direct/proxy/zerotier/vpn 之和，不含 lan 内网互访），再经 updateScale 锚定物理量级。
+	//   两种情形都是「用户上网上下行」，不含本机/docker 流量。
 	NetUpBps   int64
 	NetDownBps int64
-	ConnCount  int64
-	DiskFreeMb int64
-	RSSMb      int64
-	Model      string
-	Arch       string
-	Kernel     string
-	OpenWrt    string
-	Hostname   string
+	// PhysTotalBps：物理基准总量（bit/s，单方向口径），仅供 updateScale 校准与总量校验，
+	// 不作为对外 KPI。conntrack 是「每连接一次计数」，而旁路由中转下 br-lan 的
+	// RX+TX 每字节计两次（直接相加比较会得到约 2 倍的系统性放大），因此这里：
+	//   有真 WAN 口（拓扑判定，与本轮计数是否读到无关）：RX+TX，
+	//     WAN 或 br-lan/eth0 每字节都只在其方向上计一次；
+	//   无真 WAN（旁路由）：(br-lan RX + br-lan TX)/2（取均值还原单方向总量）。
+	PhysTotalBps int64
+	ConnCount    int64
+	DiskFreeMb   int64
+	RSSMb        int64
+	Model        string
+	Arch         string
+	Kernel       string
+	OpenWrt      string
+	Hostname     string
 }
 
 // SysInfo 系统采样器。
@@ -55,6 +74,7 @@ type SysInfo struct {
 	prevCPU   cpuTimes
 	prevNetRx int64
 	prevNetTx int64
+	prevIface string // 上次差分所用接口（WAN 口出现/消失时重新登记基准）
 	havePrev  bool
 
 	diskFreeMb int64
@@ -144,29 +164,81 @@ func (s *SysInfo) Sample(intervalSec int64) {
 		n, _ := atoi64OK(trimSpaceBytes(b))
 		snap.ConnCount = n
 	}
-	// 接口速率（br-lan 优先，eth0 兜底）
+	// 接口速率（真 WAN 口优先；无真 WAN 的旁路由形态用 br-lan/eth0 中转计数）
+	usedWAN := false
 	if b, err := os.ReadFile("/proc/net/dev"); err == nil {
-		rx, tx, ok := parseNetDev(string(b))
-		if ok {
-			if s.havePrev && intervalSec > 0 {
-				drx := rx - s.prevNetRx
-				dtx := tx - s.prevNetTx
+		text := string(b)
+		// 真 WAN 口判定：复用 topology.go 的 wanIface（默认路由出口且非内网桥/隧道），
+		// interfaces()/routeLines() 走 10s 共享命令缓存，采样周期内不会反复 fork。
+		wanName := ""
+		if s.app != nil {
+			wanName = wanIface(s.app.interfaces(), s.app.routeLines())
+		}
+		var physRx, physTx int64
+		iface := ""
+		if wanName != "" {
+			if rx, tx, ok := netDevIfCounters(text, wanName); ok {
+				physRx, physTx, iface, usedWAN = rx, tx, wanName, true
+			}
+		}
+		if iface == "" {
+			if rx, tx, ok := netDevIfCounters(text, "br-lan"); ok {
+				physRx, physTx, iface = rx, tx, "br-lan"
+			} else if rx, tx, ok := netDevIfCounters(text, "eth0"); ok {
+				physRx, physTx, iface = rx, tx, "eth0"
+			}
+		}
+		if iface != "" {
+			// prevIface 记录上次差分基准：WAN 口出现/消失时基准切换，
+			// 跳过一次差分重新登记，避免两个不同计数器相减产生假尖峰。
+			if s.havePrev && s.prevIface == iface && intervalSec > 0 {
+				drx := physRx - s.prevNetRx
+				dtx := physTx - s.prevNetTx
 				if drx < 0 {
 					drx = 0
 				}
 				if dtx < 0 {
 					dtx = 0
 				}
-				snap.WanRxBps = drx * 8 / intervalSec
-				snap.WanTxBps = dtx * 8 / intervalSec
-				// 用户视角：LAN RX = 上行，LAN TX = 下行
-				snap.NetUpBps = snap.WanRxBps
-				snap.NetDownBps = snap.WanTxBps
+				rxBps := drx * 8 / intervalSec
+				txBps := dtx * 8 / intervalSec
+				snap.WanRxBps = rxBps
+				snap.WanTxBps = txBps
+				if wanName != "" {
+					// 有真 WAN 口的形态：所采接口（WAN 优先；WAN 计数临时读不到时
+					// br-lan/eth0 兜底）每个字节只在其方向上计一次，与 conntrack 同量纲。
+					snap.PhysTotalBps = rxBps + txBps
+					if usedWAN {
+						// WAN RX=外网→用户=下行，TX=用户→外网=上行
+						snap.NetDownBps = rxBps
+						snap.NetUpBps = txBps
+					}
+				} else {
+					// 无真 WAN（旁路由）：br-lan 是中转桥，RX≈TX≈总流量（每字节计两次），
+					// 物理基准取单方向均值；KPI 上下行改由 conntrack path 归因（见下）
+					snap.PhysTotalBps = (rxBps + txBps) / 2
+				}
 			}
-			s.prevNetRx, s.prevNetTx = rx, tx
+			s.prevNetRx, s.prevNetTx, s.prevIface = physRx, physTx, iface
 		}
 	}
 	s.havePrev = true
+	// KPI 上下行（未采到 WAN 计数时）：conntrack 归因的设备侧外发链路速率
+	//（direct/proxy/zerotier/vpn 之和，不含 lan 内网互访与本机流量），
+	// 再由 updateScale 锚定到 PhysTotalBps 的物理量级。
+	// 旁路由形态下物理计数只做总量校验（br-lan 无法区分用户方向）。
+	if !usedWAN && s.app != nil && s.app.agg != nil {
+		var kpiUp, kpiDown int64
+		for p, v := range s.app.agg.LastRates().PathBps {
+			if p == "lan" || p == "docker" {
+				continue
+			}
+			kpiUp += v[0]
+			kpiDown += v[1]
+		}
+		snap.NetUpBps = kpiUp
+		snap.NetDownBps = kpiDown
+	}
 	// 磁盘占用（60s 更新一次，避免频繁 fork df）
 	s.sampleN++
 	if s.sampleN%30 == 1 || time.Now().Unix()-s.diskAt > 60 {
@@ -249,6 +321,9 @@ func (s *SysInfo) sampleDemo(intervalSec int64) {
 		snap.WanTxBps = r.UpBps
 		snap.NetUpBps = r.UpBps
 		snap.NetDownBps = r.DownBps
+		// 演示模式无物理计数：校准基准直接取上下行合计（与 ct 同量纲，
+		// updateScale 会得到固定点系数 ≈1，保持展示值不变）
+		snap.PhysTotalBps = r.UpBps + r.DownBps
 	}
 	s.mu.Lock()
 	s.s = snap
@@ -260,7 +335,9 @@ func (s *SysInfo) queryDiskFree() int64 {
 	if s.app == nil {
 		return 0
 	}
-	out, err := s.app.shellQuietOutput("df -k " + s.app.cfg.DataDir + " 2>/dev/null | tail -1")
+	// 采集类命令：3s 超时（df 是本地读取，正常毫秒级完成）。
+	// 一条慢命令若按默认 60s 超时执行，会占住 execMu 把采集一起冻结。
+	out, err := s.app.shellQuietOutput("df -k "+s.app.cfg.DataDir+" 2>/dev/null | tail -1", 3*time.Second)
 	if err != nil {
 		return 0
 	}
@@ -332,15 +409,17 @@ func parseMemInfo(text string) (totalKB, availKB int64, ok bool) {
 	return totalKB, availKB, totalKB > 0
 }
 
-// parseNetDev 解析 /proc/net/dev，返回 br-lan（或 eth0）的 rx/tx 累计字节。
-func parseNetDev(text string) (rx, tx int64, ok bool) {
+// netDevIfCounters 解析 /proc/net/dev 中指定接口的 rx/tx 累计字节（按接口名精确匹配）。
+func netDevIfCounters(text, name string) (rx, tx int64, ok bool) {
+	if name == "" {
+		return 0, 0, false
+	}
 	for _, line := range strings.Split(text, "\n") {
 		colon := strings.IndexByte(line, ':')
 		if colon < 0 {
 			continue
 		}
-		name := strings.TrimSpace(line[:colon])
-		if name != "br-lan" && name != "eth0" {
+		if strings.TrimSpace(line[:colon]) != name {
 			continue
 		}
 		fields := strings.Fields(line[colon+1:])
@@ -352,13 +431,17 @@ func parseNetDev(text string) (rx, tx int64, ok bool) {
 		if err1 != nil || err2 != nil {
 			continue
 		}
-		// br-lan 优先；若同时存在则 br-lan 直接返回
-		rx, tx, ok = r, t, true
-		if name == "br-lan" {
-			return rx, tx, true
-		}
+		return r, t, true
 	}
-	return rx, tx, ok
+	return 0, 0, false
+}
+
+// parseNetDev 解析 /proc/net/dev，返回 br-lan（或 eth0 兜底）的 rx/tx 累计字节。
+func parseNetDev(text string) (rx, tx int64, ok bool) {
+	if rx, tx, ok = netDevIfCounters(text, "br-lan"); ok {
+		return rx, tx, true
+	}
+	return netDevIfCounters(text, "eth0")
 }
 
 // readProcessRSSMb 读取当前进程 RSS（MB）。

@@ -9,8 +9,12 @@ package main
 //   - ThreatFox Community API 需要 Auth-Key（401），通过环境变量 THREATFOX_AUTH_KEY
 //     配置后启用；未配置时跳过并记录 warning，其余公开源照常更新。
 //   - URLhaus/Feodo/Spamhaus 使用公开镜像/导出；PhishTank 需 API key（403）暂不启用。
-//   - 加载上限：域名 50000、IP/CIDR 30000；超限按 confidence 降序截断保留高置信度，
-//     但内置 curated 规则（内置黑名单）标记为不可裁剪，始终保留。
+//   - 加载上限：域名 50000、IP/CIDR 30000；超限按「源配额」截断（每个源先均分上限、
+//     用不完的份额回收再分），组内才按 confidence 降序保留 —— 避免 URLhaus 等
+//     conf=100 大源按纯置信度独占上限、其它源与内置快照被整体丢弃且此后进不来（库冻结）。
+//     内置 curated 规则（内置黑名单）不受配额限制、始终全额保留。
+//   - 内存（N1 仅 1GB）：并发拉取限 2 路、单源解析条数设上限、落盘/加载走流式读写，
+//     更新峰值内存控制在 ~30MB 量级。
 
 import (
 	"bufio"
@@ -36,6 +40,15 @@ const (
 	threatFetchTimeout       = 30 * time.Second
 	threatFetchMaxBytes      = 32 * 1024 * 1024 // 单源响应上限
 	threatUpdateFile         = "threats.json"
+
+	// 内存保护（N1 仅 1GB，更新峰值要求 <30MB）：
+	//   - 单源解析条数上限：解析结果先按源截断再进合并，避免全量 IOC 同时驻留；
+	//     取库总上限的一半，正常情况下各源均分（50000/6≈8300）远低于该值，
+	//     只有半数以上源失败时才触顶，此时仍能保留可用规模。
+	//   - 并发拉取上限：9 路并发 × 32MB 响应缓冲是原内存峰值的主要来源。
+	threatPerSourceDomainCap = maxThreatDomains / 2 // 单源域名上限 25000
+	threatPerSourceIPCap     = maxThreatIPs / 2     // 单源 IP/CIDR 上限 15000
+	threatUpdateParallel     = 2                    // 并发拉取源数（内存/耗时折中）
 )
 
 // UpdateResult 一次情报库更新结果。
@@ -493,17 +506,19 @@ func parseThreatFoxJSON(src threatSource, data []byte) ([]ThreatRule, error) {
 	return out, nil
 }
 
-// mergeThreatRules 合并：内置博彩/矿池域名 + 现有库 + 抓取条目，去重 + 置信度截断 + 上限。
+// mergeThreatRules 合并：内置博彩/矿池域名 + 现有库 + 抓取条目，去重 + 按源配额截断 + 上限。
 func mergeThreatRules(fetchedDomains, fetchedIPs []ThreatRule) ([]ThreatRule, []ThreatRule) {
 	return mergeThreatRulesWithBase(nil, nil, fetchedDomains, fetchedIPs)
 }
 
 func mergeThreatRulesWithBase(baseD, baseI, fetchedD, fetchedI []ThreatRule) ([]ThreatRule, []ThreatRule) {
-	// 域名：收集到 2 倍上限后按置信度裁剪，避免异常源撑爆内存
+	// 域名：收集顺序 curated → 本次抓取 → 现有库。
+	// 抓取排在现有库前：同源同置信度时新数据优先（稳定排序保持插入序），
+	// 避免「现有库条目永远钉死配额、新 IOC 进不来」的库内冻结。
+	// 超限时按源配额截断（而非纯置信度全局截断，防止 URLhaus conf=100 独占上限）。
 	doms := make([]ThreatRule, 0, maxThreatDomains)
 	seenD := make(map[string]bool, len(fetchedD)+len(baseD)+64)
-	var addD func(r ThreatRule)
-	addD = func(r ThreatRule) {
+	addD := func(r ThreatRule) {
 		t := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(r.Target, ".")))
 		if t == "" || seenD[t] || !threatValidDomain(t) {
 			return
@@ -515,20 +530,20 @@ func mergeThreatRulesWithBase(baseD, baseI, fetchedD, fetchedI []ThreatRule) ([]
 		seenD[t] = true
 		doms = append(doms, r)
 		if len(doms) >= maxThreatDomains*2 {
-			doms = truncateByConfidence(doms, maxThreatDomains)
+			doms = truncateBySourceQuota(doms, maxThreatDomains)
 		}
 	}
 	for _, r := range curatedThreatRules() {
 		addD(r)
 	}
-	for _, r := range baseD {
-		addD(r)
-	}
 	for _, r := range fetchedD {
 		addD(r)
 	}
+	for _, r := range baseD {
+		addD(r)
+	}
 	if len(doms) > maxThreatDomains {
-		doms = truncateByConfidence(doms, maxThreatDomains)
+		doms = truncateBySourceQuota(doms, maxThreatDomains)
 	}
 	sort.Slice(doms, func(i, j int) bool { return doms[i].Target < doms[j].Target })
 
@@ -558,67 +573,191 @@ func mergeThreatRulesWithBase(baseD, baseI, fetchedD, fetchedI []ThreatRule) ([]
 		seenI[t] = true
 		ips = append(ips, r)
 		if len(ips) >= maxThreatIPs*2 {
-			ips = truncateByConfidence(ips, maxThreatIPs)
+			ips = truncateBySourceQuota(ips, maxThreatIPs)
 		}
-	}
-	for _, r := range baseI {
-		addI(r)
 	}
 	for _, r := range fetchedI {
 		addI(r)
 	}
+	for _, r := range baseI {
+		addI(r)
+	}
 	if len(ips) > maxThreatIPs {
-		ips = truncateByConfidence(ips, maxThreatIPs)
+		ips = truncateBySourceQuota(ips, maxThreatIPs)
 	}
 	sort.Slice(ips, func(i, j int) bool { return ips[i].Target < ips[j].Target })
 	return doms, ips
 }
 
 // isCuratedRule 判断是否为内置 curated 规则（内置黑名单：矿池/赌博域名）。
-// 这类规则置信度为 0（未知），但按"内置黑名单始终保留"的约定不可被裁剪。
+// 这类规则置信度为 0（未知），但按"内置黑名单始终保留"的约定不受配额限制。
 func isCuratedRule(r ThreatRule) bool {
 	return strings.HasPrefix(r.Source, "内置黑名单")
 }
 
-// truncateByConfidence 超限时按置信度降序保留（同置信度保留原顺序），再按需截断。
-// 内置 curated 规则标记为不可裁剪：即使置信度为 0 也始终保留，
-// 并为它们预留名额（总条数仍不超过 max）。
-func truncateByConfidence(rules []ThreatRule, max int) []ThreatRule {
-	keep := make([]ThreatRule, 0, len(rules))
-	trim := make([]ThreatRule, 0, len(rules))
+// curatedSourceKey 内置 curated 规则在按源分组时使用的固定组名。
+const curatedSourceKey = "内置黑名单"
+
+// threatSourceKey 规则 → 源分组键（按源配额截断用）。
+// ThreatFox/Feodo 等 Source 带 malware 后缀，按前缀归组；
+// 未知来源按完整 Source 独立成组（不与已知源抢占份额）。
+func threatSourceKey(r ThreatRule) string {
+	if isCuratedRule(r) {
+		return curatedSourceKey
+	}
+	s := r.Source
+	for _, p := range []string{
+		"ThreatFox", "Abuse.ch URLhaus", "Phishing.Database", "Feodo Tracker",
+		"Spamhaus DROP", "AbuseIPDB", "IPsum", "C2IntelFeeds",
+	} {
+		if strings.HasPrefix(s, p) {
+			return p
+		}
+	}
+	return s
+}
+
+// allocateSourceQuotas max-min 公平配额：各源先均分上限，需求不超过份额的源
+// 取走实际数量并把剩余份额回收，再分给仍有余量的源，直到分完或所有源满足。
+// 保证总和不超过 max；输入总量 ≤ max 时各源全额分配。
+func allocateSourceQuotas(counts map[string]int, max int) map[string]int {
+	quotas := make(map[string]int, len(counts))
+	if max <= 0 {
+		return quotas
+	}
+	var list []string
+	total := 0
+	for s, n := range counts {
+		if n > 0 {
+			list = append(list, s)
+			total += n
+		}
+	}
+	sort.Strings(list) // 确定性顺序，避免配额随 map 遍历顺序抖动
+	if total <= max {
+		for _, s := range list {
+			quotas[s] = counts[s]
+		}
+		return quotas
+	}
+	remaining := max
+	for len(list) > 0 && remaining > 0 {
+		share := remaining / len(list)
+		if share <= 0 {
+			// 剩余不足每源 1 条：按确定性顺序逐条分完即止
+			for _, s := range list {
+				if remaining <= 0 {
+					break
+				}
+				quotas[s]++
+				remaining--
+			}
+			break
+		}
+		var next []string
+		for _, s := range list {
+			if counts[s] <= share {
+				quotas[s] = counts[s]
+				remaining -= counts[s]
+			} else {
+				next = append(next, s)
+			}
+		}
+		if len(next) == len(list) {
+			// 所有剩余源都超过均分份额：均分后收尾
+			for _, s := range list {
+				quotas[s] = share
+			}
+			break
+		}
+		list = next
+	}
+	return quotas
+}
+
+// truncateBySourceQuota 超限时按源配额截断：
+// 内置 curated（内置黑名单快照）不受配额限制、全额保留；剩余上限在各源间
+// max-min 均分（防止 URLhaus conf=100 这类大源按纯置信度独占全部上限，
+// 导致 Phishing/C2/内置快照被整体丢弃且此后永远进不来——库永久冻结）；
+// 组内再按置信度降序保留（稳定排序：同置信度保持原顺序，调用方已把
+// 本次抓取排在现有库之前，故同置信度下新数据优先）。
+func truncateBySourceQuota(rules []ThreatRule, max int) []ThreatRule {
+	if max <= 0 {
+		return nil
+	}
+	if len(rules) <= max {
+		return rules
+	}
+	groups := make(map[string][]ThreatRule, 8)
+	var order []string
 	for _, r := range rules {
-		if isCuratedRule(r) {
-			keep = append(keep, r)
+		k := threatSourceKey(r)
+		if _, ok := groups[k]; !ok {
+			order = append(order, k)
+		}
+		groups[k] = append(groups[k], r)
+	}
+	sort.Strings(order)
+
+	out := make([]ThreatRule, 0, max)
+	// 内置 curated 全额保留（快照量小，恒远低于上限）
+	if g, ok := groups[curatedSourceKey]; ok {
+		keep := len(g)
+		if keep > max {
+			keep = max
+		}
+		out = append(out, g[:keep]...)
+		max -= keep
+	}
+	if max <= 0 {
+		return out
+	}
+	counts := make(map[string]int, len(order))
+	for _, s := range order {
+		if s == curatedSourceKey {
 			continue
 		}
-		trim = append(trim, r)
+		counts[s] = len(groups[s])
 	}
-	sort.SliceStable(trim, func(i, j int) bool { return trim[i].Confidence > trim[j].Confidence })
-	limit := max - len(keep)
-	if limit < 0 {
-		limit = 0
+	quotas := allocateSourceQuotas(counts, max)
+	for _, s := range order {
+		if s == curatedSourceKey {
+			continue
+		}
+		g := groups[s]
+		q := quotas[s]
+		if q > len(g) {
+			q = len(g)
+		}
+		if q <= 0 {
+			continue
+		}
+		sort.SliceStable(g, func(i, j int) bool { return g[i].Confidence > g[j].Confidence })
+		out = append(out, g[:q]...)
 	}
-	if len(trim) > limit {
-		trim = trim[:limit]
-	}
-	out := make([]ThreatRule, 0, len(keep)+len(trim))
-	out = append(out, keep...)
-	out = append(out, trim...)
 	return out
 }
 
 // saveThreatFile 原子写 threats.json（tmp + rename）。
+// 用 json.Encoder 流式写入临时文件，避免 json.Marshal 整段序列化缓冲
+// （5 万域名 + 3 万 IP 约 10~20MB，是更新内存峰值的一部分）。
 func saveThreatFile(path string, doms, ips []ThreatRule, at int64) error {
 	f := threatFile{UpdatedAt: at, Domains: doms, IPs: ips}
-	data, err := json.Marshal(&f)
-	if err != nil {
-		return err
-	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if err := json.NewEncoder(out).Encode(&f); err != nil {
+		out.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
@@ -629,13 +768,15 @@ func saveThreatFile(path string, doms, ips []ThreatRule, at int64) error {
 }
 
 // LoadThreats 启动时加载 <data>/threats.json；失败（缺失/损坏）回退内置静态库。
+// 流式解码：避免 os.ReadFile 把整个文件（10~20MB）再整段读进内存。
 func LoadThreats(path string) error {
-	data, err := os.ReadFile(path)
+	fh, err := os.Open(path)
 	if err != nil {
 		return err
 	}
+	defer fh.Close()
 	var f threatFile
-	if err := json.Unmarshal(data, &f); err != nil {
+	if err := json.NewDecoder(fh).Decode(&f); err != nil {
 		resetThreatLibraryForTest()
 		return err
 	}
@@ -681,10 +822,14 @@ func updateThreatsWithFetcher(dataDir string, demo bool, fetch func(threatSource
 	}
 	outs := make(chan fetchOut, len(threatSources))
 	var wg sync.WaitGroup
+	// 并发拉取限流：9 路并发各自持有响应缓冲是更新内存峰值的主要来源（N1 仅 1GB）
+	sem := make(chan struct{}, threatUpdateParallel)
 	for _, src := range threatSources {
 		wg.Add(1)
 		go func(src threatSource) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			res := fetchOut{name: src.name}
 			var lastErr error
 			for _, u := range src.urls {
@@ -699,14 +844,24 @@ func updateThreatsWithFetcher(dataDir string, demo bool, fetch func(threatSource
 					continue
 				}
 				for _, r := range rules {
+					// 单源解析条数上限：先截断再进合并，避免全量 IOC 同时驻留内存
+					if len(res.doms) >= threatPerSourceDomainCap && len(res.ips) >= threatPerSourceIPCap {
+						break
+					}
 					if strings.Contains(r.Target, "/") {
-						res.ips = append(res.ips, r)
+						if len(res.ips) < threatPerSourceIPCap {
+							res.ips = append(res.ips, r)
+						}
 						continue
 					}
 					if addr, err := netip.ParseAddr(r.Target); err == nil && addr.Is4() {
-						res.ips = append(res.ips, r)
+						if len(res.ips) < threatPerSourceIPCap {
+							res.ips = append(res.ips, r)
+						}
 					} else if threatValidDomain(r.Target) {
-						res.doms = append(res.doms, r)
+						if len(res.doms) < threatPerSourceDomainCap {
+							res.doms = append(res.doms, r)
+						}
 					}
 				}
 				lastErr = nil

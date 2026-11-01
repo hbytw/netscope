@@ -551,10 +551,12 @@ func (g *Agg) Tick(intervalSec, now int64) IntervalRates {
 }
 
 // SetScale 设置校准系数（conntrack 权重 → 物理速率的比例）。
+// 限幅 [0.05, 20]：conntrack 表被清空/归因骤降时的极端比值（实测可达 1e3~1e5）
+// 视为异常样本直接丢弃，避免全站速率被放大数个数量级。
 func (g *Agg) SetScale(f float64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if f <= 0 || f > 1e9 {
+	if f < 0.05 || f > 20 {
 		return
 	}
 	g.scale = f

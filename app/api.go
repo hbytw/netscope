@@ -662,7 +662,9 @@ func (a *App) buildOverview() overviewResp {
 			Online: online, Devices: len(devJSON), Conns: sys.ConnCount,
 			NewConns: rates.NewConnsLastMin, DNSQps: round1f(a.dns.QPS(now)),
 			Alerts: a.store.UnackedCount(),
-			// 实时上下行用 LAN 接口计数（物理真实）；conntrack 速率仅用于归因统计
+			// 实时上下行：有真 WAN 口时取 WAN 接口计数（每字节只计一次）；
+			// 旁路由（无 WAN）时取 conntrack 归因的外发链路速率，
+			// 物理 br-lan 计数只做总量校验（中转桥每字节进出各计一次，不能直接当上下行）。
 			UpBps: sys.NetUpBps, DownBps: sys.NetDownBps,
 			RiskLevel: a.sec.Level(),
 		},
@@ -840,9 +842,17 @@ func (a *App) handleDevices(w http.ResponseWriter, r *http.Request, parts []stri
 		now := nowUnix()
 		domAgg := a.dns.DeviceTopDomains(ip, now-6*3600, 20)
 		topDomains := make([]deviceDomain, 0, len(domAgg))
+		// 域名字节按校准系数缩放，与设备/分类流量口径一致
+		dsc := a.agg.Scale()
+		scDomBytes := func(v int64) int64 {
+			if dsc > 0 && dsc != 1 {
+				return int64(float64(v) * dsc)
+			}
+			return v
+		}
 		for _, d := range domAgg {
 			topDomains = append(topDomains, deviceDomain{
-				Domain: d.Domain, Label: d.Label, Category: d.Category, Hits: d.Hits, Bytes: d.Bytes,
+				Domain: d.Domain, Label: d.Label, Category: d.Category, Hits: d.Hits, Bytes: scDomBytes(d.Bytes),
 			})
 		}
 		dstBytes := a.agg.DeviceDstBytes(ip)
@@ -988,6 +998,12 @@ func (a *App) handleDevices(w http.ResponseWriter, r *http.Request, parts []stri
 		dj, _, _, _ := a.deviceFor(ip)
 		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "applied": applied, "device": dj})
 	case "forget":
+		// 与同组其它 action（alias/group/block/limit）保持一致：先校验设备存在，
+		// 避免给任意 IP 写入 hidden 元数据
+		if _, _, _, ok := a.deviceFor(ip); !ok {
+			writeErr(w, http.StatusNotFound, "设备不存在", "not_found")
+			return
+		}
 		a.store.UpdateDeviceMeta(ip, func(m *DeviceMeta) { m.Hidden = true })
 		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "applied": []string{}})
 	default:
@@ -1299,6 +1315,15 @@ func (a *App) handleTrafficDomains(w http.ResponseWriter, r *http.Request) {
 	now := nowUnix()
 	list := a.dns.TopDomains(now-dur, limit)
 	metas := a.store.AllDeviceMeta()
+	// 域名字节来自 dns.AddBytes（conntrack 原始值），与其他流量出口一样按校准系数缩放，
+	// 否则同一页「域名流量」与「分类/设备流量」口径不一致（相差 sc 倍）。
+	sc := a.agg.Scale()
+	scBytes := func(v int64) int64 {
+		if sc > 0 && sc != 1 {
+			return int64(float64(v) * sc)
+		}
+		return v
+	}
 	out := make([]domainEntryJSON, 0, len(list))
 	for _, d := range list {
 		devList := make([]domainDevBriefJSON, 0, len(d.DevList))
@@ -1310,12 +1335,12 @@ func (a *App) handleTrafficDomains(w http.ResponseWriter, r *http.Request) {
 			}
 			devList = append(devList, domainDevBriefJSON{
 				IP: dev.IP, Name: name, Alias: metas[dev.IP].Alias,
-				Hits: dev.Hits, Bytes: dev.Bytes, LastSeen: dev.LastSeen,
+				Hits: dev.Hits, Bytes: scBytes(dev.Bytes), LastSeen: dev.LastSeen,
 			})
 		}
 		out = append(out, domainEntryJSON{
 			Domain: d.Domain, Label: d.Label, Category: d.Category,
-			Hits: d.Hits, Bytes: d.Bytes, Devices: d.Devices, LastSeen: d.LastSeen,
+			Hits: d.Hits, Bytes: scBytes(d.Bytes), Devices: d.Devices, LastSeen: d.LastSeen,
 			DeviceList: devList,
 		})
 	}
@@ -2227,7 +2252,7 @@ func (a *App) buildTick(now int64, full bool, last map[string]tickDevice) tickFr
 			Online: countOnline(states, metas), Devices: visible,
 			Conns: sys.ConnCount, NewConns: rates.NewConnsLastMin,
 			DNSQps: round1f(a.dns.QPS(now)), Alerts: a.store.UnackedCount(),
-			// 实时上下行用 LAN 接口计数（物理真实）；conntrack 速率仅用于归因统计
+			// 有真 WAN 取 WAN 计数；旁路由取 conntrack 外发链路速率（详见 buildOverview 注释）
 			UpBps: sys.NetUpBps, DownBps: sys.NetDownBps, RiskLevel: a.sec.Level(),
 		},
 		Sys:         sysToJSON(sys),

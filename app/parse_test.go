@@ -37,7 +37,7 @@ func TestParseConntrackLine(t *testing.T) {
 			wantDst:   "112.252.211.104",
 			wantOrig:  520,
 			wantReply: 20480,
-			wantKey:   "tcp-192.168.1.31-11223-112.252.211.104-17776-0",
+			wantKey:   "tcp-192.168.1.31-11223-112.252.211.104-17776",
 		},
 		{
 			name:      "UNREPLIED 只有原始方向",
@@ -59,7 +59,7 @@ func TestParseConntrackLine(t *testing.T) {
 			wantDst:   "192.168.1.32",
 			wantOrig:  120,
 			wantReply: 30,
-			wantKey:   "udp-192.168.1.32-5353-8.8.8.8-53-1",
+			wantKey:   "udp-192.168.1.32-5353-8.8.8.8-53",
 		},
 		{
 			name:   "无关行",
@@ -291,7 +291,7 @@ ipv4 2 tcp 6 61 ESTABLISHED src=192.168.1.33 dst=7.7.7.7 sport=4000 dport=53 pac
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
-	d1, ok := deltas["tcp-192.168.1.31-1000-1.2.3.4-443-0"]
+	d1, ok := deltas["tcp-192.168.1.31-1000-1.2.3.4-443"]
 	if !ok {
 		t.Fatalf("缺少第一条 flow 的增量: %v", deltas)
 	}
@@ -301,14 +301,14 @@ ipv4 2 tcp 6 61 ESTABLISHED src=192.168.1.33 dst=7.7.7.7 sport=4000 dport=53 pac
 	if d1.New || d1.Baseline {
 		t.Errorf("已有连接不应标记 New/Baseline: %+v", d1)
 	}
-	d3, ok := deltas["tcp-192.168.1.33-4000-7.7.7.7-53-0"]
+	d3, ok := deltas["tcp-192.168.1.33-4000-7.7.7.7-53"]
 	if !ok {
 		t.Fatalf("缺少新 flow 的增量: %v", deltas)
 	}
 	if !d3.New || d3.UpDelta != 10 || d3.DownDelta != 20 {
 		t.Errorf("新 flow 增量 = %+v，期望 New 且 10/20", d3)
 	}
-	if len(gone) != 1 || gone[0] != "tcp-192.168.1.32-2000-5.6.7.8-80-0" {
+	if len(gone) != 1 || gone[0] != "tcp-192.168.1.32-2000-5.6.7.8-80" {
 		t.Errorf("消失 flow = %v", gone)
 	}
 }
@@ -1016,7 +1016,7 @@ func TestConnMultiNet(t *testing.T) {
 			wantDev:   "192.168.99.16",
 			wantPath:  "zerotier",
 			wantIface: "zt6vwy3rne",
-			wantKey:   "tcp-192.168.99.16-5000-10.0.2.5-445-0",
+			wantKey:   "tcp-192.168.99.16-5000-10.0.2.5-445",
 		},
 		{
 			name:      "ZeroTier 远端 LAN 网段",
@@ -1024,7 +1024,7 @@ func TestConnMultiNet(t *testing.T) {
 			wantDev:   "192.168.99.16",
 			wantPath:  "zerotier",
 			wantIface: "zt6vwy3rne",
-			wantKey:   "tcp-192.168.99.16-5001-192.168.2.20-445-0",
+			wantKey:   "tcp-192.168.99.16-5001-192.168.2.20-445",
 		},
 	}
 	for _, tc := range cases {

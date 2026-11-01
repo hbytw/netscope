@@ -98,18 +98,26 @@ type ipNet struct {
 	iface string // 接口名（可空）
 }
 
-// ConnEngine conntrack 差分引擎（单 goroutine 使用，无需锁）。
+// ConnEngine conntrack 差分引擎。
+// 常规路径由采集协程单 goroutine 驱动；Reset 由 HTTP 协程调用，
+// 因此 flows/retired/baseline/gen 由 mu 串行化。
 type ConnEngine struct {
 	// nets 网段与本机 IP 快照（整体原子替换）。
 	// 设备刷新协程写、采集协程读，用 atomic.Value 避免「新指针 + 旧长度」的中间态。
 	nets     atomic.Value // netsSnapshot
 	maxFlows int
 	flows    map[flowKey]*flowSnap
-	gen      uint32
-	baseline bool
-
-	flowMu   sync.Mutex // 保护 flowHook
-	flowHook func(FlowContext)
+	// retired 被淘汰/老化流的最后累计值（幻影流量防护）：
+	// 一条流的快照因容量/老化被移除后，若它在 conntrack 表里重现，
+	// 没有墓碑就会被当成「从未见过的大额新流」，其全生命周期累计字节
+	//（可达数百 MB）被一次性计入 2 秒增量。墓碑保留基线后可正确差分。
+	retired    map[flowKey]flowSnap
+	maxRetired int
+	gen        uint32
+	baseline   bool
+	mu         sync.Mutex // 串行化 Reset 与 Collect 对 flows/retired/baseline 的访问
+	flowMu     sync.Mutex // 保护 flowHook
+	flowHook   func(FlowContext)
 }
 
 // netsSnapshot 设备网段 / 路由网段 / 本机 IP 的不可变快照。
@@ -139,7 +147,10 @@ const smallFlowBytes = 16 * 1024
 // NewConnEngine 按 LAN 网段创建引擎；extra 为额外设备网段（默认按 lan 处理）。
 // 运行期由 App.syncConnNets() 用拓扑采集结果覆盖为多网段（zt/vpn）。
 func NewConnEngine(lanCIDR string, extra ...string) *ConnEngine {
-	e := &ConnEngine{maxFlows: 20000, flows: map[flowKey]*flowSnap{}, baseline: true}
+	e := &ConnEngine{
+		maxFlows: 20000, flows: map[flowKey]*flowSnap{},
+		retired: map[flowKey]flowSnap{}, maxRetired: 30000, baseline: true,
+	}
 	var device []ipNet
 	for _, cidr := range append([]string{lanCIDR}, extra...) {
 		if n, ok := ipNetFromCIDR(cidr, "lan", ""); ok {
@@ -204,8 +215,12 @@ func (e *ConnEngine) publishFlow(ctx FlowContext) {
 // Reset 清空差分状态（例如设置里改了 LAN 网段）。
 // baseline 置 true：下一轮只登记存量连接、不计入统计，
 // 否则关闭再开启采集后第一轮会把存量连接的累计字节当成新流量（幻影流量）。
+// Reset 由 HTTP 协程调用，与采集协程并发，必须与 Collect 串行化。
 func (e *ConnEngine) Reset() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.flows = map[flowKey]*flowSnap{}
+	e.retired = map[flowKey]flowSnap{}
 	e.baseline = true
 }
 
@@ -291,7 +306,10 @@ func (e *ConnEngine) CollectFile(path string, now int64, emit func(FlowDelta), g
 }
 
 // Collect 流式处理 conntrack 内容。
+// 与 Reset（HTTP 协程）串行化：全程持 mu，避免并发改 flows/retired/baseline。
 func (e *ConnEngine) Collect(r io.Reader, now int64, emit func(FlowDelta), gone func(string)) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.gen++
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -319,6 +337,28 @@ func (e *ConnEngine) Collect(r io.Reader, now int64, emit func(FlowDelta), gone 
 		}
 		snap, exists := e.flows[key]
 		if !exists {
+			// 墓碑命中：该流曾因容量/老化被移出跟踪，但保留了最后累计基线。
+			// 若直接按「新 key」处理，大额流会被当成从未见过的新流，
+			// 下一轮把全生命周期累计字节（可达数百 MB）一次性计入 2 秒增量，
+			// 在流量曲线上形成几十 Gbps 的幻影尖峰并永久落盘。
+			if tomb, ok := e.retired[key]; ok {
+				if upv >= tomb.Up && downv >= tomb.Down {
+					du := int64(upv - tomb.Up)
+					dd := int64(downv - tomb.Down)
+					snap = &flowSnap{Started: tomb.Started, Up: upv, Down: downv, LastSeen: now, Gen: e.gen}
+					e.flows[key] = snap
+					delete(e.retired, key)
+					if !e.baseline && (du > 0 || dd > 0) {
+						delta := e.makeDelta(key, ent, meta, up, down, snap.Started, false)
+						delta.UpDelta = du
+						delta.DownDelta = dd
+						e.emitFlow(emit, delta)
+					}
+					continue
+				}
+				// 累计值倒退：计数器已重置（同 5 元组的新连接），按新流处理
+				delete(e.retired, key)
+			}
 			// 新 key 首见：
 			//   - baseline 轮（启动/Reset 后第一轮）：只登记快照，不计入统计；
 			//   - 累计字节很小：确属本区间内新建的流，累计值即增量；
@@ -531,15 +571,19 @@ func (e *ConnEngine) makeDelta(k flowKey, ent ctEntry, meta flowMeta, up, down i
 }
 
 // evict 控制快照容量，超限时淘汰最早开始的 flow。
+// 淘汰/老化的快照不直接丢弃，而是转入墓碑（retired）保留最后累计基线：
+// 否则该 key 在 conntrack 表重现时会被当成「从未见过的大额新流」，
+// 其全生命周期字节被一次性计入增量（实测可形成数十 Gbps 幻影尖峰并落盘污染历史）。
 func (e *ConnEngine) evict(now int64) {
-	// 老化：超过 10 分钟未在 conntrack 表中出现的快照直接丢弃
+	// 老化：超过 10 分钟未在 conntrack 表中出现的快照转墓碑
 	const staleSec = 10 * 60
 	for k, s := range e.flows {
 		if now-s.LastSeen > staleSec {
-			delete(e.flows, k)
+			e.retire(k, s)
 		}
 	}
 	if len(e.flows) <= e.maxFlows {
+		e.trimRetired(now)
 		return
 	}
 	type pair struct {
@@ -561,7 +605,55 @@ func (e *ConnEngine) evict(now int64) {
 		n = len(list)
 	}
 	for i := 0; i < n; i++ {
-		delete(e.flows, list[i].k)
+		k := list[i].k
+		e.retire(k, e.flows[k])
+	}
+	e.trimRetired(now)
+}
+
+// retire 把一条流快照移入墓碑（保留最后累计基线）。
+func (e *ConnEngine) retire(k flowKey, s *flowSnap) {
+	if s == nil {
+		delete(e.flows, k)
+		return
+	}
+	if e.retired == nil {
+		e.retired = map[flowKey]flowSnap{}
+	}
+	e.retired[k] = *s
+	delete(e.flows, k)
+}
+
+// trimRetired 控制墓碑规模：超过上限按最久未见淘汰，并清理 1 小时前的墓碑。
+// 墓碑只保留累计值（约 40 字节/条），上限 3 万条约 1.2MB。
+func (e *ConnEngine) trimRetired(now int64) {
+	if len(e.retired) == 0 {
+		return
+	}
+	const tombStale = int64(60 * 60) // 1 小时前的墓碑失去参考价值
+	for k, s := range e.retired {
+		if now-s.LastSeen > tombStale {
+			delete(e.retired, k)
+		}
+	}
+	if e.maxRetired <= 0 {
+		e.maxRetired = 30000
+	}
+	if len(e.retired) <= e.maxRetired {
+		return
+	}
+	type pair struct {
+		k flowKey
+		t int64
+	}
+	list := make([]pair, 0, len(e.retired))
+	for k, s := range e.retired {
+		list = append(list, pair{k, s.LastSeen})
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].t < list[j].t })
+	drop := len(e.retired) - e.maxRetired
+	for i := 0; i < drop && i < len(list); i++ {
+		delete(e.retired, list[i].k)
 	}
 }
 
@@ -598,7 +690,9 @@ func protoName(code uint8) string {
 	return "other"
 }
 
-// flowID 生成连接 ID：proto-devip-sport-dstip-dport（api.md §4 示例格式）。
+// flowID 生成连接 ID：proto-devip-sport-dstip-dport（api.md §4 示例格式，5 段）。
+// 方向位 Dir 只用于内部差分 key（区分设备侧/远端侧同行五元组），
+// 不进入对外 ID —— 否则破坏契约，并让 api.go 的「按 ID 回退封禁目标」解析错位。
 func flowID(k flowKey) string {
 	var b [22]byte
 	buf := b[:0]
@@ -611,8 +705,6 @@ func flowID(k flowKey) string {
 	buf = appendIP4(buf, k.Dst)
 	buf = append(buf, '-')
 	buf = strconv.AppendUint(buf, uint64(k.DPort), 10)
-	buf = append(buf, '-')
-	buf = strconv.AppendUint(buf, uint64(k.Dir), 10)
 	return string(buf)
 }
 

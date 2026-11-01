@@ -24,3 +24,6 @@ docs/shots-ui/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 非本项目产物（其它工具生成）
+wechat-clawbot-login-qr.png

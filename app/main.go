@@ -82,6 +82,7 @@ type App struct {
 	deviceControlRestore func() error
 
 	scaleLogN int
+	scaleInit bool // 校准系数是否已首次取值（Scale() 未初始化时返回 1，无法靠它判断）
 	pidPath   string
 
 	// 命令记录（demo/dry-run 下便于单测断言「开关撤销流程」调用了哪些命令）
@@ -730,7 +731,18 @@ func (a *App) clearCollectedData() {
 // ---------------- 外部命令执行 ----------------
 
 // shell 执行 shell 命令（/bin/sh -c），全局串行；-dry-run / -demo 只记录不执行。
+// 默认 60s 超时，供管控类命令（iptables/tc/uci 等）使用。
 func (a *App) shell(cmd string) (string, error) {
+	return a.shellTimeout(cmd, 60*time.Second)
+}
+
+// shellTimeout 执行 shell 命令并指定超时（timeout<=0 视为 60s）。
+//
+// 超时预算必须在拿到 execMu 之后再开始计时：排队等锁的时间不计入超时，
+// 否则并发调用一多，命令还没执行就被判定超时。
+// 采集类命令（ip/ss/df 等）应传 2~3s：一条慢命令若按 60s 跑，
+// 会占住 execMu 把采集/拓扑一起冻结；管控类命令保持长超时。
+func (a *App) shellTimeout(cmd string, timeout time.Duration) (string, error) {
 	if a.cfg.DryRun || a.cfg.Demo {
 		a.recordCmd(cmd)
 		logf("[dry-run] %s", cmd)
@@ -738,7 +750,10 @@ func (a *App) shell(cmd string) (string, error) {
 	}
 	a.execMu.Lock()
 	defer a.execMu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
 	var buf bytes.Buffer
@@ -790,8 +805,15 @@ func (a *App) shellQuiet(cmd string) {
 }
 
 // shellQuietOutput 执行并返回输出，忽略错误。
-func (a *App) shellQuietOutput(cmd string) (string, error) {
-	return a.shell(cmd)
+//
+// 可选 timeout：采集类调用（ip/ss/df 等）传 2~3s，慢命令最多冻结 2~3s 而不是 60s；
+// 不传（或传 <=0）保持默认 60s，管控类调用无需改动。
+// 用变参兼容既有调用方，其它模块可按需逐个迁移到短超时。
+func (a *App) shellQuietOutput(cmd string, timeout ...time.Duration) (string, error) {
+	if len(timeout) > 0 {
+		return a.shellTimeout(cmd, timeout[0])
+	}
+	return a.shellTimeout(cmd, 60*time.Second)
 }
 
 // iptablesSnapshot 保存当前 iptables 规则快照（回滚用）。
@@ -939,11 +961,18 @@ func (a *App) collectOnce() {
 //
 // conntrack 差分在 UDP 打洞/端口复用场景下会重复计入，绝对值不可信
 // （实测可虚高 10~1000 倍）；但它给出的「各类/各设备/各域名的相对比例」仍然可用。
-// 这里以 LAN 接口计数（物理真实）为总量基准，算出比例系数并交给 Agg，
+// 这里以物理单方向总量（SysSnapshot.PhysTotalBps）为总量基准，算出比例系数并交给 Agg，
 // 使所有对外显示的速率都锚定在物理真实量级上。
+//
+// 口径说明（否则校准结果系统性偏 ~2 倍）：
+//   - conntrack 是「每连接一次计数」：ct = raw.Up + raw.Down，每个字节在其方向上计一次；
+//   - 旁路由形态下 br-lan 是中转桥，NetUp+NetDown 这类「进出合计」每字节计两次
+//     （RX≈TX≈总流量），与 ct 不同量纲 —— 不能直接相除；
+//   - PhysTotalBps 已按单方向口径给出：有真 WAN 取 WAN RX+TX，无 WAN 取 (RX+TX)/2，
+//     与 ct 同量纲，f = phys/ct 才是真实校准系数。
 func (a *App) updateScale() {
 	sys := a.sys.Snapshot()
-	phys := sys.NetDownBps + sys.NetUpBps
+	phys := sys.PhysTotalBps
 	if phys <= 0 {
 		return
 	}
@@ -957,17 +986,27 @@ func (a *App) updateScale() {
 	if f <= 0.0001 {
 		return
 	}
-	// 平滑，避免系数抖动导致显示跳变
-	old := a.agg.Scale()
-	if old <= 0 {
-		old = f
+	var next float64
+	if a.scaleInit {
+		// 平滑，避免系数抖动导致显示跳变
+		old := a.agg.Scale()
+		if old <= 0 {
+			old = f
+		} else {
+			old = 0.7*old + 0.3*f
+		}
+		next = old
 	} else {
-		old = 0.7*old + 0.3*f
+		// 首次直接取值：Scale() 未初始化时返回 1 而非 0，靠 old<=0 判断「未设置」
+		// 永远不成立（旧逻辑因此只能从 1 慢慢逼近，约 40s 收敛）。
+		// scaleInit 只在本 App 内标记首个可用系数，直接 SetScale(f) 立即锚定。
+		next = f
+		a.scaleInit = true
 	}
-	a.agg.SetScale(old)
+	a.agg.SetScale(next)
 	a.scaleLogN++
 	if a.scaleLogN%30 == 1 {
-		logf("[scale] 物理=%.2f Mbps conntrack=%.2f Mbps 系数=%.6f", float64(phys)/1e6, float64(ct)/1e6, old)
+		logf("[scale] 物理(单向)=%.2f Mbps conntrack=%.2f Mbps 系数=%.6f", float64(phys)/1e6, float64(ct)/1e6, next)
 	}
 }
 
@@ -1113,9 +1152,17 @@ func (a *App) runSSE() {
 	for {
 		select {
 		case <-ticker.C:
-			frame++
-			full := frame%10 == 1
-			a.hub.Broadcast("tick", a.buildTick(nowUnix(), full, last))
+			// 单帧 panic 只丢这一帧，不拖垮进程也不终止推送循环
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logf("SSE 推送 panic: %v", rec)
+					}
+				}()
+				frame++
+				full := frame%10 == 1
+				a.hub.Broadcast("tick", a.buildTick(nowUnix(), full, last))
+			}()
 		case <-a.stop:
 			return
 		}
@@ -1208,11 +1255,25 @@ func (a *App) runStateSaver() {
 	for {
 		select {
 		case <-ticker.C:
-			if err := a.store.SaveIfDirty(); err != nil {
-				logf("保存 state.json 失败: %v", err)
-			}
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logf("状态保存 panic: %v", rec)
+					}
+				}()
+				if err := a.store.SaveIfDirty(); err != nil {
+					logf("保存 state.json 失败: %v", err)
+				}
+			}()
 		case <-purgeTicker.C:
-			a.store.PurgeOldTraffic(a.store.Settings().RetentionDays)
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logf("流量清理 panic: %v", rec)
+					}
+				}()
+				a.store.PurgeOldTraffic(a.store.Settings().RetentionDays)
+			}()
 		case <-a.stop:
 			return
 		}
@@ -1227,12 +1288,20 @@ func (a *App) runThreatUpdater() {
 		timer := time.NewTimer(a.threatUpdateHours())
 		select {
 		case <-timer.C:
-			res := a.updateThreatsNow()
-			if !res.Ok {
-				logf("威胁情报库定时更新失败（保留旧库）: %v", res.Errors)
-				continue
-			}
-			logf("威胁情报库定时更新完成：域名 %d、IP %d", res.Domains, res.IPs)
+			// 更新类 panic 只丢这一轮，不拖垮进程也不终止更新循环
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logf("威胁情报更新 panic: %v", rec)
+					}
+				}()
+				res := a.updateThreatsNow()
+				if !res.Ok {
+					logf("威胁情报库定时更新失败（保留旧库）: %v", res.Errors)
+					return
+				}
+				logf("威胁情报库定时更新完成：域名 %d、IP %d", res.Domains, res.IPs)
+			}()
 		case <-a.stop:
 			timer.Stop()
 			return
@@ -1342,6 +1411,14 @@ func (a *App) Run() error {
 		a.wg.Add(1)
 		go func() {
 			defer a.wg.Done()
+			// runDNSTailer 的循环体在 dns.go（其它模块维护），这里兜底：
+			// 它 panic 时记录日志而不是带走整个进程（代价是该协程停止，
+			// procd 不会重启；相比进程崩溃导致全部服务中断更可控）
+			defer func() {
+				if rec := recover(); rec != nil {
+					logf("DNS 日志采集 panic: %v", rec)
+				}
+			}()
 			a.runDNSTailer()
 		}()
 	} else {

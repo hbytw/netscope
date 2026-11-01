@@ -27,6 +27,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -350,6 +351,9 @@ func (d *DNSResolver) handleQuery(rec dnsRecord, now int64) {
 		return
 	}
 	d.mu.Lock()
+	// 数据路径自清理：TTL 清理不依赖告警开关（研判循环只在 alerts 打开时运行），
+	// 否则关闭告警后 ip→domain 等映射只增不减。cleanupLocked 内部 60s 节流。
+	d.cleanupLocked(now)
 	st := d.statLocked(domain, cat, label, blockKind, now)
 	if st != nil {
 		st.Hits++
@@ -417,9 +421,14 @@ func (d *DNSResolver) handleQuery(rec dnsRecord, now int64) {
 		if blockKind != "" {
 			d.app.sec.OnBlacklistDomain(domain, rec.SrcIP, blockKind, now)
 		}
-		// 开源威胁情报库：恶意域名（C2/钓鱼/矿池/恶意软件）
-		if tr, ok := ThreatDomainLookup(domain); ok {
-			d.app.sec.OnThreatDomain(domain, rec.SrcIP, tr, now)
+		// 开源威胁情报库：恶意域名（C2/钓鱼/矿池/恶意软件）。
+		// 必须用「原始查询域名」而非分类聚合后的展示域名匹配：displayDomain 会把
+		// 子域名折叠到规则域名（如 video.bilibili.com → bilibili.com）上，直接拿
+		// 聚合域名查库会遮蔽掉只登记了子域名的内置 IOC。
+		if raw := normalizeThreatHost(rec.Name); raw != "" {
+			if tr, ok := ThreatDomainLookup(raw); ok {
+				d.app.sec.OnThreatDomain(raw, rec.SrcIP, tr, now)
+			}
 		}
 	}
 }
@@ -435,6 +444,8 @@ func (d *DNSResolver) handleAnswer(rec dnsRecord, now int64) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	// 数据路径自清理（同 handleQuery：不依赖告警开关，60s 节流）
+	d.cleanupLocked(now)
 	st := d.statLocked(domain, cat, label, blockKind, now)
 	if st != nil {
 		// reply 也算一次访问时间但不计入 hits（hits 只统计查询次数）
@@ -442,12 +453,24 @@ func (d *DNSResolver) handleAnswer(rec dnsRecord, now int64) {
 			st.LastSeen = now
 		}
 	}
-	d.ipMap[addr] = &ipEntry{domain: domain, expires: now + ipMapTTL, last: now}
+	// ip→domain 写入：同一 IP 在有效期内被解析到不同域名（CDN/共享 IP 常态）时
+	// 不做「后写覆盖」——覆盖会让共享 IP 的流量在多个域名间反复横跳、大面积误归因。
+	// 保守策略：有效期内保留首次归因，仅刷新活跃时间；等旧条目过期后新域名才能接管。
+	if ent, ok := d.ipMap[addr]; ok && ent.expires >= now && ent.domain != domain {
+		ent.last = now
+	} else {
+		d.ipMap[addr] = &ipEntry{domain: domain, expires: now + ipMapTTL, last: now}
+	}
 	if len(d.ipMap) > ipMapCap {
 		d.evictIPMapLocked(now)
 	}
 	// 长 TTL 反查索引（6h）：dnsTap 关闭/短 TTL 过期后仍可把连接目的 IP 归因到域名
-	d.ipLong[addr] = &ipEntry{domain: domain, expires: now + longIPTTL, last: now}
+	// （同样不后写覆盖，理由同上；过期后由下一条 reply 重新归因）
+	if ent, ok := d.ipLong[addr]; ok && ent.expires >= now && ent.domain != domain {
+		ent.last = now
+	} else {
+		d.ipLong[addr] = &ipEntry{domain: domain, expires: now + longIPTTL, last: now}
+	}
 	if len(d.ipLong) > ipMapCap {
 		d.evictIPLongLocked()
 	}
@@ -800,9 +823,17 @@ func (d *DNSResolver) IPsForDomain(domain string, now int64) []string {
 }
 
 // Cleanup 周期性清理过期数据，控制内存。
+// 调用方：Security.Analyze（仅 alerts 打开时）+ DNS 数据路径自驱
+// （handleQuery/handleAnswer）+ runDNSTailer 每秒自驱（60s 节流）。
+// 后两者保证关闭告警开关后 TTL 清理照常进行，映射不会只增不减（内存泄漏）。
 func (d *DNSResolver) Cleanup(now int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.cleanupLocked(now)
+}
+
+// cleanupLocked 清理过期数据（调用方已持有写锁），60s 节流。
+func (d *DNSResolver) cleanupLocked(now int64) {
 	if now-d.lastTrim < 60 {
 		return
 	}
@@ -958,6 +989,12 @@ func displayDomain(host string) (domain, cat, label, blockKind string) {
 	return rule, cat, label, kind
 }
 
+// normalizeThreatHost 归一化原始查询域名供威胁库匹配（小写、去空白、去尾点）。
+// 威胁匹配不走 displayDomain 的分类聚合，避免内置 IOC（多为子域名条目）被遮蔽。
+func normalizeThreatHost(host string) string {
+	return strings.ToLower(strings.TrimSpace(strings.TrimSuffix(host, ".")))
+}
+
 // baseDomain 取域名的后两级（用于 TXT 隧道按主域聚合）。
 func baseDomain(host string) string {
 	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
@@ -1009,10 +1046,59 @@ func netipParse4(s string) (uint32, error) {
 
 // ---------------- DNS 日志 tail（按偏移量续读） ----------------
 
+// dnsTailState runDNSTailer 的跨 tick 状态：当前文件偏移/身份 + 轮转残留补读。
+type dnsTailState struct {
+	offset int64  // 当前日志文件已读偏移
+	ino    uint64 // 当前文件 inode（0=拿不到，退回 size 判断）
+	mod    int64  // 当前文件 mtime（inode 不可用时的兜底信号）
+
+	// 轮转残留补读：mv 到 .old 后 dnsmasq 处理 SIGUSR2 之前仍可能向旧 fd 写入，
+	// 记录旧 inode 与已读偏移，把 .old 里没读完的行补读完再回到新文件。
+	oldPending string // 待补读的 .old 路径（""=无）
+	oldOff     int64  // .old 已读偏移
+	oldIno     uint64 // 轮转前的旧 inode（用于确认 .old 没被再次替换）
+	oldQuiet   int    // .old 连续读到文件尾且不再增长的 tick 数
+}
+
+func (st *dnsTailState) reset() {
+	st.offset = 0
+	st.ino, st.mod = 0, 0
+}
+
+// fileInode 尽力读取文件 inode（Linux 下为 st_ino；拿不到返回 0）。
+// 用反射读取，避免在 Windows 上直接引用 syscall.Stat_t 导致交叉编译/测试失败。
+func fileInode(fi os.FileInfo) uint64 {
+	if fi == nil || fi.Sys() == nil {
+		return 0
+	}
+	v := reflect.ValueOf(fi.Sys())
+	if v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return 0
+		}
+		v = v.Elem()
+	}
+	f := v.FieldByName("Ino")
+	if !f.IsValid() {
+		return 0
+	}
+	switch f.Kind() {
+	case reflect.Uint64:
+		return f.Uint()
+	case reflect.Uint32:
+		return uint64(f.Uint())
+	case reflect.Uint:
+		return uint64(f.Uint())
+	}
+	return 0
+}
+
 // runDNSTailer 后台线程：按偏移量续读 dnsmasq 日志；文件不存在时每 2s 重试。
 func (a *App) runDNSTailer() {
-	var offset int64
+	var st dnsTailState
 	missingLogged := false
+	missingTicks := 0
+	lastHealAt := int64(0)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -1020,8 +1106,20 @@ func (a *App) runDNSTailer() {
 		case <-a.stop:
 			return
 		case <-ticker.C:
+			// TTL 清理不依赖告警开关：研判循环（Security.Analyze → dns.Cleanup）
+			// 只在 alerts 打开时运行，若清理只挂在那边，关闭告警后 ip→domain 等
+			// 映射只增不减（内存泄漏）。由 DNS 采集线程自身驱动，内部 60s 节流。
+			if a.dns != nil {
+				a.dns.Cleanup(nowUnix())
+			}
 			// 总开关/采集开关/DNS 旁挂开关任意关闭：不读日志文件
 			if !a.dataActive() || !a.settings().DNSTap {
+				continue
+			}
+			// 刚轮转：先补读 .old 残留（dnsmasq 处理 SIGUSR2 前可能仍写旧 fd），
+			// 补读完成前不推进新文件偏移，保证日志先后顺序不乱。
+			if st.oldPending != "" {
+				a.drainRotatedDNSLog(&st)
 				continue
 			}
 			fi, err := os.Stat(dnsLogPath)
@@ -1030,34 +1128,106 @@ func (a *App) runDNSTailer() {
 					logf("DNS 旁挂日志不存在（%s），等待 dnsmasq 写入或启用旁挂", dnsLogPath)
 					missingLogged = true
 				}
-				offset = 0
+				// 自愈：dnsmasq 可能仍持有被 mv 走的旧文件句柄（轮转信号丢失、
+				// 旧版本用 SIGHUP 轮转、dnsmasq 重启打断等），此时它永远不会自己
+				// 重建日志文件，域名归因会一直为空。10 秒后补发 SIGUSR2 让它重开，
+				// 每分钟最多一次，避免刷信号。
+				missingTicks++
+				if missingTicks >= 10 && nowUnix()-lastHealAt >= 60 {
+					lastHealAt = nowUnix()
+					logf("DNS 日志缺失自愈：向 dnsmasq 发送 SIGUSR2 重开日志")
+					a.shellQuiet("kill -USR2 $(pidof dnsmasq) 2>/dev/null")
+				}
+				st.reset()
 				continue
 			}
+			missingTicks = 0
 			missingLogged = false
-			if fi.Size() < offset {
-				offset = 0 // 文件被截断/重建
+			ino := fileInode(fi)
+			mod := fi.ModTime().UnixNano()
+			// 同一文件判定：优先 inode（文件被轮转/重建后 inode 必变，即使新文件
+			// 已经涨到与旧偏移相当的大小也不会读错位置）；拿不到 inode 时退回
+			// size 变小（截断）+ mtime 回退判断。
+			if st.ino != 0 && ino != 0 && ino != st.ino {
+				st.offset = 0 // 文件被替换（轮转/重建）
+			} else if st.mod != 0 && mod < st.mod {
+				st.offset = 0 // mtime 回退：视为重建
 			}
+			if fi.Size() < st.offset {
+				st.offset = 0 // 文件被截断/重建
+			}
+			st.ino, st.mod = ino, mod
 			if fi.Size() > dnsLogMaxBytes {
+				// 轮转前记录旧 inode 与已读偏移，先把已写未读的日志读完
+				if n, rerr := a.readDNSLogFrom(dnsLogPath, st.offset); rerr == nil {
+					st.offset += n
+				}
 				a.rotateDNSLog()
-				offset = 0
+				st.oldPending = dnsLogPath + ".old"
+				st.oldOff = st.offset
+				st.oldIno = ino
+				st.oldQuiet = 0
+				st.offset = 0
+				st.ino, st.mod = 0, 0
 				continue
 			}
-			if fi.Size() == offset {
+			if fi.Size() == st.offset {
 				continue
 			}
-			n, err := a.readDNSLogFrom(offset)
+			n, err := a.readDNSLogFrom(dnsLogPath, st.offset)
 			if err != nil {
 				logf("读取 DNS 日志失败: %v", err)
 				continue
 			}
-			offset += n
+			st.offset += n
 		}
 	}
 }
 
-// readDNSLogFrom 从 offset 读取新日志行，返回消费的字节数。
-func (a *App) readDNSLogFrom(offset int64) (int64, error) {
-	f, err := os.Open(dnsLogPath)
+// drainRotatedDNSLog 轮转后把 .old 中未读完的行补读完。
+// dnsmasq 收到 SIGUSR2 前仍可能写旧 fd（现已是 .old），因此读到文件尾后
+// 还要确认连续 2 个 tick 大小不再增长才结束补读。
+func (a *App) drainRotatedDNSLog(st *dnsTailState) {
+	fi, err := os.Stat(st.oldPending)
+	if err != nil {
+		st.oldPending = "" // .old 已不存在（异常删除），放弃补读
+		return
+	}
+	// 确认 .old 仍是轮转时的那个文件（inode 可用时）
+	if st.oldIno != 0 {
+		if ino := fileInode(fi); ino != 0 && ino != st.oldIno {
+			st.oldPending = ""
+			return
+		}
+	}
+	if fi.Size() < st.oldOff {
+		st.oldOff = 0 // .old 被重建（极端情况）
+	}
+	if fi.Size() > st.oldOff {
+		n, rerr := a.readDNSLogFrom(st.oldPending, st.oldOff)
+		if rerr != nil {
+			logf("读取 DNS 轮转残留失败: %v", rerr)
+			// 连续失败视为持久错误：放弃残留读取，避免永远卡在补读、新日志读不进来
+			st.oldQuiet++
+			if st.oldQuiet >= 2 {
+				st.oldPending = ""
+			}
+			return
+		}
+		st.oldOff += n
+		st.oldQuiet = 0
+		return
+	}
+	st.oldQuiet++
+	if st.oldQuiet >= 2 {
+		logf("DNS 日志轮转完成，.old 残留 %d 字节已补读", st.oldOff)
+		st.oldPending = ""
+	}
+}
+
+// readDNSLogFrom 从 path 的 offset 处读取新日志行，返回消费的字节数。
+func (a *App) readDNSLogFrom(path string, offset int64) (int64, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return 0, err
 	}
@@ -1084,11 +1254,15 @@ func (a *App) readDNSLogFrom(offset int64) (int64, error) {
 	return consumed, nil
 }
 
-// rotateDNSLog 超过 32MB 时轮转（mv + kill -HUP dnsmasq，dnsmasq 会重新打开日志）。
+// rotateDNSLog 超过 32MB 时轮转：mv 到 .old 后通知 dnsmasq 重开日志。
+//
+// 信号必须用 SIGUSR2：dnsmasq 只有收到 SIGUSR2 才会 close/reopen 日志文件
+// （logrotate 标准流程）。SIGHUP 触发的是 EVENT_RELOAD —— 重新加载配置并
+// 清空 DNS 缓存，会在全网制造一波查询风暴，绝不能用于日志轮转。
 func (a *App) rotateDNSLog() {
-	logf("DNS 日志超过 32MB，执行轮转")
+	logf("DNS 日志超过 32MB，执行轮转（SIGUSR2 重开日志）")
 	a.shellQuiet("mv -f " + dnsLogPath + " " + dnsLogPath + ".old")
-	a.shellQuiet("kill -HUP $(pidof dnsmasq) 2>/dev/null")
+	a.shellQuiet("kill -USR2 $(pidof dnsmasq) 2>/dev/null")
 }
 
 // ---------------- DNS 旁挂开关（UCI logqueries + conf 文件 log-facility + 健康检查 + 回滚） ----------------
