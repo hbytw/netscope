@@ -70,14 +70,17 @@ type AlertSettings struct {
 // 两级开关（docs/api.md §7.1）：Enabled 为总开关，其余为功能开关，全部默认关闭。
 // 关闭时服务不采集、不修改系统配置、不下发管控规则，仅保留 Web 服务。
 type Settings struct {
-	Enabled            bool          `json:"enabled"`
-	Collect            bool          `json:"collect"`
-	DNSTap             bool          `json:"dnsTap"`
-	DeviceControl      bool          `json:"deviceControl"`
-	DomainBlock        bool          `json:"domainBlock"`
-	Schedule           bool          `json:"schedule"`
-	Alerts             bool          `json:"alerts"`
-	History            bool          `json:"history"`
+	Enabled       bool `json:"enabled"`
+	Collect       bool `json:"collect"`
+	DNSTap        bool `json:"dnsTap"`
+	DeviceControl bool `json:"deviceControl"`
+	DomainBlock   bool `json:"domainBlock"`
+	Schedule      bool `json:"schedule"`
+	Alerts        bool `json:"alerts"`
+	History       bool `json:"history"`
+	// HTTPTap 抓取明文 HTTP（TCP 80）请求路径，得到「http://host/path」完整 URL。
+	// 默认关闭：HTTPS 路径在 TLS 内加密，本开关只影响明文 HTTP 站点。
+	HTTPTap            bool          `json:"httpTap"`
 	CollectIntervalSec int           `json:"collectIntervalSec"`
 	RetentionDays      int           `json:"retentionDays"`
 	Alert              AlertSettings `json:"alert"`
@@ -100,12 +103,14 @@ func normalizeSwitches(s *Settings) {
 		s.Schedule = false
 		s.Alerts = false
 		s.History = false
+		s.HTTPTap = false
 		return
 	}
 	if !s.Collect {
 		s.DomainBlock = false
 		s.Alerts = false
 		s.History = false
+		s.HTTPTap = false
 	}
 	if !s.DeviceControl {
 		s.Schedule = false

@@ -263,6 +263,9 @@ func (a *App) ApplySwitchPatch(patch settingsPatch) (Settings, []string, []strin
 	if patch.History != nil {
 		next.History = *patch.History
 	}
+	if patch.HTTPTap != nil {
+		next.HTTPTap = *patch.HTTPTap
+	}
 	if patch.Timezone != nil {
 		// 定时策略时区：必须是合法 IANA 名称（如 Asia/Shanghai）。
 		// 非法值会导致策略时段静默偏移，故直接拒绝而不是回退默认。
@@ -341,6 +344,16 @@ func (a *App) ApplySwitchPatch(patch settingsPatch) (Settings, []string, []strin
 	// 采集链路开启/恢复后，同步多网段识别（zt/vpn 设备与流向）
 	if switchPatch && out.Enabled && out.Collect {
 		a.syncConnNets()
+	}
+	// 明文 HTTP URL 抓取：跟随 httpTap 开关即时启停（失败只记日志，不影响开关本身）
+	if patch.HTTPTap != nil || (switchPatch && !out.Enabled) {
+		if out.Enabled && out.Collect && out.HTTPTap {
+			if err := a.StartHTTPTap(); err != nil {
+				logf("HTTP 明文 URL 抓取启动失败: %v", err)
+			}
+		} else {
+			a.StopHTTPTap()
+		}
 	}
 	return out, applied, revoked, nil
 }
@@ -1435,6 +1448,12 @@ func (a *App) Run() error {
 	a.sec.RestoreWhitelist()
 	// 初始化 conntrack 多网段识别（LAN + zt/vpn 本地接口 + zt/vpn 远端路由）
 	a.syncConnNets()
+	// 明文 HTTP URL 抓取（可选开关，默认关闭）：只在开启且采集生效时启动
+	if s := a.store.Settings(); s.Enabled && s.Collect && s.HTTPTap {
+		if err := a.StartHTTPTap(); err != nil {
+			logf("HTTP 明文 URL 抓取启动失败（不影响其它功能）: %v", err)
+		}
+	}
 
 	a.hub.SetInitial(func() interface{} {
 		return a.buildTick(nowUnix(), true, nil)
@@ -1501,6 +1520,8 @@ func (a *App) Run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+	// 停止明文 HTTP 抓包（释放 AF_PACKET 套接字）
+	a.StopHTTPTap()
 	if err := a.store.Save(); err != nil {
 		logf("退出前保存状态失败: %v", err)
 	}

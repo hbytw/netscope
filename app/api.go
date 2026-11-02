@@ -1099,6 +1099,15 @@ type domainEntryJSON struct {
 	Devices    int                  `json:"devices"`
 	LastSeen   int64                `json:"lastSeen"`
 	DeviceList []domainDevBriefJSON `json:"deviceList"`
+	// Paths 明文 HTTP（http://）观测到的完整 URL 路径（含查询串），按次数降序
+	Paths []httpPathJSON `json:"paths,omitempty"`
+}
+
+type httpPathJSON struct {
+	URL      string `json:"url"`
+	Hits     int64  `json:"hits"`
+	LastSeen int64  `json:"lastSeen"`
+	Devices  int    `json:"devices"`
 }
 
 type domainsResp struct {
@@ -1407,11 +1416,20 @@ func (a *App) handleTrafficDomains(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 		urlStr, scheme := buildDomainURL(d.Domain, d.Port)
+		// 明文 HTTP 有路径记录时：优先展示「http://host/path」，并把路径列表带出去
+		var paths []httpPathJSON
+		if briefs := a.dns.HTTPURLsFor(d.Domain, 5); len(briefs) > 0 {
+			paths = make([]httpPathJSON, 0, len(briefs))
+			for _, b := range briefs {
+				paths = append(paths, httpPathJSON{URL: b.URL, Hits: b.Hits, LastSeen: b.LastSeen, Devices: b.Devices})
+			}
+			urlStr, scheme = briefs[0].URL, "http"
+		}
 		out = append(out, domainEntryJSON{
 			Domain: d.Domain, URL: urlStr, Scheme: scheme, Port: d.Port,
 			Label: d.Label, Category: d.Category,
 			Hits: d.Hits, Bytes: scBytes(d.Bytes), Devices: d.Devices, LastSeen: d.LastSeen,
-			DeviceList: devList,
+			DeviceList: devList, Paths: paths,
 		})
 	}
 	writeJSON(w, http.StatusOK, domainsResp{Domains: out})
@@ -2102,6 +2120,8 @@ func togglePatch(key string, value bool) (settingsPatch, error) {
 		p.Alerts = &value
 	case "history":
 		p.History = &value
+	case "httpTap":
+		p.HTTPTap = &value
 	default:
 		return p, fmt.Errorf("未知开关 key: %s", key)
 	}
@@ -2117,6 +2137,7 @@ type settingsPatch struct {
 	DomainBlock        *bool `json:"domainBlock"`
 	Schedule           *bool `json:"schedule"`
 	Alerts             *bool `json:"alerts"`
+	HTTPTap            *bool `json:"httpTap"`
 	History            *bool `json:"history"`
 	CollectIntervalSec *int  `json:"collectIntervalSec"`
 	RetentionDays      *int  `json:"retentionDays"`

@@ -573,16 +573,30 @@ export async function mount(host, ctx) {
       h('div', {}, [
         h('div', { class: 'fs-12 dim', style: { marginBottom: '4px' }, text: `访问设备（${devList.length || d.devices || 0}）` }),
         h('div', { class: 'col' }, devRows)
-      ])
-    ]);
+      ]),
+      // 明文 HTTP 观测到的完整路径（含查询串）
+      (d.paths && d.paths.length) ? h('div', {}, [
+        h('div', { class: 'fs-12 dim', style: { marginBottom: '4px' }, text: `明文 HTTP 路径（${d.paths.length}）` }),
+        h('div', { class: 'col' }, d.paths.map((p) => h('div', {
+          class: 'row-gap-2 fs-12', style: { justifyContent: 'space-between', padding: '6px 0', borderBottom: '1px solid var(--line-soft)' }
+        }, [
+          h('span', { class: 'mono truncate', style: { minWidth: '0', flex: '1' }, title: p.url, text: p.url }),
+          h('div', { class: 'col', style: { textAlign: 'right', flex: '0 0 auto' } }, [
+            h('span', { class: 'num fs-12', text: `${formatNumber(p.hits || 0)} 次` }),
+            h('span', { class: 'dim fs-11', text: p.lastSeen ? formatRelative(p.lastSeen) : '' })
+          ])
+        ])))
+      ]) : null
+    ].filter(Boolean));
     modal({
       title: `URL 详情 · ${d.url || d.domain}`,
       width: 560,
       body: [body, h('div', { class: 'fs-11 dim', style: { marginTop: '8px', lineHeight: '1.5' } }, [
         h('span', { text: '说明：' }),
         h('span', {
-          text: 'HTTPS 的路径（/xxx）在 TLS 内加密，DNS 与连接跟踪都看不到，'
-            + '此处给出协议、域名与端口；如需完整路径需在路由器上启用 TLS 解密（DPI），会显著增加开销。'
+          text: 'http:// 站点的路径可从明文请求中还原（上方「明文 HTTP 路径」）；'
+            + 'HTTPS 的路径（/xxx）在 TLS 内加密，DNS 与连接跟踪都看不到，'
+            + '如需 HTTPS 完整路径需在路由器上做 TLS 解密（MITM），需给设备装 CA 且有兼容性风险。'
         })
       ])]
     });

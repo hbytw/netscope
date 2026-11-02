@@ -207,7 +207,7 @@ const SWITCH_KEYS = ['enabled', 'collect', 'dnsTap', 'deviceControl', 'domainBlo
 const SWITCH_LABEL = {
   enabled: '系统总开关', collect: '流量采集', dnsTap: 'DNS 行为日志',
   deviceControl: '设备管控', domainBlock: '域名封堵', schedule: '定时策略',
-  alerts: '安全告警', history: '历史统计'
+  alerts: '安全告警', history: '历史统计', httpTap: 'HTTP 明文 URL 抓取'
 };
 
 const DNS_BLOCKED = ['tracker.torrent.eu.org', 'api.telegram.org', 'douyin.com/ads'];
@@ -227,7 +227,7 @@ const mockState = {
   alertFreezeTs: Math.floor(Date.now() / 1000),
   settings: {
     // mock 下默认开启，保证离线预览可验收（见 §7.3）
-    enabled: true, collect: true, dnsTap: true, deviceControl: true,
+    enabled: true, collect: true, dnsTap: true, httpTap: false, deviceControl: true,
     domainBlock: true, schedule: true, alerts: true, history: true,
     collectIntervalSec: 2, retentionDays: 14,
     alert: { enable: true, scanPorts: 20, trafficMbPerHour: 500 },
@@ -639,6 +639,7 @@ function makeDomains(range, limit) {
     const port = 443;
     return {
       domain: d.domain, url: `https://${d.domain}/`, scheme: 'https', port,
+      paths: i % 3 === 0 ? [{ url: `http://${d.domain}/index.html`, hits: 3 + i, lastSeen: now - 60 * i, devices: 1 }] : [],
       label: d.label, category: d.category,
       hits: 8 + Math.floor(rnd(s) * 460),
       bytes: 1024 * (4 + Math.floor(rnd(s) * 240000)),
@@ -1422,7 +1423,8 @@ export const SWITCH_DEFS = [
   { key: 'domainBlock', name: '域名封堵', icon: 'ban', desc: '不开启则不拦截域名' },
   { key: 'schedule', name: '定时策略', icon: 'clock', desc: '不开启则不按时间窗自动启停' },
   { key: 'alerts', name: '安全告警', icon: 'alert', desc: '不开启则不做风险研判' },
-  { key: 'history', name: '历史统计', icon: 'layers', desc: '关闭后不再落盘历史统计文件（近期曲线仍可查）' }
+  { key: 'history', name: '历史统计', icon: 'layers', desc: '关闭后不再落盘历史统计文件（近期曲线仍可查）' },
+  { key: 'httpTap', name: 'HTTP 明文 URL 抓取', icon: 'globe', desc: '抓取 http:// 站点请求路径，显示完整 URL；HTTPS 路径加密不可见' }
 ];
 
 /** 关闭某开关需要撤销已下发规则（需要二次确认） */

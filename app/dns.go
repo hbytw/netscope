@@ -314,6 +314,8 @@ type DNSResolver struct {
 	devRecent map[string]*devRecentEntry // 设备 IP -> 最近查询域名
 	qTimes    []int64
 	lastTrim  int64
+	// httpURLs 明文 HTTP 完整 URL 统计（来自 httptap，仅 http:// 站点）
+	httpURLs map[string]*httpURLStat
 	// flowCtx 采集侧发布的当前流向上下文（emit 期间有效）：
 	// 用于把设备级 DNS 回退限制在「走代理、目的为代理服务器」的连接上。
 	flowCtx FlowContext
@@ -329,6 +331,7 @@ func NewDNSResolver(a *App) *DNSResolver {
 		stats:     map[string]*DomainStat{},
 		txt:       map[string]*txtTrack{},
 		devRecent: map[string]*devRecentEntry{},
+		httpURLs:  map[string]*httpURLStat{},
 	}
 	// 订阅采集侧的流向上下文（emit 前后各一次，空上下文表示当前无 flow）
 	if a != nil && a.ct != nil {
@@ -958,6 +961,8 @@ func (d *DNSResolver) cleanupLocked(now int64) {
 	if len(d.stats) > domainStatCap {
 		d.evictStatsLocked()
 	}
+	// 明文 HTTP 完整 URL 的过期清理（与域名统计同周期）
+	d.cleanupHTTPURLsLocked(now)
 }
 
 func (d *DNSResolver) evictIPMapLocked(now int64) {
