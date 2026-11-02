@@ -128,12 +128,15 @@ export async function mount(host, ctx) {
   ]);
   const urlPager = pager({ onChange: (p) => { urlPage = p; renderUrlList(); } });
   const urlCount = h('span', { class: 'card-sub' });
+  // URL 显示规则：优先展示后端还原的完整地址（scheme://host[:port]/），
+  // 域名作为副标题（分类标签移到 tooltip）。HTTPS 路径在 TLS 内加密，无 DPI 时不可见。
+  const urlText = (d) => d.url || d.domain || '';
   const urlCols = [
     {
       key: 'domain', title: 'URL / 域名', width: '31%',
       render: (d) => h('div', { class: 'col', style: { lineHeight: '1.3', minWidth: '0' } }, [
-        h('span', { class: 'td-strong truncate', text: d.domain }),
-        h('span', { class: 'dim fs-11 truncate', text: d.label || d.category || '' })
+        h('span', { class: 'td-strong truncate', title: `${urlText(d)}${d.label ? ' · ' + d.label : ''}`, text: urlText(d) }),
+        h('span', { class: 'dim fs-11 truncate', text: d.domain })
       ]),
       sortValue: (d) => d.domain
     },
@@ -556,7 +559,9 @@ export async function mount(host, ctx) {
 
     const body = h('div', { class: 'col gap-3' }, [
       h('div', { class: 'kv-grid' }, [
+        kv('完整 URL', d.url || d.domain || '-'),
         kv('域名', d.domain),
+        kv('协议 / 端口', `${d.scheme || 'https'}${d.port ? ' / ' + d.port : ''}`),
         kv('类别', CATEGORY_LABEL[d.category] || '其他'),
         kv('分类标签', d.label || '-'),
         kv('访问次数', formatNumber(d.hits || 0)),
@@ -571,9 +576,15 @@ export async function mount(host, ctx) {
       ])
     ]);
     modal({
-      title: `URL 详情 · ${d.domain}`,
+      title: `URL 详情 · ${d.url || d.domain}`,
       width: 560,
-      body: [body]
+      body: [body, h('div', { class: 'fs-11 dim', style: { marginTop: '8px', lineHeight: '1.5' } }, [
+        h('span', { text: '说明：' }),
+        h('span', {
+          text: 'HTTPS 的路径（/xxx）在 TLS 内加密，DNS 与连接跟踪都看不到，'
+            + '此处给出协议、域名与端口；如需完整路径需在路由器上启用 TLS 解密（DPI），会显著增加开销。'
+        })
+      ])]
     });
   }
 

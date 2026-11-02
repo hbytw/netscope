@@ -122,6 +122,10 @@ type DeviceMeta struct {
 	LimitAt   int64     `json:"limitAt,omitempty"`
 	FirstSeen int64     `json:"firstSeen"`
 	Hidden    bool      `json:"hidden"`
+	// 设备上下线时间（只记录时间，不再产生安全告警）
+	LastOnlineAt  int64 `json:"lastOnlineAt,omitempty"`
+	LastOfflineAt int64 `json:"lastOfflineAt,omitempty"`
+	OnlineCount   int64 `json:"onlineCount,omitempty"`
 }
 
 // Event 安全事件。
@@ -958,6 +962,10 @@ func (s *Store) Events(limit int, severity, typ, ack string) ([]Event, EventSumm
 	out := make([]Event, 0, limit)
 	var sum EventSummary
 	for _, e := range s.events {
+		// 设备上下线/新设备不是威胁：只在设备详情里记时间，不进告警流
+		if isActivityEvent(e.Type) {
+			continue
+		}
 		if severity != "" && e.Severity != severity {
 			continue
 		}
@@ -997,17 +1005,54 @@ func (s *Store) RecentUnacked(limit int) []Event {
 	return events
 }
 
-// UnackedCount 未确认事件数。
+// UnackedCount 未确认事件数（不含设备上下线等非威胁事件）。
 func (s *Store) UnackedCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
 	for _, e := range s.events {
-		if !e.Acked {
+		if !e.Acked && !isActivityEvent(e.Type) {
 			n++
 		}
 	}
 	return n
+}
+
+// isActivityEvent 设备活动类事件：只记录时间到设备详情，不算安全告警。
+func isActivityEvent(typ string) bool {
+	switch typ {
+	case "device_online", "device_offline", "new_device":
+		return true
+	}
+	return false
+}
+
+// NoteDeviceOnline 记录设备上线时间（不产生事件）。
+func (s *Store) NoteDeviceOnline(ip string, ts int64, firstSeen bool) {
+	if ip == "" {
+		return
+	}
+	s.UpdateDeviceMeta(ip, func(m *DeviceMeta) {
+		if ts > m.LastOnlineAt {
+			m.LastOnlineAt = ts
+		}
+		m.OnlineCount++
+		if firstSeen && m.FirstSeen == 0 {
+			m.FirstSeen = ts
+		}
+	})
+}
+
+// NoteDeviceOffline 记录设备离线时间（不产生事件）。
+func (s *Store) NoteDeviceOffline(ip string, ts int64) {
+	if ip == "" {
+		return
+	}
+	s.UpdateDeviceMeta(ip, func(m *DeviceMeta) {
+		if ts > m.LastOfflineAt {
+			m.LastOfflineAt = ts
+		}
+	})
 }
 
 // AckEvent 确认/取消确认事件。

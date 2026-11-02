@@ -462,27 +462,31 @@ func (a *App) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 // DeviceJSON GET /api/devices 契约结构。
 type DeviceJSON struct {
-	IP        string    `json:"ip"`
-	MAC       string    `json:"mac"`
-	Hostname  string    `json:"hostname"`
-	Alias     string    `json:"alias"`
-	Vendor    string    `json:"vendor"`
-	Network   string    `json:"network"` // 所属网络：lan / zerotier / vpn
-	Group     string    `json:"group"`
-	Online    bool      `json:"online"`
-	FirstSeen int64     `json:"firstSeen"`
-	LastSeen  int64     `json:"lastSeen"`
-	UpBps     int64     `json:"upBps"`
-	DownBps   int64     `json:"downBps"`
-	TotalUp   int64     `json:"totalUp"`
-	TotalDown int64     `json:"totalDown"`
-	Conns     int       `json:"conns"`
-	Risk      float64   `json:"risk"`
-	Blocked   bool      `json:"blocked"`
-	LimitKbps LimitKbps `json:"limitKbps"`
-	TopCat    string    `json:"topCat"`
-	TopDomain string    `json:"topDomain"`
-	PolicyIds []string  `json:"policyIds"`
+	IP        string `json:"ip"`
+	MAC       string `json:"mac"`
+	Hostname  string `json:"hostname"`
+	Alias     string `json:"alias"`
+	Vendor    string `json:"vendor"`
+	Network   string `json:"network"` // 所属网络：lan / zerotier / vpn
+	Group     string `json:"group"`
+	Online    bool   `json:"online"`
+	FirstSeen int64  `json:"firstSeen"`
+	LastSeen  int64  `json:"lastSeen"`
+	// 设备上下线时间（只记录，不产生安全告警）
+	LastOnlineAt  int64     `json:"lastOnlineAt"`
+	LastOfflineAt int64     `json:"lastOfflineAt"`
+	OnlineCount   int64     `json:"onlineCount"`
+	UpBps         int64     `json:"upBps"`
+	DownBps       int64     `json:"downBps"`
+	TotalUp       int64     `json:"totalUp"`
+	TotalDown     int64     `json:"totalDown"`
+	Conns         int       `json:"conns"`
+	Risk          float64   `json:"risk"`
+	Blocked       bool      `json:"blocked"`
+	LimitKbps     LimitKbps `json:"limitKbps"`
+	TopCat        string    `json:"topCat"`
+	TopDomain     string    `json:"topDomain"`
+	PolicyIds     []string  `json:"policyIds"`
 }
 
 const (
@@ -578,6 +582,7 @@ func (a *App) deviceJSON(st DeviceState, meta DeviceMeta, conns int, pols []Poli
 		IP: st.IP, MAC: st.MAC, Hostname: st.Hostname, Vendor: st.Vendor,
 		Network: st.Network, Alias: meta.Alias, Group: meta.Group, Online: st.Online,
 		FirstSeen: st.FirstSeen, LastSeen: st.LastSeen,
+		LastOnlineAt: meta.LastOnlineAt, LastOfflineAt: meta.LastOfflineAt, OnlineCount: meta.OnlineCount,
 		UpBps: st.UpBps, DownBps: st.DownBps,
 		TotalUp: st.TotalUp, TotalDown: st.TotalDown,
 		Conns: conns, Risk: st.Risk, Blocked: meta.Blocked, LimitKbps: meta.LimitKbps,
@@ -786,6 +791,7 @@ type deviceDetailResp struct {
 
 type deviceDomain struct {
 	Domain   string `json:"domain"`
+	URL      string `json:"url"`
 	Label    string `json:"label"`
 	Category string `json:"category"`
 	Hits     int64  `json:"hits"`
@@ -874,8 +880,9 @@ func (a *App) handleDevices(w http.ResponseWriter, r *http.Request, parts []stri
 			return v
 		}
 		for _, d := range domAgg {
+			u, _ := buildDomainURL(d.Domain, d.Port)
 			topDomains = append(topDomains, deviceDomain{
-				Domain: d.Domain, Label: d.Label, Category: d.Category, Hits: d.Hits, Bytes: scDomBytes(d.Bytes),
+				Domain: d.Domain, URL: u, Label: d.Label, Category: d.Category, Hits: d.Hits, Bytes: scDomBytes(d.Bytes),
 			})
 		}
 		dstBytes := a.agg.DeviceDstBytes(ip)
@@ -1080,7 +1087,11 @@ type domainDevBriefJSON struct {
 }
 
 type domainEntryJSON struct {
-	Domain     string               `json:"domain"`
+	Domain string `json:"domain"`
+	// URL 完整访问地址（scheme://host[:port]/）；HTTP(S) 路径属加密内容不可见
+	URL        string               `json:"url"`
+	Scheme     string               `json:"scheme"`
+	Port       int                  `json:"port"`
 	Label      string               `json:"label"`
 	Category   string               `json:"category"`
 	Hits       int64                `json:"hits"`
@@ -1335,6 +1346,25 @@ func aggregateSeries(buckets []*Bucket, bucketSec int64) []trafficSeriesPoint {
 	return out
 }
 
+// buildDomainURL 由域名 + 观测到的目的端口还原可读的完整 URL。
+//
+// 说明：HTTPS 的路径（/video/xxx）在 TLS 内加密，DNS 与 conntrack 都看不到，
+// 因此最多能还原到 scheme://host[:port]/；HTTP 明文的路径同样需要抓包才能获得。
+// 这里给出协议、主机与端口，已是无 DPI 条件下能得到的最完整地址。
+func buildDomainURL(domain string, port int) (string, string) {
+	scheme := "https"
+	hostPort := ""
+	switch {
+	case port == 80:
+		scheme = "http"
+	case port == 443 || port == 0:
+		scheme = "https"
+	case port > 0 && port <= 65535:
+		scheme = "https"
+		hostPort = ":" + strconv.Itoa(port)
+	}
+	return scheme + "://" + domain + hostPort + "/", scheme
+}
 func (a *App) handleTrafficDomains(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
@@ -1376,8 +1406,10 @@ func (a *App) handleTrafficDomains(w http.ResponseWriter, r *http.Request) {
 				Hits: dev.Hits, Bytes: scBytes(dev.Bytes), LastSeen: dev.LastSeen,
 			})
 		}
+		urlStr, scheme := buildDomainURL(d.Domain, d.Port)
 		out = append(out, domainEntryJSON{
-			Domain: d.Domain, Label: d.Label, Category: d.Category,
+			Domain: d.Domain, URL: urlStr, Scheme: scheme, Port: d.Port,
+			Label: d.Label, Category: d.Category,
 			Hits: d.Hits, Bytes: scBytes(d.Bytes), Devices: d.Devices, LastSeen: d.LastSeen,
 			DeviceList: devList,
 		})

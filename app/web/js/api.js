@@ -396,6 +396,10 @@ function buildDevices() {
       online, deviceType: d.deviceType,
       firstSeen: now - 86400 * (3 + idx),
       lastSeen: online ? now - Math.floor(rnd(s) * 30) : now - 600,
+      // 上下线时间（真实后端由设备活动记录提供）
+      lastOnlineAt: online ? now - Math.floor(rnd(s) * 900) : now - 86400 - Math.floor(rnd(s) * 3600),
+      lastOfflineAt: online ? now - 86400 - Math.floor(rnd(s) * 7200) : now - 600,
+      onlineCount: 2 + Math.floor(rnd(s) * 20),
       upBps, downBps, totalUp, totalDown,
       conns: online ? 4 + Math.floor(rnd(s) * 180) : 0,
       risk: Math.round(risk * 100) / 100,
@@ -632,8 +636,10 @@ function makeDomains(range, limit) {
       });
     }
     deviceList.sort((a, b) => b.bytes - a.bytes);
+    const port = 443;
     return {
-      domain: d.domain, label: d.label, category: d.category,
+      domain: d.domain, url: `https://${d.domain}/`, scheme: 'https', port,
+      label: d.label, category: d.category,
       hits: 8 + Math.floor(rnd(s) * 460),
       bytes: 1024 * (4 + Math.floor(rnd(s) * 240000)),
       devices: devCount,

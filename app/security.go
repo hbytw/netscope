@@ -198,12 +198,19 @@ func (s *Security) OnFlow(d FlowDelta, now int64, dstForeign bool) {
 	//   - ZeroTier 控制端口 9993/9994。
 	// ZeroTier 是 P2P：设备会同时连接多个 ZT 对等体的不同端口（9993 + 随机端口），
 	// 若把这些也算进来会误判为端口扫描，因此这里仅对直连公网目的计数。
+	// 只统计 TCP：真实端口扫描几乎都是 TCP SYN 探测；UDP 大量随机高位端口
+	// 是 P2P/语音/直播（如 PCDN、游戏语音）的正常行为，计入会持续误报。
 	scanFlow := d.New && scanPathDirect(d.Path) &&
+		strings.EqualFold(d.Proto, "tcp") &&
 		!d.Inbound &&
 		scanProbeState(d.State) &&
 		!isPrivateOrCGNAT(d.DstIP) &&
 		!s.isVirtualDst(d.DstIP, now) &&
-		d.DPort != 9993 && d.DPort != 9994
+		d.DPort != 9993 && d.DPort != 9994 &&
+		// 常见服务端口（浏览/流媒体/游戏/语音/保活）不计入扫描端口数：
+		// 正常客户端在一次视频会话里就会接连新建几十个到 443/80/游戏端口的连接，
+		// 若不排除会把「正常使用」误判成「端口扫描」。
+		!isCommonServicePort(d.DPort)
 	if scanFlow {
 		if s.scan[d.DeviceIP] == nil {
 			s.scan[d.DeviceIP] = map[int]int64{}
@@ -296,6 +303,34 @@ func (s *Security) OnFlow(d FlowDelta, now int64, dstForeign bool) {
 	}
 }
 
+// isCommonServicePort 判断端口是否属于「正常业务也大量使用」的服务端口。
+// 这些端口不计入端口扫描口径，避免把浏览/流媒体/游戏/语音类正常流量误判为扫描。
+func isCommonServicePort(port int) bool {
+	switch port {
+	case 80, 443, 8080, 8443, 8000, 8888, 3000, 5000,
+		53, 123, 853, // DNS / NTP / DoT
+		5222, 5223, 5228, // XMPP / FCM
+		3478, 3479, 3480, 3481, 4500, 500, // STUN / TURN / IPsec
+		19302, 19305, 19308, 19309, // Google Meet/QUIC
+		9339,       // 部分游戏登录
+		5060, 5061, // SIP
+		1900, 5353, // SSDP / mDNS
+		27015, 27016, 27017, 27018, 27019, 27020, // Steam 等游戏端口段
+		3074, 3075, 3076, // Xbox Live
+		16384, 16385, 16386, // TPROXY 特征/QUIC 备用
+		25, 465, 587, 993, 995, // 邮件
+		5229, 5269: // XMPP 服务端互联
+		return true
+	}
+	// 游戏/直播常用高位端口段
+	if port >= 27015 && port <= 27050 {
+		return true
+	}
+	if port >= 3478 && port <= 3497 {
+		return true
+	}
+	return false
+}
 func (s *Security) scanPortsThreshold() int {
 	n := 20
 	if s.app != nil && s.app.store != nil {
@@ -431,37 +466,20 @@ func (s *Security) OnBlacklistDomain(domain, devIP, kind string, now int64) {
 	})
 }
 
-// OnNewDevice 新设备入网。
+// 设备上下线不产生安全告警：只把时间记到设备元信息（设备详情里可见）。
+// 用户反馈「上下线不是威胁」，因此这里不再 emit 事件，避免告警流被刷屏。
 func (s *Security) OnNewDevice(ip, name string, now int64) {
-	s.emit(Event{
-		Ts: now, Severity: "info", Type: "new_device",
-		Title:    "新设备入网：" + name,
-		Detail:   fmt.Sprintf("发现设备 %s（%s）接入局域网", name, ip),
-		DeviceIP: ip, DeviceName: name,
-		Evidence: map[string]interface{}{"ip": ip},
-	})
+	s.app.store.NoteDeviceOnline(ip, now, true)
 }
 
-// OnDeviceOnline 设备上线。
+// OnDeviceOnline 设备上线：只记时间。
 func (s *Security) OnDeviceOnline(ip, name string, now int64) {
-	s.emit(Event{
-		Ts: now, Severity: "info", Type: "device_online",
-		Title:    "设备上线：" + name,
-		Detail:   fmt.Sprintf("设备 %s（%s）重新上线", name, ip),
-		DeviceIP: ip, DeviceName: name,
-		Evidence: map[string]interface{}{"ip": ip},
-	})
+	s.app.store.NoteDeviceOnline(ip, now, false)
 }
 
-// OnDeviceOffline 设备离线。
+// OnDeviceOffline 设备离线：只记时间。
 func (s *Security) OnDeviceOffline(ip, name string, now int64) {
-	s.emit(Event{
-		Ts: now, Severity: "info", Type: "device_offline",
-		Title:    "设备离线：" + name,
-		Detail:   fmt.Sprintf("设备 %s（%s）已离线", name, ip),
-		DeviceIP: ip, DeviceName: name,
-		Evidence: map[string]interface{}{"ip": ip},
-	})
+	s.app.store.NoteDeviceOffline(ip, now)
 }
 
 // OnPolicyHit 策略命中。

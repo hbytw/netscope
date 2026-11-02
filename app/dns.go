@@ -236,6 +236,8 @@ type DomainStat struct {
 	FirstSeen int64
 	LastSeen  int64
 	Devices   map[string]*DomainDev
+	// Ports 该域名实际使用的目的端口计数（来自 conntrack 归因），用于还原完整 URL
+	Ports map[int]int64
 }
 
 // Bytes 总字节。
@@ -258,7 +260,9 @@ type DomainAgg struct {
 	Bytes    int64
 	Devices  int
 	LastSeen int64
-	DevList  []DomainDevAgg // 按 Bytes 降序的设备明细（最多 20 条）
+	// Port 该域名最常见的访问端口（0=未知），用于还原完整 URL 的协议与端口
+	Port    int
+	DevList []DomainDevAgg // 按 Bytes 降序的设备明细（最多 20 条）
 }
 
 type ipEntry struct {
@@ -679,6 +683,52 @@ func (d *DNSResolver) AddBytes(domain string, up, down int64, devIP string, now 
 	dev.LastSeen = now
 }
 
+// AddPort 记录该域名实际使用的目的端口（用于还原完整 URL 的协议与端口）。
+// DNS 日志只有域名，端口要靠 conntrack 归因时顺带采集。
+func (d *DNSResolver) AddPort(domain string, port int) {
+	if domain == "" || port <= 0 || port > 65535 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st := d.stats[domain]
+	if st == nil {
+		return
+	}
+	if st.Ports == nil {
+		st.Ports = make(map[int]int64, 4)
+	}
+	// 端口种类上限，避免异常端口把 map 撑大
+	if len(st.Ports) >= 32 {
+		if _, ok := st.Ports[port]; !ok {
+			return
+		}
+	}
+	st.Ports[port]++
+}
+
+// dominantPort 取该域名最可能的服务端口：
+// 优先 443/80（HTTPS/HTTP 标准端口），其次出现次数最多的端口；无记录返回 0。
+func (st *DomainStat) dominantPort() int {
+	if st.Ports == nil {
+		return 0
+	}
+	if st.Ports[443] > 0 {
+		return 443
+	}
+	if st.Ports[80] > 0 {
+		return 80
+	}
+	var best int
+	var bestN int64
+	for p, n := range st.Ports {
+		if n > bestN {
+			best, bestN = p, n
+		}
+	}
+	return best
+}
+
 // QPS 最近 10 秒的 DNS 查询速率（取整）。
 func (d *DNSResolver) QPS(now int64) float64 {
 	d.mu.RLock()
@@ -719,6 +769,7 @@ func (d *DNSResolver) TopDomains(since int64, limit int) []DomainAgg {
 		out = append(out, DomainAgg{
 			Domain: st.Domain, Category: st.Category, Label: st.Label,
 			Hits: st.Hits, Bytes: st.Bytes(), Devices: len(st.Devices), LastSeen: st.LastSeen,
+			Port:    st.dominantPort(),
 			DevList: devList,
 		})
 	}
@@ -742,6 +793,7 @@ func (d *DNSResolver) DeviceTopDomains(devIP string, since int64, limit int) []D
 		out = append(out, DomainAgg{
 			Domain: st.Domain, Category: st.Category, Label: st.Label,
 			Hits: dev.Hits, Bytes: dev.Bytes, Devices: 1, LastSeen: dev.LastSeen,
+			Port: st.dominantPort(),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Bytes > out[j].Bytes })
@@ -763,6 +815,30 @@ func (d *DNSResolver) DomainHits(domain string) (hits int64, label, cat string, 
 }
 
 // SuspectTXT 返回正在发生的 TXT 隧道嫌疑（60s 窗口内查询 >20 次或标签平均长度 >40）。
+// isKnownTunnelService 已知的合法隧道/内网穿透服务域名后缀。
+// 这些服务的客户端会大量查询长标签 TXT 记录，属正常业务而非攻击。
+func isKnownTunnelService(domain string) bool {
+	if domain == "" {
+		return false
+	}
+	d := strings.ToLower(domain)
+	suffixes := []string{
+		"argotunnel.com",    // Cloudflare Tunnel
+		"trycloudflare.com", // Cloudflare 临时隧道
+		"ngrok.io", "ngrok-free.app", "ngrok.app",
+		"tailscale.com", "tailscale.io",
+		"zerotier.com", "zerotier.net",
+		"pagekite.me",
+		"localhost.run",
+		"serveo.net",
+	}
+	for _, s := range suffixes {
+		if d == s || strings.HasSuffix(d, "."+s) {
+			return true
+		}
+	}
+	return false
+}
 func (d *DNSResolver) SuspectTXT(now int64) []TXTSuspect {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -796,7 +872,14 @@ func (d *DNSResolver) SuspectTXT(now int64) []TXTSuspect {
 			sum += l
 		}
 		avg := float64(sum) / float64(maxInt(cnt, 1))
-		if cnt > 20 || avg > 40 {
+		// 判定口径（降低误报）：
+		//   · 已知隧道服务商域名（如 Cloudflare Tunnel 的 argotunnel.com）是合法业务，跳过；
+		//   · 同时满足「60s 内 >20 次 TXT」且「标签平均长度 >40」才判嫌疑：
+		//     真实 DNS 隧道（iodine/dnscat 等）两个特征都具备，单一特征的多为正常业务。
+		if isKnownTunnelService(base) {
+			continue
+		}
+		if cnt > 20 && avg > 40 {
 			out = append(out, TXTSuspect{Domain: base, Count: cnt, AvgLabel: avg, SrcIP: tr.srcIP})
 		}
 	}

@@ -1121,6 +1121,14 @@ func (a *App) onDelta(d FlowDelta) {
 	a.devs.NoteTraffic(d.DeviceIP, d.UpDelta, d.DownDelta, now)
 	if domain != "" {
 		a.dns.AddBytes(domain, d.UpDelta, d.DownDelta, d.DeviceIP, now)
+		// 记录该域名实际使用的目的端口，用于把「域名」还原成 scheme://host:port 的完整 URL。
+		// 只采信「设备主动发起、非 TPROXY 改写、非临时端口」的记录：
+		//   · Inbound 连接的方向被交换过，DPort 是对端的临时端口（如 46423），不可用；
+		//   · TPROXY 记录的 SPort 是 16384 特征端口，DPort 是改写后的端口，不可用；
+		//   · >=32768 基本都是临时端口，不是服务端口。
+		if !d.Inbound && d.SPort != 16384 && d.DPort > 0 && d.DPort < 32768 {
+			a.dns.AddPort(domain, d.DPort)
+		}
 	}
 	a.sec.OnFlow(d, now, isForeignIP(d.DstIP))
 }

@@ -312,6 +312,10 @@ export async function mount(host, ctx) {
       ['MAC', d.mac || '—'],
       ['首次出现', formatTime(d.firstSeen, true)],
       ['最后活跃', formatRelative(d.lastSeen)],
+      // 上下线时间只记录、不再作为告警
+      ['上次上线', d.lastOnlineAt ? formatTime(d.lastOnlineAt, true) : '—'],
+      ['上次离线', d.lastOfflineAt ? formatTime(d.lastOfflineAt, true) : '—'],
+      ['上线次数', d.onlineCount ? `${formatNumber(d.onlineCount)} 次` : '—'],
       ['连接数', formatNumber(d.conns || 0)],
       ['累计流量', `↓ ${formatBytes(d.totalDown)} · ↑ ${formatBytes(d.totalUp)}`]
     ].forEach(([k, v]) => {
