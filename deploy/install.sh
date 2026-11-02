@@ -8,6 +8,8 @@
 #
 # 特性：
 #   * 幂等：可重复运行，已安装时覆盖升级，不破坏用户改过的密码
+#   * 免传参：数据目录（不用 /mnt/mmcblk2p4 硬编码）与 LAN 网段自动探测；
+#     ELF 架构期望值按本机 uname -m 自动选择（aarch64 / x86_64）
 #   * 安全：二进制先落 /tmp 校验再原子 mv 到 /usr/sbin，避免 overlay 写一半断电损坏
 #   * 可回滚：DNS 旁挂失败自动还原并恢复 dnsmasq，服务本体安装不受影响
 #   * 最小改动：安装时不改 dnsmasq 配置（旁挂由设置页开关控制）；
@@ -40,38 +42,337 @@ esac
 APP_NAME="guanlan"
 BIN_SRC="${1:-/tmp/guanlan.new}"
 BIN_DST="/usr/sbin/${APP_NAME}"
-DATA_DIR="/mnt/mmcblk2p4/${APP_NAME}"
 DATA_SUBDIRS="data logs"
 CONF_DIR="/etc/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.json"
+# 数据目录记录文件：见下面 data_dir_detect 一节（rollback.sh / uninstall.sh 优先读它）
 INIT_SCRIPT="/etc/init.d/${APP_NAME}"
 RUN_DIR="/tmp/${APP_NAME}"
 PID_FILE="/var/run/${APP_NAME}.pid"
 PORT="${GUANLAN_PORT:-8088}"
 LISTEN_ADDR="0.0.0.0:${PORT}"
-DATA_PATH="${DATA_DIR}/data"
-LOG_DIR="${DATA_DIR}/logs"
+# 数据目录不假设固定分区（不是每台路由器都有 /mnt/mmcblk2p4）：
+# 由下面 data_dir_detect 现场探测；DATA_PATH / LOG_DIR 在 §0 里跟着确定。
+DATA_DIR=""
+DATA_PATH=""
+LOG_DIR=""
 
 # --- DNS 旁挂（与后端 ApplyDNSTap 一致：改写 /etc/dnsmasq.conf 的 log-facility） ---
 DNS_LOG_DIR="/tmp/${APP_NAME}"
 DNS_LOG="${DNS_LOG_DIR}/dnsmasq.log"
 DNS_CONF="/etc/dnsmasq.conf"
 # log-facility 原值的持久备份（卸载/回退时按它还原；/tmp 是 tmpfs，重启即失）
-LOGFAC_ORIG_FILE="${DATA_DIR}/logfacility.orig"
+LOGFAC_ORIG_FILE=""
 UCI_SECTION="dhcp.@dnsmasq[0]"
 UCI_OPT_LOGQUERIES="logqueries"
 
 DEFAULT_PASSWORD="${GUANLAN_DEFAULT_PASSWORD:-guanlan2026}"
-LAN_IP="${GUANLAN_LAN_IP:-192.168.1.254}"
+# 访问地址用的本机 LAN IPv4：§0 现场探测；GUANLAN_LAN_IP 可显式覆盖
+LAN_IP=""
+LAN_DEV=""
+LAN_CIDR=""
+LAN_NOTE=""
+
+# ===========================================================================
+# 本机 LAN 探测（不假设网段：192.168.1.x / 192.168.8.x / 10.x 都适用）
+#   接口优先级：br-lan → br0 → br-* → 首个非 lo 非虚拟接口
+#   （双网口时把默认路由出口排到最后，避免把上游 WAN 地址当成访问地址）
+# ===========================================================================
+
+# 取接口首个可用 IPv4（CIDR 形式，如 192.168.8.4/24）；跳过回环/链路本地
+_lan_ipv4_of() {
+  _ips="$(ip -4 addr show dev "$1" 2>/dev/null | awk '$1 == "inet" { print $2 }')"
+  [ -n "$_ips" ] || return 1
+  for _ip in $_ips; do
+    case "$_ip" in
+      127.*|169.254.*) continue ;;
+    esac
+    echo "$_ip"
+    return 0
+  done
+  return 1
+}
+
+# 默认路由出口（旁路由上通常就是 br-lan；单网口 x86 也是它）
+_default_route_dev() {
+  ip route show 2>/dev/null | awk '
+    $1 == "default" {
+      for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i+1); exit }
+    }'
+}
+
+# 按优先级找 LAN 接口名（不依赖 /proc/net/route 的固定格式）
+_lan_dev_detect() {
+  for _d in br-lan br0; do
+    _lan_ipv4_of "$_d" >/dev/null 2>&1 && { echo "$_d"; return 0; }
+  done
+  for _p in /sys/class/net/*; do
+    [ -e "$_p" ] || continue
+    _d="${_p##*/}"
+    case "$_d" in
+      br-*) _lan_ipv4_of "$_d" >/dev/null 2>&1 && { echo "$_d"; return 0; } ;;
+    esac
+  done
+  _def="$(_default_route_dev)"
+  for _pass in 1 2; do
+    for _p in /sys/class/net/*; do
+      [ -e "$_p" ] || continue
+      _d="${_p##*/}"
+      case "$_d" in
+        lo|ifb*|docker*|veth*|virbr*|tun*|tap*|wg*|zt*|tailscale*|dummy*|sit*|gre*|ip6*|ppp*|wwan*|br-*) continue ;;
+      esac
+      # 第一轮跳过默认路由出口（那个通常是 WAN，不能当访问地址）
+      [ "$_pass" = "1" ] && [ -n "$_def" ] && [ "$_d" = "$_def" ] && continue
+      _lan_ipv4_of "$_d" >/dev/null 2>&1 && { echo "$_d"; return 0; }
+    done
+  done
+  return 1
+}
+
+# 192.168.8.4/24 → 192.168.8.0/24（网络地址 = floor(addr/block)*block）
+_cidr_to_network() {
+  awk -F/ 'NF {
+    split($1, o, ".");
+    bits = ($2 == "") ? 24 : $2;
+    addr = o[1]*16777216 + o[2]*65536 + o[3]*256 + o[4];
+    block = (bits >= 32) ? 1 : 2^(32-bits);
+    net = int(addr/block)*block;
+    printf "%d.%d.%d.%d/%d\n", int(net/16777216)%256, int(net/65536)%256, int(net/256)%256, net%256, bits;
+  }'
+}
+
+# 探测结果写入全局：LAN_DEV / LAN_IP / LAN_CIDR / LAN_NOTE
+lan_detect() {
+  LAN_DEV=""
+  LAN_IP=""
+  LAN_CIDR=""
+  LAN_NOTE=""
+  LAN_DEV="$(_lan_dev_detect 2>/dev/null)"
+  if [ -n "$LAN_DEV" ]; then
+    _cidr="$(_lan_ipv4_of "$LAN_DEV" 2>/dev/null)"
+    if [ -n "$_cidr" ]; then
+      LAN_CIDR="$(printf '%s\n' "$_cidr" | _cidr_to_network)"
+      LAN_IP="${_cidr%%/*}"
+    fi
+  fi
+  if [ -n "${GUANLAN_LAN_IP:-}" ]; then
+    LAN_IP="$GUANLAN_LAN_IP"
+    LAN_NOTE="${LAN_NOTE}（IP 来自 GUANLAN_LAN_IP）"
+  fi
+  if [ -z "$LAN_IP" ]; then
+    LAN_IP="<路由器IP>"
+    LAN_NOTE="${LAN_NOTE}（LAN IPv4 探测失败）"
+  fi
+  if [ -z "$LAN_CIDR" ]; then
+    # 最后兜底：探测不到时仍给运行时一个合法网段（运行时 syncConnNets 会用真实接口覆盖）
+    LAN_CIDR=""  # 探测失败留空：由程序启动时按真实接口自探
+    LAN_NOTE="${LAN_NOTE}（网段探测失败，使用最后兜底 $LAN_CIDR）"
+  fi
+}
+
+# ===========================================================================
+# 数据目录探测（install.sh / rollback.sh / uninstall.sh 三处保持同一套逻辑）
+#
+# 不假设固定分区（/mnt/mmcblk2p4 只是部分机器恰好如此，也可能是 /mnt/sda1、
+# /mnt/nvme0n1p1，甚至没有外挂存储）。
+#
+# 优先级：
+#   ① 环境变量 GUANLAN_DATA（显式指定，最高）
+#   ② /etc/guanlan/datadir（install.sh 写入；保证回滚/卸载删的是同一处）
+#   ③ 已存在的 <挂载点>/guanlan（重装/卸载时优先复用旧数据目录）
+#   ④ /mnt 下可写且剩余 ≥200MB 的挂载点（mmcblk/sd/nvme/ssd 优先，其次任意）
+#   ⑤ /etc/guanlan（overlay 兜底，空间可能很小，但保证能装）
+#
+# 结果写入全局 DATA_DIR / DATA_SRC（不用 echo，避免 $(...) 子 shell 丢变量）。
+# ===========================================================================
+DATA_RECORD="/etc/${APP_NAME}/datadir"
+DATA_MIN_FREE_KB=204800   # 200 MB
+
+# 合法数据目录：绝对路径、至少两级目录（避免 "/"、"/mnt" 这类会被整目录误删），
+# 且不含空白/shell 元字符（后续要拼进 sh -c）
+_data_path_ok() {
+  case "$1" in
+    /?*/?*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *[!A-Za-z0-9_./-]*) return 1 ;;
+    *..*) return 1 ;;
+  esac
+  return 0
+}
+
+# 去掉末尾多余的 "/"，避免同一路径两种写法（/etc/guanlan 与 /etc/guanlan/）
+_data_trim_slash() {
+  _dp="$1"
+  while [ "$_dp" != "/" ] && [ "${_dp%/}" != "$_dp" ]; do
+    _dp="${_dp%/}"
+  done
+  printf '%s\n' "$_dp"
+}
+
+# 可用空间（KB）；df 不支持 -P 时退回 -k；失败输出空
+_data_free_kb() {
+  _df="$(df -kP "$1" 2>/dev/null)" || _df="$(df -k "$1" 2>/dev/null)"
+  [ -n "$_df" ] || return 1
+  echo "$_df" | awk 'NR > 1 { print $4; exit }'
+}
+
+# 目录可写（目录不存在则要求父目录可写）。root 下 [ -w ] 对只读挂载也可能为真，
+# 所以真实写一个临时文件确认；干跑模式不落盘。
+_data_writable() {
+  if [ -d "$1" ]; then
+    if [ "${DRY:-0}" = "1" ]; then
+      [ -w "$1" ]
+      return $?
+    fi
+    _wt="$1/.guanlan-write-test.$$"
+    if ( : > "$_wt" ) 2>/dev/null; then
+      rm -f "$_wt" 2>/dev/null
+      return 0
+    fi
+    return 1
+  fi
+  _dparent="$(dirname "$1")"
+  [ -d "$_dparent" ] && _data_writable "$_dparent"
+}
+
+# /mnt 下已挂载且非只读的分区：每行「设备<TAB>挂载点」
+_data_mnt_list() {
+  [ -r /proc/mounts ] || return 1
+  awk '
+    $2 == "/mnt" || index($2, "/mnt/") == 1 {
+      if ($4 ~ /(^|,)ro(,|$)/) next;
+      print $1 "\t" $2;
+    }' /proc/mounts
+}
+
+# 设备名/挂载点名像内置存储（仅用于排序优先级，不影响可用性判断）
+_data_storage_hint() {
+  case "$1" in
+    *mmcblk*|*nvme*|*mmc*|*ssd*|*/sd[a-z]*) return 0 ;;
+  esac
+  return 1
+}
+
+# ③ 已存在的 <挂载点>/guanlan（里面有历史数据），取剩余空间最大的一处
+_data_pick_existing() {
+  _best=""
+  _best_kb=-1
+  while IFS="$(printf '\t')" read -r _mdev _mmp; do
+    [ -n "$_mmp" ] || continue
+    [ -d "$_mmp/${APP_NAME}" ] || continue
+    _kb="$(_data_free_kb "$_mmp" 2>/dev/null)"
+    [ -n "$_kb" ] || _kb=0
+    if [ "$_kb" -gt "$_best_kb" ] 2>/dev/null; then
+      _best="$_mmp/${APP_NAME}"
+      _best_kb="$_kb"
+    fi
+  done <<EOF
+$(_data_mnt_list)
+EOF
+  [ -n "$_best" ] && { echo "$_best"; return 0; }
+  return 1
+}
+
+# ④ 新建数据目录的挂载点：可写、剩余 ≥200MB；存储类优先，其次任意
+_data_pick_mount() {
+  for _tier in storage any; do
+    _best=""
+    _best_kb=-1
+    while IFS="$(printf '\t')" read -r _mdev _mmp; do
+      [ -n "$_mmp" ] || continue
+      if [ "$_tier" = "storage" ]; then
+        _data_storage_hint "$_mdev $_mmp" || continue
+      fi
+      _data_writable "$_mmp/${APP_NAME}" || continue
+      _kb="$(_data_free_kb "$_mmp" 2>/dev/null)"
+      # 空间已知但不足 200MB → 跳过；df 不可用（未知）时按可用处理
+      if [ -n "$_kb" ] && [ "$_kb" -lt "$DATA_MIN_FREE_KB" ] 2>/dev/null; then
+        continue
+      fi
+      [ -n "$_kb" ] || _kb=0
+      if [ "$_kb" -gt "$_best_kb" ] 2>/dev/null; then
+        _best="$_mmp/${APP_NAME}"
+        _best_kb="$_kb"
+      fi
+    done <<EOF
+$(_data_mnt_list)
+EOF
+    [ -n "$_best" ] && { echo "$_best"; return 0; }
+  done
+  return 1
+}
+
+# ② 读记录；记录指向的挂载点已不存在则视为无效（避免删错地方）
+_data_pick_recorded() {
+  [ -s "$DATA_RECORD" ] || return 1
+  _rec=""
+  IFS= read -r _rec < "$DATA_RECORD" 2>/dev/null || true
+  _rec="$(_data_trim_slash "$(printf '%s' "$_rec" | tr -d '\r')")"
+  _data_path_ok "$_rec" || return 1
+  if [ -d "$_rec" ] || [ -d "$(dirname "$_rec")" ]; then
+    echo "$_rec"
+    return 0
+  fi
+  return 1
+}
+
+data_dir_detect() {
+  DATA_DIR=""
+  DATA_SRC=""
+
+  # ① 环境变量
+  if [ -n "${GUANLAN_DATA:-}" ]; then
+    if _data_path_ok "$(_data_trim_slash "$GUANLAN_DATA")"; then
+      DATA_DIR="$(_data_trim_slash "$GUANLAN_DATA")"
+      DATA_SRC="环境变量 GUANLAN_DATA"
+      return 0
+    fi
+    warn "忽略非法的 GUANLAN_DATA=${GUANLAN_DATA}（需为至少两级、不含空白的绝对路径）"
+  fi
+
+  # ② 安装时记录的路径
+  if _rec="$(_data_pick_recorded)"; then
+    if [ -n "${GUANLAN_DATA:-}" ] && [ "$_rec" != "$GUANLAN_DATA" ]; then
+      warn "记录的旧数据目录为 $_rec（与 GUANLAN_DATA 不同），旧数据不会自动迁移"
+    fi
+    DATA_DIR="$_rec"
+    DATA_SRC="记录文件 $DATA_RECORD"
+    return 0
+  fi
+
+  # ③ 已存在的 <挂载点>/guanlan
+  if _dir="$(_data_pick_existing)"; then
+    DATA_DIR="$_dir"
+    DATA_SRC="已存在的 /mnt 数据目录"
+    return 0
+  fi
+
+  # ④ /mnt 可写且空间充足的分区
+  if _dir="$(_data_pick_mount)"; then
+    DATA_DIR="$_dir"
+    DATA_SRC="/mnt 分区探测"
+    return 0
+  fi
+
+  # ⑤ overlay 兜底
+  DATA_DIR="/etc/${APP_NAME}"
+  DATA_SRC="overlay 兜底（/etc，未找到可用的 /mnt 分区）"
+  if ! _data_writable "$DATA_DIR"; then
+    warn "overlay 兜底路径 $DATA_DIR 不可写，安装/卸载可能失败，请设置 GUANLAN_DATA"
+  fi
+  return 0
+}
 
 BACKUP_DIR="/tmp/${APP_NAME}-backup"
 DNS_FAIL=0
 
 # --- 用户自助回退（rollback.sh）的位置 ---
-# /tmp 重启会丢，因此在持久化分区留一份备份
+# /tmp 重启会丢，因此在持久化数据目录留一份备份
 ROLLBACK_SH_SRC="${GL_ROLLBACK_SH:-}"          # 可选：指定 rollback.sh 来源
 ROLLBACK_SH_TMP="/tmp/rollback.sh"              # 守器上的位置（用户可直接用）
-ROLLBACK_SH_KEEP="${DATA_DIR}/rollback.sh"      # 持久化位置（跨重启保留）
+ROLLBACK_SH_KEEP=""                             # 持久化位置（§0 探测数据目录后确定）
 
 log()  { echo "[install] $*"; }
 warn() { echo "[install][WARN] $*" >&2; }
@@ -142,9 +443,30 @@ write_logfacility() {
 }
 
 # ===========================================================================
-# 0. 前置检查
+# 0. 前置检查 + 现场探测（数据目录 / LAN）
 # ===========================================================================
 log "开始安装 ${APP_NAME} ..."
+
+# --- 数据目录：不假设 /mnt/mmcblk2p4，按环境变量→记录→已有数据→/mnt 探测→overlay ---
+data_dir_detect
+DATA_PATH="${DATA_DIR}/data"
+LOG_DIR="${DATA_DIR}/logs"
+LOGFAC_ORIG_FILE="${DATA_DIR}/logfacility.orig"
+ROLLBACK_SH_KEEP="${DATA_DIR}/rollback.sh"
+log "数据目录：${DATA_DIR}（来源：${DATA_SRC}）"
+case "$DATA_SRC" in
+  *overlay*)
+    warn "未找到可用的 /mnt 数据分区，数据将落在 overlay；overlay 空间通常很小，建议用 GUANLAN_DATA 指定外挂存储"
+    ;;
+esac
+
+# --- LAN：不假设 192.168.1.x 网段，按 br-lan → br0 → br-* → 首个物理接口 ---
+lan_detect
+if [ -n "$LAN_DEV" ]; then
+  log "LAN 接口：${LAN_DEV}"
+fi
+log "访问地址：http://${LAN_IP}:${PORT}"
+log "写入配置的 LAN 网段：${LAN_CIDR}${LAN_NOTE}"
 
 if [ "$DRY" = "1" ]; then
   log "干跑模式（GL_APPLY=0）：只打印命令，不做任何写操作"
@@ -170,8 +492,8 @@ mkdir -p "$RUN_DIR" 2>/dev/null || true
   free -m 2>/dev/null || echo "n/a"
   echo "--- df -h / ---"
   df -h / 2>/dev/null || echo "n/a"
-  echo "--- df -h /mnt/mmcblk2p4 ---"
-  df -h /mnt/mmcblk2p4 2>/dev/null || echo "n/a"
+  echo "--- df -h $(dirname "$DATA_DIR")（数据目录所在分区：$DATA_DIR）---"
+  df -h "$(dirname "$DATA_DIR")" 2>/dev/null || echo "n/a"
   echo "--- uci dnsmasq log 选项（部署前应为空）---"
   uci show dhcp 2>/dev/null | grep -E 'logqueries|logfacility' || echo "(空)"
   echo "--- /etc/dnsmasq.conf log-facility（部署前应为 /dev/null）---"
@@ -197,6 +519,15 @@ run_sh "mkdir -p $RUN_DIR $DNS_LOG_DIR" || warn "创建运行目录失败"
 # dnsmasq 以 dnsmasq 用户运行，必须能写入 DNS 日志目录（否则日志文件创建失败、
 # 轮转后变成 *.log.old 且新文件缺失，域名归因随之失效）
 run_sh "chown dnsmasq:dnsmasq $DNS_LOG_DIR 2>/dev/null || chmod 0777 $DNS_LOG_DIR" || warn "设置 DNS 日志目录权限失败"
+
+# --- 记录最终数据目录，供 rollback.sh / uninstall.sh 读取（保证删的是同一处） ---
+if [ "$DRY" = "1" ]; then
+  run_sh "echo '$DATA_DIR' > $DATA_RECORD"
+else
+  printf '%s\n' "$DATA_DIR" > "$DATA_RECORD" 2>/dev/null \
+    && log "已记录数据目录：$DATA_RECORD → $DATA_DIR" \
+    || warn "写入数据目录记录失败：$DATA_RECORD（回退/卸载脚本将改用现场探测）"
+fi
 
 # ---------------------------------------------------------------------------
 # 2.5 备份 /etc/dnsmasq.conf 的 log-facility 原值（供卸载/回退还原）
@@ -243,12 +574,50 @@ if [ -f "$BIN_SRC" ]; then
 fi
 log "二进制来源：$BIN_SRC (${SRC_SIZE:-0} bytes)"
 
+# --- 期望架构按本机 uname -m 决定（不再固定 aarch64） ---
+HOST_ARCH="$(uname -m 2>/dev/null | tr -d '\r')"
+EXPECT_MACHINE=""
+EXPECT_DESC=""
+case "$HOST_ARCH" in
+  aarch64|arm64)
+    EXPECT_MACHINE=183
+    EXPECT_DESC="aarch64 (ARM64)"
+    ;;
+  x86_64|amd64|x64)
+    EXPECT_MACHINE=62
+    EXPECT_DESC="x86_64 (x86-64)"
+    ;;
+  "")
+    warn "无法探测本机架构（uname -m 为空），改按 ELF machine 校验（只接受 aarch64=183 / x86_64=62）"
+    ;;
+  *)
+    if [ "$DRY" = "1" ]; then
+      warn "本机架构 $HOST_ARCH 不在支持范围（仅 aarch64 / x86_64），干跑继续"
+    else
+      die "本机架构 $HOST_ARCH 暂不支持安装（仅支持 aarch64 / x86_64）"
+    fi
+    ;;
+esac
+
+# 十六进制字符串 → 十进制（busybox 无 strtonum，且 ${x#??} 交换字节后要能算）
+_hex_to_dec() {
+  printf '%s\n' "$1" | awk '{
+    h = tolower($0); v = 0;
+    for (i = 1; i <= length(h); i++) {
+      d = index("0123456789abcdef", substr(h, i, 1)) - 1;
+      if (d < 0) exit 1;
+      v = v * 16 + d;
+    }
+    printf "%d\n", v;
+  }'
+}
+
 if [ "$DRY" != "1" ]; then
   if [ "${SRC_SIZE:-0}" -lt 100000 ]; then
     die "二进制大小异常（$SRC_SIZE bytes），疑似传输不完整，请重新上传"
   fi
 
-  # ELF 头校验（magic + machine=aarch64）；busybox 无 od，用 hexdump 兜底
+  # ELF 头校验（magic + e_machine 与本机架构匹配）；busybox 无 od，用 hexdump 兜底
   MAGIC=""
   MACHINE=""
   if command -v od >/dev/null 2>&1; then
@@ -256,9 +625,24 @@ if [ "$DRY" != "1" ]; then
     MACHINE=$(od -An -tu2 -j18 -N2 "$BIN_SRC" 2>/dev/null | tr -d ' \n')
   elif command -v hexdump >/dev/null 2>&1; then
     MAGIC=$(dd if="$BIN_SRC" bs=1 count=4 2>/dev/null | hexdump -v -e '1/1 "%02x"' 2>/dev/null)
-    MACHINE=$(dd if="$BIN_SRC" bs=1 skip=18 count=2 2>/dev/null | hexdump -v -e '1/1 "%02x"' 2>/dev/null)
+    # e_machine 在偏移 18，2 字节；按 EI_DATA（偏移 5）决定大小端
+    _mhex=$(dd if="$BIN_SRC" bs=1 skip=18 count=2 2>/dev/null | hexdump -v -e '1/1 "%02x"' 2>/dev/null)
+    _eidata=$(dd if="$BIN_SRC" bs=1 skip=5 count=1 2>/dev/null | hexdump -v -e '1/1 "%02x"' 2>/dev/null)
+    case "$_mhex" in
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+        if [ "$_eidata" = "02" ]; then
+          MACHINE="$(_hex_to_dec "$_mhex")"                        # 大端：直接用
+        else
+          MACHINE="$(_hex_to_dec "${_mhex#??}${_mhex%??}")"        # 小端：交换两字节
+        fi
+        ;;
+    esac
+  fi
+
+  if [ -n "$MACHINE" ]; then
     case "$MACHINE" in
-      b700|0000b7) MACHINE=183 ;;
+      *[!0-9]*) ;;
+      *) MACHINE="$(printf '%s\n' "$MACHINE" | awk '{ printf "%d\n", $1 }')" ;;
     esac
   fi
 
@@ -266,13 +650,22 @@ if [ "$DRY" != "1" ]; then
     warn "无法解析 ELF 头（缺少 od/hexdump），跳过架构校验"
   elif [ "$MAGIC" != "7f454c46" ]; then
     die "来源文件不是有效的 ELF 可执行文件（magic=$MAGIC），拒绝安装"
-  elif [ "$MACHINE" != "183" ]; then
-    die "来源文件架构不是 aarch64（machine=$MACHINE），拒绝安装"
+  elif [ -z "$EXPECT_MACHINE" ]; then
+    # 本机架构未知：只接受已知支持的两个目标架构
+    case "$MACHINE" in
+      183|62) log "本机架构未知，按 ELF machine=$MACHINE 校验通过（aarch64/x86_64 之一）" ;;
+      ""|*[!0-9]*) warn "无法解析 ELF machine（$MACHINE），跳过架构校验" ;;
+      *) die "来源文件 architecture=$MACHINE 不在支持范围（仅 aarch64=183 / x86_64=62），拒绝安装" ;;
+    esac
+  elif [ -z "$MACHINE" ] || [ "$MACHINE" = "0" ]; then
+    warn "无法解析 ELF machine 字段，跳过架构校验（本机 $(uname -m)，期望 machine=$EXPECT_MACHINE / $EXPECT_DESC）"
+  elif [ "$MACHINE" != "$EXPECT_MACHINE" ]; then
+    die "来源文件架构与本机不符：本机 $(uname -m) 需要 machine=$EXPECT_MACHINE（$EXPECT_DESC），实际 machine=$MACHINE，拒绝安装"
   else
-    log "ELF 校验通过（aarch64 静态可执行文件）"
+    log "ELF 校验通过（$EXPECT_DESC 静态可执行文件，machine=$MACHINE）"
   fi
 else
-  run_sh "echo '[DRY] 将校验 ELF 头（magic=7f454c46, machine=183/aarch64）'"
+  run_sh "echo '[DRY] 将校验 ELF 头（magic=7f454c46，本机 ${HOST_ARCH:-未知} → 期望 machine=${EXPECT_MACHINE:-183(aarch64)或62(x86_64)}）'"
 fi
 
 # 备份旧二进制（回滚用）
@@ -333,7 +726,8 @@ if [ -f "$CONF_FILE" ]; then
       echo "  \"salt\": \"$SALT\","
       echo "  \"passwordHash\": \"$(printf '%s' "$SALT$DEFAULT_PASSWORD" | sha256sum | cut -d' ' -f1)\","
       echo "  \"listen\": \"$LISTEN_ADDR\","
-      echo "  \"dataDir\": \"$DATA_PATH\""
+      echo "  \"dataDir\": \"$DATA_PATH\","
+      echo "  \"lanCidr\": \"$LAN_CIDR\""
       echo '}'
     } > "${CONF_TMP}" && run_sh "mv -f $CONF_TMP $CONF_FILE"
   fi
@@ -355,6 +749,7 @@ else
   "dataDir": "$DATA_PATH",
   "logDir": "$LOG_DIR",
   "port": $PORT,
+  "lanCidr": "$LAN_CIDR",
   "createdAt": "$(date '+%Y-%m-%dT%H:%M:%S%z')"
 }
 EOF
@@ -597,8 +992,10 @@ echo "============================================================"
 echo " 访问地址   : http://${LAN_IP}:${PORT}"
 echo " 本机自检   : http://127.0.0.1:${PORT}/healthz"
 echo " 二进制     : $BIN_DST"
-echo " 数据目录   : $DATA_DIR"
+echo " 数据目录   : $DATA_DIR（来源：$DATA_SRC）"
+echo " LAN 接口   : ${LAN_DEV:-未探测到}，网段 ${LAN_CIDR}"
 echo " 配置       : $CONF_FILE"
+echo " 数据目录记录: $DATA_RECORD"
 echo " 运行日志   : $LOG_DIR/guanlan.log"
 echo " 系统日志   : logread -e guanlan"
 if [ "$DNS_TAP_OK" = "1" ]; then
@@ -623,7 +1020,7 @@ echo " 卸载       : sh uninstall.sh [--purge]"
 echo "============================================================"
 echo ""
 echo "如需完全移除本服务（随时可执行）："
-echo "  Windows : .\deploy\rollback.ps1"
+printf '%s\n' '  Windows : .\deploy\rollback.ps1'
 echo "  路由器 : sh /tmp/rollback.sh"
 echo "  路由器 : sh ${ROLLBACK_SH_KEEP} --purge   # 连数据目录一起删"
 echo ""

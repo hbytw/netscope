@@ -3,7 +3,7 @@ package main
 // 进程入口：flag 解析、组件装配、采集/推送/巡检循环、HTTP 服务、优雅退出。
 //
 // 运行形态：
-//   guanlan -addr :8088 -data /mnt/mmcblk2p4/guanlan          （路由器真机）
+//   guanlan -addr :8088 -data /mnt/<存储>/guanlan            （路由器真机，默认自动探测持久分区）
 //   guanlan -addr 127.0.0.1:8088 -web .\app\web -data tmpdata -demo   （Windows 本地联调）
 //   guanlan -dry-run ...                                     （真机零风险验证：命令只记录不执行）
 
@@ -1640,7 +1640,7 @@ func localIPv4s() []uint32 {
 func main() {
 	addr := flag.String("addr", ":8088", "监听地址")
 	webDir := flag.String("web", "", "前端资源目录（空=使用内嵌资源）")
-	dataDir := flag.String("data", "", "数据目录（默认 /mnt/mmcblk2p4/guanlan；演示模式默认 ./tmpdata）")
+	dataDir := flag.String("data", "", "数据目录（默认自动探测 /mnt 下持久分区，兜底 /etc/guanlan/data；演示模式 ./tmpdata）")
 	demo := flag.Bool("demo", false, "演示模式：不读 /proc、不执行命令，生成合成数据")
 	dryRun := flag.Bool("dry-run", false, "干跑模式：所有外部命令只记录不执行（可用 GL_DRYRUN=1）")
 	flag.Parse()

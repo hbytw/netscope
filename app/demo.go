@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -50,6 +51,11 @@ type demoFlow struct {
 }
 
 // demoRouteTargets 演示用的 zt/vpn/代理流向目的地址，用于展示 Connection.path。
+//
+// 这些是「远端/虚拟网络」样例，刻意用 10.x 私有段而不是 192.168.x：
+// 家用 LAN 常见 192.168.0/16，写 192.168.2.20 之类会与用户真实 LAN 冲突，
+// 导致演示把内网互访显示成 ZeroTier。10.x 样例与 LAN 探测结果无关，
+// 即使极少数用户 LAN 用 10.0.2.0/24，也只影响演示页的流向显示，不影响真机采集。
 var demoRouteTargets = []struct {
 	IP     string
 	Mark   uint32
@@ -57,7 +63,7 @@ var demoRouteTargets = []struct {
 }{
 	{"10.0.2.20", 0, "zt-remote-nas"},   // 经 ZeroTier 的远端网段
 	{"10.10.10.20", 0, "zt-remote-svc"}, // 经 ZeroTier
-	{"192.168.2.20", 0, "zt-branch"},    // 经 ZeroTier 的远端 LAN
+	{"10.20.0.20", 0, "zt-branch"},      // 经 ZeroTier 的远端 LAN（10.20.0.0/24）
 	{"10.8.0.20", 0, "vpn-node"},        // 经 VPN
 	{"142.250.72.14", 1, "google.com"},  // 公网 + mark=1 → 代理
 }
@@ -72,25 +78,40 @@ type Demo struct {
 	started       int64
 	tickN         int64
 	lastNewDevice int64
+
+	// 演示网络规划：LAN 网段来自配置/自动探测（cfg.LANCIDR），ZT 演示网段
+	// 自动避开 LAN，保证演示设备 IP 在任何网段的机器上都落在正确网络里。
+	lanPrefix string
+	lanBits   int
+	ztPrefix  string
+	ztBits    int
+	// proxySrc 是演示"本机/docker0 经代理出口"的源地址（非用户设备），
+	// 从候选地址里选一个不在 LAN 网段内的值。
+	proxySrc string
 }
 
+// demoDeviceTable 演示设备模板。
+//
+// IP 字段用 "lan:<主机号>"/"zt:<主机号>" 占位：真实 IP 在 NewDemo 里按
+// 「探测到的 LAN 网段 + 主机号」生成，因此换到 192.168.8.x / 10.0.x 等任何
+// 网段都不会再把演示设备钉死在 192.168.1.x。
 var demoDeviceTable = []demoDevice{
-	{"192.168.1.31", "90:f0:52:d5:9a:cb", "MEIZU-Note-16", true, "妈妈的手机", "家人"},
-	{"192.168.1.32", "3c:5a:b4:1a:22:01", "iPhone-15-Pro", true, "爸爸的手机", "家人"},
-	{"192.168.1.33", "00:9a:cd:11:22:33", "Redmi-Turbo-3", true, "小明的手机", "孩子"},
-	{"192.168.1.34", "00:1b:63:12:34:56", "MacBook-Pro", true, "客厅MacBook", "家人"},
-	{"192.168.1.35", "00:e0:4c:aa:bb:01", "DESKTOP-7K3M", true, "书房台式机", "办公"},
-	{"192.168.1.36", "00:0c:43:01:02:03", "MI-BOX-4", true, "客厅电视盒子", "家人"},
-	{"192.168.1.37", "00:0c:43:04:05:06", "MI-TV-65", true, "客厅电视", "家人"},
-	{"192.168.1.38", "24:db:ac:00:00:01", "UniFi-AP", true, "客厅AP", "网络"},
-	{"192.168.1.39", "b8:27:eb:00:00:02", "raspberrypi", true, "树莓派NAS", "网络"},
-	{"192.168.1.40", "00:0c:29:01:02:03", "VM-Ubuntu", true, "开发虚拟机", "办公"},
-	{"192.168.1.41", "38:01:46:aa:00:01", "Galaxy-S24", true, "备用手机", "家人"},
-	{"192.168.1.42", "00:23:cd:00:00:09", "TP-LINK-Cam", false, "门口摄像头", "家庭安防"},
-	{"192.168.1.43", "00:1d:0f:00:00:0a", "kindle", false, "Kindle", "家人"},
-	{"192.168.1.44", "18:b4:30:00:00:0b", "Nest-Thermostat", true, "温控器", "智能家居"},
-	{"192.168.99.16", "24:db:ac:00:00:10", "ZT-NAS", true, "ZeroTier NAS", "网络"},
-	{"192.168.99.94", "24:db:ac:00:00:5e", "ZT-Laptop", true, "ZeroTier 笔记本", "办公"},
+	{"lan:31", "90:f0:52:d5:9a:cb", "MEIZU-Note-16", true, "妈妈的手机", "家人"},
+	{"lan:32", "3c:5a:b4:1a:22:01", "iPhone-15-Pro", true, "爸爸的手机", "家人"},
+	{"lan:33", "00:9a:cd:11:22:33", "Redmi-Turbo-3", true, "小明的手机", "孩子"},
+	{"lan:34", "00:1b:63:12:34:56", "MacBook-Pro", true, "客厅MacBook", "家人"},
+	{"lan:35", "00:e0:4c:aa:bb:01", "DESKTOP-7K3M", true, "书房台式机", "办公"},
+	{"lan:36", "00:0c:43:01:02:03", "MI-BOX-4", true, "客厅电视盒子", "家人"},
+	{"lan:37", "00:0c:43:04:05:06", "MI-TV-65", true, "客厅电视", "家人"},
+	{"lan:38", "24:db:ac:00:00:01", "UniFi-AP", true, "客厅AP", "网络"},
+	{"lan:39", "b8:27:eb:00:00:02", "raspberrypi", true, "树莓派NAS", "网络"},
+	{"lan:40", "00:0c:29:01:02:03", "VM-Ubuntu", true, "开发虚拟机", "办公"},
+	{"lan:41", "38:01:46:aa:00:01", "Galaxy-S24", true, "备用手机", "家人"},
+	{"lan:42", "00:23:cd:00:00:09", "TP-LINK-Cam", false, "门口摄像头", "家庭安防"},
+	{"lan:43", "00:1d:0f:00:00:0a", "kindle", false, "Kindle", "家人"},
+	{"lan:44", "18:b4:30:00:00:0b", "Nest-Thermostat", true, "温控器", "智能家居"},
+	{"zt:16", "24:db:ac:00:00:10", "ZT-NAS", true, "ZeroTier NAS", "网络"},
+	{"zt:94", "24:db:ac:00:00:5e", "ZT-Laptop", true, "ZeroTier 笔记本", "办公"},
 }
 
 var demoDomainTable = []demoDomain{
@@ -128,14 +149,145 @@ var demoDomainTable = []demoDomain{
 
 // NewDemo 创建演示生成器。
 func NewDemo(a *App) *Demo {
-	return &Demo{
-		app:     a,
-		devices: append([]demoDevice(nil), demoDeviceTable...),
-		domains: append([]demoDomain(nil), demoDomainTable...),
-		flows:   map[string]*demoFlow{},
-		rng:     rand.New(rand.NewSource(20251031)),
-		started: nowUnix(),
+	var lanCIDR string
+	if a != nil && a.cfg != nil {
+		lanCIDR = a.cfg.LANCIDR
 	}
+	lanPrefix, lanBits := demoLANPrefix(lanCIDR)
+	ztPrefix, ztBits := demoZTPrefix(lanPrefix, lanBits)
+	return &Demo{
+		app:       a,
+		devices:   expandDemoDevices(lanPrefix, lanBits, ztPrefix, ztBits),
+		domains:   append([]demoDomain(nil), demoDomainTable...),
+		flows:     map[string]*demoFlow{},
+		rng:       rand.New(rand.NewSource(20251031)),
+		started:   nowUnix(),
+		lanPrefix: lanPrefix,
+		lanBits:   lanBits,
+		ztPrefix:  ztPrefix,
+		ztBits:    ztBits,
+		proxySrc:  demoProxySource(lanPrefix, lanBits),
+	}
+}
+
+// ---------------- 演示网络规划（LAN 网段派生） ----------------
+
+// demoLANPrefix 返回演示 LAN 网段的前三段与掩码位数（来自 cfg.LANCIDR）。
+// 配置缺失/格式非法时回退 192.168.1/24（与全局兜底一致）。
+func demoLANPrefix(cidr string) (prefix string, bits int) {
+	p, err := netip.ParsePrefix(strings.TrimSpace(cidr))
+	if err != nil || !p.Addr().Is4() {
+		return "192.168.1", 24
+	}
+	p = p.Masked()
+	b := p.Addr().As4()
+	return fmt.Sprintf("%d.%d.%d", b[0], b[1], b[2]), p.Bits()
+}
+
+// demoCIDR 把「前三段 + 掩码位数」拼回网段字符串。
+func demoCIDR(prefix string, bits int) string {
+	return fmt.Sprintf("%s.0/%d", prefix, bits)
+}
+
+// demoHostIP 在演示网段里按主机号生成 IP。
+// 子网小于 /24 时把主机号收敛到可用主机范围，避免生成网络地址/广播地址；
+// 溢出时从 .2 起分配（.1 留给演示网关），/27 之类的小网段也不会设备与网关撞车。
+func demoHostIP(prefix string, bits, offset int) string {
+	usable := 254
+	if bits > 24 && bits <= 32 {
+		usable = (1 << (32 - bits)) - 2
+		if usable < 1 {
+			usable = 1
+		}
+	}
+	if offset < 1 {
+		offset = 1
+	}
+	if offset > usable {
+		if usable > 1 {
+			offset = 2 + (offset-1)%(usable-1)
+		} else {
+			offset = 1
+		}
+	}
+	return fmt.Sprintf("%s.%d", prefix, offset)
+}
+
+// demoZTPrefix 选一个不与 LAN 网段重叠的 /24 作为演示 ZeroTier 网段，
+// 避免用户的 LAN 恰好是 192.168.99.0/24 时演示 ZT 设备"落进 LAN"。
+func demoZTPrefix(lanPrefix string, lanBits int) (string, int) {
+	lan, err := netip.ParsePrefix(demoCIDR(lanPrefix, lanBits))
+	if err != nil {
+		return "192.168.99", 24
+	}
+	for _, cand := range []string{"192.168.99.0/24", "10.147.20.0/24", "172.30.99.0/24"} {
+		p, err := netip.ParsePrefix(cand)
+		if err != nil {
+			continue
+		}
+		if !prefixesOverlap(p, lan) {
+			b := p.Masked().Addr().As4()
+			return fmt.Sprintf("%d.%d.%d", b[0], b[1], b[2]), 24
+		}
+	}
+	return "10.147.20", 24
+}
+
+// prefixesOverlap 判断两个 IPv4 网段是否有交集。
+func prefixesOverlap(a, b netip.Prefix) bool {
+	if !a.Addr().Is4() || !b.Addr().Is4() {
+		return false
+	}
+	a, b = a.Masked(), b.Masked()
+	return a.Contains(b.Addr()) || b.Contains(a.Addr())
+}
+
+// expandDemoDevices 把模板里的 lan:<主机号>/zt:<主机号> 展开成实际 IP。
+func expandDemoDevices(lanPrefix string, lanBits int, ztPrefix string, ztBits int) []demoDevice {
+	out := make([]demoDevice, 0, len(demoDeviceTable))
+	for _, tpl := range demoDeviceTable {
+		d := tpl
+		if kind, hostStr, ok := strings.Cut(tpl.IP, ":"); ok {
+			host, _ := strconv.Atoi(hostStr)
+			switch kind {
+			case "lan":
+				d.IP = demoHostIP(lanPrefix, lanBits, host)
+			case "zt":
+				d.IP = demoHostIP(ztPrefix, ztBits, host)
+			}
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// demoProxySource 选一个不在 LAN 网段里的源地址，模拟"本机/docker0 经代理出口"
+// 的流量（这类连接只计入 proxy 链路，不显示为设备）。优先用演示 docker0 的地址，
+// 用户的 LAN 恰好覆盖 172.17/16 时依次退到 benchmarking/文档保留段。
+func demoProxySource(lanPrefix string, lanBits int) string {
+	lan, err := netip.ParsePrefix(demoCIDR(lanPrefix, lanBits))
+	if err != nil {
+		return "172.17.0.1"
+	}
+	for _, cand := range []string{"172.17.0.1", "198.18.0.1", "203.0.113.1"} {
+		addr, err := netip.ParseAddr(cand)
+		if err == nil && !lan.Contains(addr) {
+			return cand
+		}
+	}
+	return "203.0.113.1"
+}
+
+// lanIP / ztIP 按主机号取演示设备 IP（与设备表使用同一套派生规则）。
+func (d *Demo) lanIP(host int) string { return demoHostIP(d.lanPrefix, d.lanBits, host) }
+func (d *Demo) ztIP(host int) string  { return demoHostIP(d.ztPrefix, d.ztBits, host) }
+
+// network 返回演示设备所属网络（ZT 网段由规划决定，其余都是 LAN）。
+func (d *Demo) network(ip string) string {
+	if d.ztPrefix != "" && strings.HasPrefix(ip, d.ztPrefix+".") {
+		return "zerotier"
+	}
+	return "lan"
 }
 
 // Init 初始化演示数据：设备、策略、域名统计、历史分钟桶、趋势点、事件。
@@ -155,21 +307,13 @@ func (d *Demo) Init() {
 	// 初始事件（让安全页/总览一打开就有内容）
 	d.seedEvents(now)
 	// 演示封禁记录：让「封禁列表/解封」入口一打开就有数据可操作
-	d.app.store.UpdateDeviceMeta("192.168.1.33", func(m *DeviceMeta) {
+	d.app.store.UpdateDeviceMeta(d.lanIP(33), func(m *DeviceMeta) {
 		m.Blocked = true
 		m.BlockedAt = now - 600
 	})
 	d.app.store.PutDstBlock("45.77.10.20", now-300)
 	// 演示告警白名单（前端白名单列表卡片预览）
-	d.app.store.PutWhitelist("port_scan", "192.168.1.84", "演示：已知的端口扫描器", now-3600)
-}
-
-// demoNetwork 演示设备的所属网络。
-func demoNetwork(ip string) string {
-	if strings.HasPrefix(ip, "192.168.99.") {
-		return "zerotier"
-	}
-	return "lan"
+	d.app.store.PutWhitelist("port_scan", d.lanIP(84), "演示：已知的端口扫描器", now-3600)
 }
 
 // ensureSeed 开关重新打开后补种演示设备/域名（不重复插入策略与历史）。
@@ -192,7 +336,7 @@ func (d *Demo) seedDevicesAndDomains(now int64) {
 		}
 		states = append(states, &DeviceState{
 			IP: dev.IP, MAC: dev.MAC, Hostname: dev.Hostname,
-			Vendor: VendorForMAC(dev.MAC), Network: demoNetwork(dev.IP), Online: dev.Online,
+			Vendor: VendorForMAC(dev.MAC), Network: d.network(dev.IP), Online: dev.Online,
 			FirstSeen: now - 86400*3, LastSeen: last,
 			TotalUp:   int64(d.rng.Intn(50_000_000)),
 			TotalDown: int64(d.rng.Intn(2_000_000_000)),
@@ -235,13 +379,13 @@ func (d *Demo) seedPolicies() {
 	}
 	d.app.store.UpsertPolicy(Policy{
 		Name: "22点后禁止刷短视频", Enabled: true,
-		Targets:  Targets{IPs: []string{"192.168.1.31", "192.168.1.33"}},
+		Targets:  Targets{IPs: []string{d.lanIP(31), d.lanIP(33)}},
 		Schedule: Schedule{Days: []int{1, 2, 3, 4, 5, 6, 7}, Start: "22:00", End: "23:59"},
 		Action:   "block", Categories: []string{"video", "game"},
 	})
 	d.app.store.UpsertPolicy(Policy{
 		Name: "孩子设备限速", Enabled: false,
-		Targets:  Targets{IPs: []string{"192.168.1.33"}},
+		Targets:  Targets{IPs: []string{d.lanIP(33)}},
 		Schedule: Schedule{Start: "00:00", End: "23:59"},
 		Action:   "limit", LimitKbps: LimitKbps{Down: 2000, Up: 500},
 	})
@@ -311,36 +455,37 @@ func (d *Demo) prefillTrend(now int64) {
 
 // seedEvents 预置几条典型事件。
 func (d *Demo) seedEvents(now int64) {
+	ip40, ip33, ip44, ip42 := d.lanIP(40), d.lanIP(33), d.lanIP(44), d.lanIP(42)
 	events := []Event{
 		{
 			Ts: now - 240, Severity: "warn", Type: "blacklist_domain",
-			Title: "命中黑名单域名：pool.minexmr.com", Detail: "设备 192.168.1.40 访问矿池地址（pool.minexmr.com）",
-			DeviceIP: "192.168.1.40", DeviceName: "VM-Ubuntu",
+			Title: "命中黑名单域名：pool.minexmr.com", Detail: "设备 " + ip40 + " 访问矿池地址（pool.minexmr.com）",
+			DeviceIP: ip40, DeviceName: "VM-Ubuntu",
 			Evidence: map[string]interface{}{"domain": "pool.minexmr.com", "category": "mining"},
 		},
 		{
 			Ts: now - 420, Severity: "warn", Type: "port_scan",
-			Title:    "疑似端口扫描：192.168.1.33",
+			Title:    "疑似端口扫描：" + ip33,
 			Detail:   "60 秒内对 28 个不同目的端口发起新连接",
-			DeviceIP: "192.168.1.33", DeviceName: "Redmi-Turbo-3",
+			DeviceIP: ip33, DeviceName: "Redmi-Turbo-3",
 			Evidence: map[string]interface{}{"ports": 28, "windowSec": 60, "sample": []string{"23", "445", "3389", "1433", "5900"}},
 		},
 		{
 			Ts: now - 900, Severity: "info", Type: "new_device",
-			Title: "新设备入网：Nest-Thermostat", Detail: "发现设备 Nest-Thermostat（192.168.1.44）接入局域网",
-			DeviceIP: "192.168.1.44", DeviceName: "Nest-Thermostat",
-			Evidence: map[string]interface{}{"ip": "192.168.1.44"},
+			Title: "新设备入网：Nest-Thermostat", Detail: "发现设备 Nest-Thermostat（" + ip44 + "）接入局域网",
+			DeviceIP: ip44, DeviceName: "Nest-Thermostat",
+			Evidence: map[string]interface{}{"ip": ip44},
 		},
 		{
 			Ts: now - 1500, Severity: "info", Type: "device_offline",
-			Title: "设备离线：TP-LINK-Cam", Detail: "设备 TP-LINK-Cam（192.168.1.42）已离线",
-			DeviceIP: "192.168.1.42", DeviceName: "TP-LINK-Cam",
-			Evidence: map[string]interface{}{"ip": "192.168.1.42"},
+			Title: "设备离线：TP-LINK-Cam", Detail: "设备 TP-LINK-Cam（" + ip42 + "）已离线",
+			DeviceIP: ip42, DeviceName: "TP-LINK-Cam",
+			Evidence: map[string]interface{}{"ip": ip42},
 		},
 		{
 			Ts: now - 1800, Severity: "info", Type: "bad_port",
-			Title: "高危端口外联：192.168.1.40", Detail: "设备主动外联 45.77.10.20:445（高危端口）",
-			DeviceIP: "192.168.1.40", DeviceName: "VM-Ubuntu",
+			Title: "高危端口外联：" + ip40, Detail: "设备主动外联 45.77.10.20:445（高危端口）",
+			DeviceIP: ip40, DeviceName: "VM-Ubuntu",
 			Evidence: map[string]interface{}{"port": 445, "dstIp": "45.77.10.20"},
 		},
 	}
@@ -351,7 +496,7 @@ func (d *Demo) seedEvents(now int64) {
 			Ts: now - 360, Severity: threatSeverity(td.Kind), Type: "blacklist_domain",
 			Title:    "命中高危域名：" + td.Target,
 			Detail:   "命中" + threatKindLabel(td.Kind) + "（来源 " + td.Source + "）",
-			DeviceIP: "192.168.1.40", DeviceName: "VM-Ubuntu",
+			DeviceIP: ip40, DeviceName: "VM-Ubuntu",
 			Evidence: map[string]interface{}{"domain": td.Target, "kind": string(td.Kind), "source": td.Source},
 		})
 		ti := ips[0]
@@ -359,7 +504,7 @@ func (d *Demo) seedEvents(now int64) {
 			Ts: now - 300, Severity: threatSeverity(ti.Kind), Type: "bad_ip",
 			Title:    "连接高危 IP：" + ti.Target,
 			Detail:   "命中" + threatKindLabel(ti.Kind) + "：" + ti.Source,
-			DeviceIP: "192.168.1.44", DeviceName: "Nest-Thermostat",
+			DeviceIP: ip44, DeviceName: "Nest-Thermostat",
 			Evidence: map[string]interface{}{"ip": ti.Target, "kind": string(ti.Kind), "source": ti.Source},
 		})
 	}
@@ -399,22 +544,24 @@ func (d *Demo) onlineDevices() []string {
 }
 
 // ensureProxyExitFlows 生成"本机/docker0 经代理"的公网流量（只计入 proxy 链路，不显示为设备连接）。
-// 对应真机上 passwall/xray 透明代理：入口连接 mark=1、src=172.31.0.1 等非用户设备。
+// 对应真机上 passwall/xray 透明代理：入口连接 mark=1、src 是路由器/docker 侧地址（非用户设备）。
+// 源地址由 demoProxySource 从候选里选一个不在 LAN 网段内的值，避免被误判成 LAN 设备。
 func (d *Demo) ensureProxyExitFlows(now int64) {
+	src := d.proxySrc
 	for _, e := range []struct {
 		key     string
 		dst     string
 		domain  string
 		downBps float64
 	}{
-		{"tcp-172.31.0.1-40101-142.250.72.14-443", "142.250.72.14", "google.com", 1_800_000},
-		{"tcp-172.31.0.1-40102-23.45.64.20-443", "23.45.64.20", "steampowered.com", 900_000},
+		{fmt.Sprintf("tcp-%s-40101-142.250.72.14-443", src), "142.250.72.14", "google.com", 1_800_000},
+		{fmt.Sprintf("tcp-%s-40102-23.45.64.20-443", src), "23.45.64.20", "steampowered.com", 900_000},
 	} {
 		if f, ok := d.flows[e.key]; ok && now <= f.Expire {
 			continue
 		}
 		d.flows[e.key] = &demoFlow{
-			Device: "172.31.0.1", DstIP: e.dst, Proto: "tcp", SPort: 40101, DPort: 443,
+			Device: src, DstIP: e.dst, Proto: "tcp", SPort: 40101, DPort: 443,
 			Mark: 1, DownRate: e.downBps, UpRate: e.downBps / 15,
 			Expire: now + 180, Domain: e.domain,
 		}
@@ -444,14 +591,14 @@ func (d *Demo) Lines(now int64, intervalSec int64) string {
 			var mark uint32
 			// 30%（zt 设备 80%）概率生成一条 zt/vpn/代理流向的连接，便于前端展示 path 列
 			routeProb := 0.30
-			if strings.HasPrefix(ip, "192.168.99.") {
+			if d.network(ip) == "zerotier" {
 				routeProb = 0.80
 			}
 			if d.rng.Float64() < routeProb {
 				t := demoRouteTargets[d.rng.Intn(len(demoRouteTargets))]
 				dstIP, mark, dom.Domain = t.IP, t.Mark, t.Domain
-				if strings.HasPrefix(t.IP, "192.168.2.") {
-					dport = 445 // 经 zt 访问远端 SMB
+				if strings.HasPrefix(t.IP, "10.20.0.") {
+					dport = 445 // 经 zt 访问远端 SMB（10.20.0.0/24 远端 LAN）
 				}
 			}
 			if mark == 0 && d.rng.Float64() < 0.12 {
@@ -534,13 +681,14 @@ func (d *Demo) Tick(now int64) {
 	}
 	// 端口扫描事件
 	if d.tickN == 6 {
+		scanner := d.lanIP(33)
 		d.app.sec.OnFlow(FlowDelta{
-			DeviceIP: "192.168.1.33", DstIP: "45.77.10.20", DPort: 3389, Proto: "tcp",
+			DeviceIP: scanner, DstIP: "45.77.10.20", DPort: 3389, Proto: "tcp",
 			New: true, State: "SYN_SENT",
 		}, now, true)
 		for _, p := range []int{23, 445, 1433, 5900, 6379, 11211} {
 			d.app.sec.OnFlow(FlowDelta{
-				DeviceIP: "192.168.1.33", DstIP: "45.77.10.20", DPort: p, Proto: "tcp",
+				DeviceIP: scanner, DstIP: "45.77.10.20", DPort: p, Proto: "tcp",
 				New: true, State: "SYN_SENT",
 			}, now, true)
 		}
@@ -548,7 +696,7 @@ func (d *Demo) Tick(now int64) {
 	// 新设备入网事件（演示）
 	if now-d.lastNewDevice > 180 && d.tickN > 20 {
 		d.lastNewDevice = now
-		d.app.sec.OnNewDevice("192.168.1.45", "iPad-Air", now)
+		d.app.sec.OnNewDevice(d.lanIP(45), "iPad-Air", now)
 	}
 }
 

@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Run a batch of shell commands on the router over one SSH session."""
+"""Run a batch of shell commands on the router over one SSH session.
+
+目标地址不内置默认值：必须设置 OWRT_HOST（不同路由器网段不同），
+未设置时由同目录的 owrt.py 明确报错并打印用法（退出码 2），不会默认到任何 IP。
+OWRT_USER / OWRT_PASS / OWRT_PORT / OWRT_KNOWN_HOSTS / OWRT_ACCEPT_HOSTKEY
+的语义与 owrt.py 完全一致（本脚本复用它的连接与主机密钥校验）。
+
+Usage:
+  OWRT_HOST=192.168.8.4 OWRT_PASS=... python tools/probe.py [section ...]
+"""
 import sys, os, json
 import paramiko
-
-HOST = os.environ.get("OWRT_HOST", "192.168.1.254")
-USER = os.environ.get("OWRT_USER", "root")
-PASS = os.environ.get("OWRT_PASS", "")
 
 CMDS = [
     ("dhcp-opts", "uci show dhcp.@dnsmasq[0].logqueries; echo '--'; uci show dhcp.lan.dhcp_option 2>/dev/null; echo '--'; uci show network.lan.gateway; echo '--'; uci show dhcp.lan.router 2>/dev/null"),
@@ -25,6 +30,8 @@ def main():
     # 复用 owrt.connect：带主机密钥指纹校验（首次连接登记，后续严格比对）
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import owrt
+    # 没有 OWRT_HOST 时在这里明确报错（不默认任何 IP）
+    owrt.resolve_host()
     c = owrt.connect()
     for name, cmd in CMDS:
         if sel and name not in sel:

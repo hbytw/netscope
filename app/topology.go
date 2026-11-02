@@ -172,6 +172,10 @@ type topologyResp struct {
 // ---------------- 接口类型判定 ----------------
 
 // ifaceKind 根据接口名判断网络类型与是否内网接口。
+//
+// 不假设 LAN 一定叫 br-lan：OpenWrt/ImmortalWrt 上还常见 br0、lan、br-guest、
+// br-iot；Docker 的网桥（docker0 / br-<12位hex>）单独归为 docker，
+// 名字含 wan 的网桥按外网口处理，避免把 WAN 桥当成 LAN。
 func ifaceKind(name string) (network string, internal bool) {
 	n := strings.ToLower(strings.TrimSpace(name))
 	if i := strings.IndexByte(n, '@'); i > 0 {
@@ -182,16 +186,219 @@ func ifaceKind(name string) (network string, internal bool) {
 		return "loopback", false
 	case n == "br-lan" || strings.HasPrefix(n, "br-lan."):
 		return "lan", true
+	case n == "br0" || strings.HasPrefix(n, "lan"):
+		// br0 / lan / lan1 …：LAN 桥或 LAN 物理口
+		return "lan", true
 	case strings.HasPrefix(n, "zt"):
 		return "zerotier", true
 	case strings.HasPrefix(n, "tun"), strings.HasPrefix(n, "wg"), n == "tailscale0", strings.HasPrefix(n, "ppp"):
 		return "vpn", true
-	case n == "docker0" || strings.HasPrefix(n, "docker") || strings.HasPrefix(n, "br-"):
+	case looksLikeDockerBridge(n):
 		return "docker", false
+	case strings.HasPrefix(n, "br"):
+		// 其它网桥（br-guest / br-iot / br1 …）按内网桥处理；
+		// 名字含 wan 的桥是对外网桥，不算 LAN。
+		if strings.Contains(n, "wan") {
+			return "other", false
+		}
+		return "lan", true
 	case n == "eth0" || n == "wan" || strings.HasPrefix(n, "eth"):
 		return "other", false
 	}
 	return "other", false
+}
+
+// looksLikeDockerBridge 判断接口名是否 Docker 自动创建的网桥。
+// Docker Compose 用 br-<容器网络 ID 前 12 位 hex> 命名，据此与 OpenWrt 的 br-guest 等区分。
+func looksLikeDockerBridge(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if n == "docker0" || strings.HasPrefix(n, "docker") {
+		return true
+	}
+	if rest, ok := strings.CutPrefix(n, "br-"); ok {
+		if len(rest) == 12 && isHexString(rest) {
+			return true
+		}
+	}
+	return false
+}
+
+// isHexString 判断字符串是否全为十六进制字符（用于识别 Docker 网桥名）。
+func isHexString(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// virtualIfaceName 判断接口是否属于「虚拟/隧道/外网」语义，不可能是 LAN 桥。
+//
+// 用于 LAN 接口探测时排除 docker/veth/zt/tailscale/tun/tap/wg/ppp/wan/ifb 等，
+// 避免把 ZeroTier 或 Docker 网段当成 LAN。
+func virtualIfaceName(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if i := strings.IndexByte(n, '@'); i > 0 {
+		n = n[:i]
+	}
+	switch {
+	case n == "lo" || strings.HasPrefix(n, "lo."):
+		return true
+	case strings.HasPrefix(n, "docker"), strings.HasPrefix(n, "veth"):
+		return true
+	case strings.HasPrefix(n, "zt"), strings.HasPrefix(n, "tailscale"):
+		return true
+	case strings.HasPrefix(n, "tun"), strings.HasPrefix(n, "tap"), strings.HasPrefix(n, "wg"):
+		return true
+	case strings.HasPrefix(n, "ppp"), strings.HasPrefix(n, "wan"):
+		return true
+	case strings.HasPrefix(n, "ifb"), strings.HasPrefix(n, "sit"), strings.HasPrefix(n, "gre"), strings.HasPrefix(n, "ip6"):
+		return true
+	case strings.HasPrefix(n, "virbr"), strings.HasPrefix(n, "vmnet"), strings.HasPrefix(n, "vboxnet"),
+		strings.HasPrefix(n, "dummy"), strings.HasPrefix(n, "wwan"):
+		return true
+	case strings.Contains(n, "wan"):
+		return true
+	case looksLikeDockerBridge(n):
+		return true
+	}
+	return false
+}
+
+// fallbackLANIface 是 LAN 接口探测全部失败时的展示兜底名。
+// 只用于拓扑/日志展示：任何要对该接口下发命令的调用方（如 enforce 的 tc）
+// 必须先经 detectedLanIface 确认它真的存在，否则应安全跳过。
+const fallbackLANIface = "br-lan"
+
+// sameIPv4Prefix 判断两个 CIDR 是否是同一个网段（网络地址+掩码一致）。
+func sameIPv4Prefix(a, b string) bool {
+	pa, err := netip.ParsePrefix(strings.TrimSpace(a))
+	if err != nil || !pa.Addr().Is4() {
+		return false
+	}
+	pb, err := netip.ParsePrefix(strings.TrimSpace(b))
+	if err != nil || !pb.Addr().Is4() {
+		return false
+	}
+	return pa.Masked() == pb.Masked() && pa.Bits() == pb.Bits()
+}
+
+// isLANIfaceAddr 判断接口地址是否私网（WAN 公网地址不可能是 LAN）。
+func isLANIfaceAddr(addr string) bool {
+	a, err := netip.ParseAddr(strings.TrimSpace(addr))
+	return err == nil && isPrivateIPv4(a)
+}
+
+// markProbedLANIface 在没有内网桥（无 br-lan/br0/lan* 等）的扁平网络里，
+// 把探测到的 LAN 接口标记为内网接口（Network=lan / Internal=true）。
+//
+// 典型场景：x86 单网口旁路由只有 eth0（LAN/WAN 共用），若不标记，
+// networkForIP 会把内网设备当成 other、设备刷新会跳过该接口上的邻居，
+// 设备归属和拓扑都会失真。只在列表里完全没有任何 lan 接口时才猜，
+// 已有 br-lan 等桥时不动（避免把 WAN 口误标成 LAN）。
+func markProbedLANIface(list []ifaceInfo, lanCIDR string) {
+	for _, f := range list {
+		if f.Network == "lan" {
+			return // 已有真实内网桥/网口
+		}
+	}
+	defDev := defaultRouteDevFromProc("/proc/net/route")
+	name := pickLanIface(list, lanCIDR, defDev)
+	if name == "" {
+		return
+	}
+	for i := range list {
+		if list[i].Name == name && list[i].Network == "other" && isLANIfaceAddr(list[i].Addr) {
+			list[i].Network = "lan"
+			list[i].Internal = true
+		}
+	}
+}
+
+// pickLanIface 从采集到的接口里挑 LAN 接口（探测不到返回 ""）。
+//
+// 优先级：br-lan* > br0 > lan* > 其它桥（br*）> 普通网口；
+// 与配置/探测到的 LAN 网段一致的接口大幅加分（配置文件 lanCidr 优先），
+// 私网地址加分、公网地址减分，排除 loopback/docker/veth/zt/tun/wg/ppp/wan 等虚拟接口。
+// defaultDev 是默认路由出口：通用网卡名（eth0/enp1s0）且是默认路由出口时降权，
+// 避免双网口机器把私网 WAN 口当 LAN；它是唯一候选时仍会选中（单网口扁平网络）。
+func pickLanIface(ifaces []ifaceInfo, lanCIDR, defaultDev string) string {
+	bestName, bestScore := "", -1
+	for _, f := range ifaces {
+		if f.CIDR == "" || f.Network == "loopback" || f.Name == "" {
+			continue
+		}
+		if virtualIfaceName(f.Name) {
+			continue
+		}
+		private := isLANIfaceAddr(f.Addr)
+		// 公网地址通常是 WAN：除非配置的 LAN 网段与它一致（显式配置优先），否则不选。
+		if !private && !(lanCIDR != "" && sameIPv4Prefix(f.CIDR, lanCIDR)) {
+			continue
+		}
+		n := strings.ToLower(f.Name)
+		nameScore := 50
+		switch {
+		case n == "br-lan" || strings.HasPrefix(n, "br-lan."):
+			nameScore = 100
+		case n == "br0":
+			nameScore = 95
+		case strings.HasPrefix(n, "lan"):
+			nameScore = 90
+		case strings.HasPrefix(n, "br"):
+			nameScore = 85
+		}
+		score := nameScore
+		if defaultDev != "" && f.Name == defaultDev && nameScore <= 50 {
+			score -= 40 // 默认路由出口 + 通用网卡名：更像 WAN
+		}
+		if lanCIDR != "" && sameIPv4Prefix(f.CIDR, lanCIDR) {
+			score += 30
+		}
+		if f.Up {
+			score += 5
+		} else {
+			score -= 10
+		}
+		if f.Internal {
+			score += 5
+		}
+		if isLANIfaceAddr(f.Addr) {
+			score += 10
+		} else {
+			score -= 30
+		}
+		if score > bestScore {
+			bestName, bestScore = f.Name, score
+		}
+	}
+	return bestName
+}
+
+// detectedLanIface 返回真实探测到的 LAN 接口名；ok=false 表示没探测到
+// （调用方应安全跳过需要对接口下发命令的动作）。
+func (a *App) detectedLanIface() (string, bool) {
+	if a == nil || a.cfg == nil {
+		return "", false
+	}
+	defDev, _ := parseDefaultRoute(a.routeLines())
+	name := pickLanIface(a.interfaces(), a.cfg.LANCIDR, defDev)
+	return name, name != ""
+}
+
+// LanIfaceName 返回探测到的 LAN 接口名，供 enforce/conntrack 复用。
+//
+// 探测优先级见 pickLanIface；全部探测失败时返回 fallbackLANIface（仅展示兜底）。
+// 需要判断该接口是否真实存在时用 detectedLanIface（enforce 的 tc 下发放行前会校验）。
+func (a *App) LanIfaceName() string {
+	if name, ok := a.detectedLanIface(); ok {
+		return name
+	}
+	return fallbackLANIface
 }
 
 // ---------------- 采集（带缓存） ----------------
@@ -204,20 +411,21 @@ func (a *App) interfaces() []ifaceInfo {
 	now := nowUnix()
 	a.ifMu.Lock()
 	defer a.ifMu.Unlock()
-	if len(a.ifaces) > 0 && now-a.ifAt < ifaceCacheSec {
+	if a.ifAt > 0 && now-a.ifAt < ifaceCacheSec {
 		return a.ifaces
 	}
 	var list []ifaceInfo
 	if a.cfg.Demo {
-		list = demoInterfaces()
+		list = a.demoInterfaces()
 	} else {
 		list = parseIPBrAddr(a.ipAddrText())
+		// 扁平单网口（只有 eth0、没有 br-lan）时把 LAN 接口标记为内网接口，
+		// 保证设备归属/邻居过滤正确；有 br-lan 等桥时本函数不做任何改动。
+		markProbedLANIface(list, a.cfg.LANCIDR)
 	}
-	if len(list) == 0 {
-		// 采集失败时至少保留 LAN 节点（保证拓扑可用）
-		cidr := a.cfg.LANCIDR
-		list = []ifaceInfo{{Name: "br-lan", Network: "lan", CIDR: cidr, Addr: cidr, Up: true, Internal: true}}
-	}
+	// 采集失败（ip 命令不可用/输出为空）时返回空列表，不再伪造一个 br-lan：
+	// 伪造会让「LAN 接口探测」误以为 br-lan 真的存在，进而对不存在的接口下发 tc。
+	// 拓扑展示由 buildTopology 的兜底 LAN 节点负责。
 	a.ifaces = list
 	a.ifAt = now
 	return list
@@ -319,7 +527,7 @@ func (a *App) networkForIP(ip string) (network string, internal bool) {
 // 返回的是共享切片，调用方只读，不得修改。
 func (a *App) routeLines() []string {
 	if a.cfg.Demo {
-		return demoRouteLines()
+		return a.demoRouteLines()
 	}
 	c := &a.cmdCacheOf().route
 	now := nowUnix()
@@ -340,20 +548,28 @@ func (a *App) routeLines() []string {
 }
 
 // demoRouteLines 演示模式的路由表。
-func demoRouteLines() []string {
+//
+// LAN 网段/网关与接口地址都从当前配置（自动探测结果或 config.json 的 lanCidr）派生，
+// 因此在任何网段的机器上演示都自洽。zt/vpn 远端网段用 10.x 私有段固定样例：
+// 这类演示网段与常见家用 LAN（192.168.x / 10.0.x 之外）不冲突；即使冲突也只影响
+// 演示页面的流向归类，真机逻辑完全走 ip route 采集，不受影响。
+func (a *App) demoRouteLines() []string {
+	lanPrefix, lanBits := demoLANPrefix(a.cfg.LANCIDR)
+	ztPrefix, ztBits := demoZTPrefix(lanPrefix, lanBits)
+	gw := demoHostIP(lanPrefix, lanBits, 1)
 	return []string{
-		"default via 192.168.1.1 dev br-lan proto static",
-		"192.168.1.0/24 dev br-lan proto kernel scope link src 192.168.1.254",
-		"192.168.99.0/24 dev zt6vwy3rne proto kernel scope link src 192.168.99.1",
+		"default via " + gw + " dev " + fallbackLANIface + " proto static",
+		demoCIDR(lanPrefix, lanBits) + " dev " + fallbackLANIface + " proto kernel scope link src " + demoHostIP(lanPrefix, lanBits, 254),
+		demoCIDR(ztPrefix, ztBits) + " dev zt6vwy3rne proto kernel scope link src " + demoHostIP(ztPrefix, ztBits, 1),
 		// ZeroTier 远端路由网段（设备在 LAN/ZT，目的在这些网段 → path=zerotier）
 		"10.0.2.0/24 dev zt6vwy3rne scope link",
 		"10.10.10.0/24 dev zt6vwy3rne scope link",
 		"10.11.0.0/24 dev zt6vwy3rne scope link",
 		"10.12.0.0/24 dev zt6vwy3rne scope link",
-		"192.168.2.0/24 dev zt6vwy3rne scope link",
-		"192.168.3.0/24 dev zt6vwy3rne scope link",
-		"192.168.8.0/24 dev zt6vwy3rne scope link",
-		"192.168.88.0/24 dev zt6vwy3rne scope link",
+		"10.20.0.0/24 dev zt6vwy3rne scope link",
+		"10.21.0.0/24 dev zt6vwy3rne scope link",
+		"10.22.0.0/24 dev zt6vwy3rne scope link",
+		"10.23.0.0/24 dev zt6vwy3rne scope link",
 		// VPN 网段（tun0，演示为 down 但仍保留路由用于展示 path=vpn）
 		"10.8.0.0/24 dev tun0 scope link",
 	}
@@ -486,12 +702,15 @@ func (a *App) buildTopology() topologyResp {
 		rxRate[name], txRate[name] = r[0], r[1]
 	}
 
-	// 接口默认路由出口（internet 是否 up）
-	_, hasDefault := parseDefaultRoute(routes)
+	// 默认路由出口（internet 是否 up；同时用于 LAN 接口探测时给 WAN 口降权）
+	defaultDev, hasDefault := parseDefaultRoute(routes)
 
 	nodes := make([]topologyNode, 0, len(ifaces)+3)
 	links := make([]topologyLink, 0, len(ifaces)+3)
 
+	// LAN 出接口按探测结果确定（不假设一定叫 br-lan）：
+	// 优先让探测到的接口作为 LAN 链路的起点，同名的 LAN 节点后出现时覆盖。
+	lanName := pickLanIface(ifaces, a.cfg.LANCIDR, defaultDev)
 	lanID := ""
 	virtual := make([]ifaceInfo, 0, len(ifaces))
 	for _, f := range ifaces {
@@ -508,7 +727,7 @@ func (a *App) buildTopology() topologyResp {
 		switch f.Network {
 		case "lan":
 			display = "内网 LAN"
-			if lanID == "" {
+			if lanID == "" || (lanName != "" && f.Name == lanName) {
 				lanID = f.Name
 			}
 		case "zerotier":
@@ -526,8 +745,9 @@ func (a *App) buildTopology() topologyResp {
 		})
 	}
 	if lanID == "" {
-		lanID = "br-lan"
-		nodes = append(nodes, topologyNode{ID: lanID, Type: "lan", Name: "内网 LAN", CIDR: a.cfg.LANCIDR, Up: true})
+		// 采集不到接口时仍给前端一个 LAN 节点（展示兜底，不代表该接口真实存在）。
+		lanID = a.LanIfaceName()
+		nodes = append(nodes, topologyNode{ID: lanID, Type: "lan", Name: "内网 LAN", CIDR: maskedCIDR(a.cfg.LANCIDR), Up: true})
 	}
 
 	// 链路流量按连接 path 聚合（conntrack mark 拆分），不再把全部公网流量一刀切给 proxy：
@@ -758,6 +978,14 @@ func (a *App) syncConnNets() {
 		return
 	}
 	ifaces := a.interfaces()
+	// 把探测到的 LAN 接口告诉 conntrack：设备网段缺接口名时用它补齐，
+	// 探测不到就传空串（连接归因的 iface 留空，不再硬编码 br-lan）。
+	lanIface, lanKnown := a.detectedLanIface()
+	if lanKnown {
+		a.ct.SetLANIface(lanIface)
+	} else {
+		a.ct.SetLANIface("")
+	}
 	var device, route []ipNet
 	for _, f := range ifaces {
 		if f.CIDR == "" || !f.Internal {
@@ -773,7 +1001,8 @@ func (a *App) syncConnNets() {
 		}
 	}
 	if len(device) == 0 {
-		if n, ok := ipNetFromCIDR(a.cfg.LANCIDR, "lan", "br-lan"); ok {
+		// 接口采集失败时用配置网段兜底；接口名用探测结果（未知则留空，交给 conntrack 的空值路径）。
+		if n, ok := ipNetFromCIDR(a.cfg.LANCIDR, "lan", lanIface); ok {
 			device = append(device, n)
 		}
 	}
@@ -832,10 +1061,16 @@ func dedupeIPNets(in []ipNet) []ipNet {
 }
 
 // demoInterfaces 演示模式接口列表。
-func demoInterfaces() []ifaceInfo {
+//
+// LAN 网段/地址从 cfg.LANCIDR 派生（与 demo 设备 IP 同源），接口名 br-lan/zt6vwy3rne
+// 是合成拓扑的固定名字（演示必须确定性，不能随宿主网卡名变化）。
+// eth0/docker0/tun0 是演示用的固定样例网段（10.0.0/24、172.17/16、10.8/24）。
+func (a *App) demoInterfaces() []ifaceInfo {
+	lanPrefix, lanBits := demoLANPrefix(a.cfg.LANCIDR)
+	ztPrefix, ztBits := demoZTPrefix(lanPrefix, lanBits)
 	return []ifaceInfo{
-		{Name: "br-lan", Network: "lan", CIDR: "192.168.1.254/24", Addr: "192.168.1.254", Up: true, Internal: true},
-		{Name: "zt6vwy3rne", Network: "zerotier", CIDR: "192.168.99.1/24", Addr: "192.168.99.1", Up: true, Internal: true},
+		{Name: fallbackLANIface, Network: "lan", CIDR: demoHostIP(lanPrefix, lanBits, 254) + "/" + strconv.Itoa(lanBits), Addr: demoHostIP(lanPrefix, lanBits, 254), Up: true, Internal: true},
+		{Name: "zt6vwy3rne", Network: "zerotier", CIDR: demoHostIP(ztPrefix, ztBits, 1) + "/" + strconv.Itoa(ztBits), Addr: demoHostIP(ztPrefix, ztBits, 1), Up: true, Internal: true},
 		{Name: "eth0", Network: "other", CIDR: "10.0.0.2/24", Addr: "10.0.0.2", Up: true, Internal: false},
 		{Name: "docker0", Network: "docker", CIDR: "172.17.0.1/16", Addr: "172.17.0.1", Up: false, Internal: false},
 		{Name: "tun0", Network: "vpn", CIDR: "10.8.0.1/24", Addr: "10.8.0.1", Up: false, Internal: true},
@@ -901,11 +1136,10 @@ func (a *App) protectedSet() map[string]bool {
 	add("127.0.0.1")
 	// 本机所有接口地址
 	if a.cfg.Demo {
-		for _, f := range demoInterfaces() {
+		// 演示接口自带的 LAN/ZT 地址即"本机地址"，无需再写死具体网段。
+		for _, f := range a.demoInterfaces() {
 			add(f.Addr)
 		}
-		add("192.168.1.254")
-		add("192.168.99.1")
 	} else {
 		// 复用共享的 `ip -br addr show` 缓存：与 interfaces() 共用同一份输出，
 		// 同一 10s 窗口内不再重复 fork ip 命令。

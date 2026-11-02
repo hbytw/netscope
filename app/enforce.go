@@ -5,7 +5,9 @@ package main
 // 安全原则（用户正在使用该路由器）：
 //   - iptables 只写自有链 UBM_FWD / UBM_IN，绝不修改/删除他人链；
 //     修改前用 iptables-save 快照，任何一步失败立即 iptables-restore 回滚。
-//   - tc 限速默认关闭；应用失败删除本次创建的 qdisc 回滚，绝不留下坏掉的 br-lan 队列。
+//   - tc 限速默认关闭；应用失败删除本次创建的 qdisc 回滚，绝不留下坏掉的 LAN 队列。
+//     限速的出接口不写死：用拓扑探测到的 LAN 接口名（见 Enforcer.lanDev），
+//     探测不到内网桥/网口时整轮跳过限速并在状态里标记原因，不对不存在的接口下发命令。
 //   - 域名封堵不走 dnsmasq，改为域名解析成 IP 写 ipset（ubm_block），
 //     iptables 链内 `-m set --match-set ubm_block dst -j DROP`；解析失败进入待重试队列。
 //   - 所有外部命令经 App.shell 串行执行；-demo / -dry-run 只记录不执行。
@@ -45,7 +47,7 @@ type EnforceStatus struct {
 	DNSBlockedDomains int    `json:"dnsBlockedDomains"`
 	ActivePolicies    int    `json:"activePolicies"`
 	DNSTap            bool   `json:"dnsTap"`
-	TcConflict        string `json:"tcConflict,omitempty"` // 非空：br-lan/ifb0 队列归属用户 QoS，已跳过限速下发
+	TcConflict        string `json:"tcConflict,omitempty"` // 非空：LAN 根队列归属用户 QoS / 未探测到 LAN 接口，已跳过限速下发
 }
 
 // BlockEntry 封禁/限速记录（/api/enforce/blocks 展示用）。
@@ -129,6 +131,25 @@ func (e *Enforcer) ensureChains() error {
 // dryRunMode 演示/试运行模式：外部命令只记录不执行，无法核验系统状态。
 func (e *Enforcer) dryRunMode() bool {
 	return e.app == nil || e.app.cfg.Demo || e.app.cfg.DryRun
+}
+
+// lanDev 返回限速使用的 LAN 出口接口名。
+//
+// ok=false 表示没有可用的内网接口（未探测到 LAN 桥/网口，或探测到的名字在当前
+// 系统里并不存在）：此时调用方必须安全跳过 tc 下发，而不是硬编码 br-lan 去操作
+// 一个不存在的接口。dry-run/demo 下不做真实存在性校验（命令本来就不执行）。
+func (e *Enforcer) lanDev() (string, bool) {
+	if e.app == nil {
+		return "", false
+	}
+	name, ok := e.app.detectedLanIface()
+	if !ok {
+		return "", false
+	}
+	if !e.dryRunMode() && !e.linkExists(name) {
+		return "", false
+	}
+	return name, true
 }
 
 // iptablesDump 读取当前 iptables 规则表（供自有链/规则核对）。
@@ -291,17 +312,24 @@ func (e *Enforcer) tcIngressExists(dev string) bool {
 	return strings.Contains(out, " ingress ")
 }
 
-// tcConflictReason 探测既有根队列归属，返回非空表示与用户 QoS 冲突。
+// tcConflictReason 探测既有根队列归属，返回非空表示本轮应跳过 tc 下发。
 //
-// 判定口径：内核自动创建的默认根队列句柄为 0:（pfifo_fast / fq_codel / noqueue），
-// 可以被本程序替换，不算冲突；除此之外的非自有句柄（例如 luci-app-sqm 的 1:）
-// 视为用户自建，一律不覆盖、不删除，整轮跳过 tc 下发。
+// 判定口径：
+//   - 先确认 LAN 出口接口真实可用（不同路由器是 br-lan/br0/br-guest/单网口 eth0）；
+//     探测不到直接跳过，原因写入状态，绝不对不存在的接口下发命令；
+//   - 内核自动创建的默认根队列句柄为 0:（pfifo_fast / fq_codel / noqueue），
+//     可以被本程序替换，不算冲突；除此之外的非自有句柄（例如 luci-app-sqm 的 1:）
+//     视为用户自建，一律不覆盖、不删除，整轮跳过 tc 下发。
 func (e *Enforcer) tcConflictReason() string {
 	if e.dryRunMode() {
 		return ""
 	}
-	if h, conflict := tcRootConflict(e.tcRootHandles("br-lan"), tcHandleRoot); conflict {
-		return fmt.Sprintf("br-lan 根队列（%s）非本程序创建，与用户 QoS 冲突，已跳过限速下发", h)
+	dev, ok := e.lanDev()
+	if !ok {
+		return "未探测到可用的 LAN 接口（无 br-lan/br0/br-* 等内网桥或网口），已跳过限速下发"
+	}
+	if h, conflict := tcRootConflict(e.tcRootHandles(dev), tcHandleRoot); conflict {
+		return fmt.Sprintf("%s 根队列（%s）非本程序创建，与用户 QoS 冲突，已跳过限速下发", dev, h)
 	}
 	for _, l := range e.limits {
 		if l.Up <= 0 {
@@ -329,6 +357,9 @@ func tcRootConflict(handles map[string]bool, own string) (string, bool) {
 // 根队列句柄固定为 tcHandleRoot/tcHandleIfb（与用户自有 QoS 常用句柄区分），
 // 删除时按句柄比对，确保不误删 luci-app-sqm 等用户配置。
 // 失败时不直接删除用户队列，由调用方用旧状态重新下发恢复。
+//
+// 出接口用探测到的 LAN 接口（dev），不写死 br-lan：单网口 / br0 / br-guest
+// 等形态都能正确下发；探测不到可用 LAN 接口时整轮跳过并把原因写进 tcConflict。
 func (e *Enforcer) rebuildTC() ([]string, error) {
 	var applied []string
 	if len(e.limits) == 0 {
@@ -336,7 +367,8 @@ func (e *Enforcer) rebuildTC() ([]string, error) {
 		e.teardownTC(false)
 		return applied, nil
 	}
-	// 下发前先探测既有根队列归属：br-lan/ifb0 已被用户 QoS（如 luci-app-sqm）接管时
+	// 下发前先探测既有根队列归属与 LAN 接口是否可用：
+	// LAN 接口不存在，或 LC/ifb0 已被用户 QoS（如 luci-app-sqm）接管时
 	// 不覆盖、不删除，整轮跳过并记录状态，避免 tc 下发整体失败或破坏用户队列。
 	if msg := e.tcConflictReason(); msg != "" {
 		if e.tcConflict != msg {
@@ -346,18 +378,27 @@ func (e *Enforcer) rebuildTC() ([]string, error) {
 		return applied, nil
 	}
 	e.tcConflict = ""
+	dev, ok := e.lanDev()
+	if !ok {
+		msg := "未探测到可用的 LAN 接口（无 br-lan/br0/br-* 等内网桥或网口），已跳过限速下发"
+		if e.tcConflict != msg {
+			e.tcConflict = msg
+			logf("%s", msg)
+		}
+		return applied, nil
+	}
 	cmds := []string{}
-	// 下行：br-lan 出口 htb
+	// 下行：LAN 出口 htb
 	if !e.tcRootOwned {
-		if e.tcRootHandles("br-lan")[tcHandleRoot] {
+		if e.tcRootHandles(dev)[tcHandleRoot] {
 			e.tcRootOwned = true // 已存在且句柄一致，视为本程序创建
 		} else {
-			cmds = append(cmds, "tc qdisc add dev br-lan root handle "+tcHandleRoot+" htb default 1")
+			cmds = append(cmds, "tc qdisc add dev "+dev+" root handle "+tcHandleRoot+" htb default 1")
 		}
 	}
 	cmds = append(cmds,
-		"tc class replace dev br-lan parent "+tcHandleRoot+" classid "+tcHandleRoot+"1 htb rate 1000000kbit ceil 1000000kbit",
-		"tc filter del dev br-lan parent "+tcHandleRoot+" prio 10 2>/dev/null")
+		"tc class replace dev "+dev+" parent "+tcHandleRoot+" classid "+tcHandleRoot+"1 htb rate 1000000kbit ceil 1000000kbit",
+		"tc filter del dev "+dev+" parent "+tcHandleRoot+" prio 10 2>/dev/null")
 	downIPs := make([]string, 0, len(e.limits))
 	for ip, l := range e.limits {
 		if l.Down > 0 {
@@ -369,8 +410,8 @@ func (e *Enforcer) rebuildTC() ([]string, error) {
 		l := e.limits[ip]
 		minor := classMinor(ip)
 		cmds = append(cmds,
-			fmt.Sprintf("tc class replace dev br-lan parent %s classid %s%d htb rate %dkbit ceil %dkbit", tcHandleRoot, tcHandleRoot, minor, l.Down, l.Down),
-			fmt.Sprintf("tc filter add dev br-lan parent %s protocol ip prio 10 u32 match ip dst %s/32 flowid %s%d", tcHandleRoot, ip, tcHandleRoot, minor))
+			fmt.Sprintf("tc class replace dev %s parent %s classid %s%d htb rate %dkbit ceil %dkbit", dev, tcHandleRoot, tcHandleRoot, minor, l.Down, l.Down),
+			fmt.Sprintf("tc filter add dev %s parent %s protocol ip prio 10 u32 match ip dst %s/32 flowid %s%d", dev, tcHandleRoot, ip, tcHandleRoot, minor))
 	}
 	// 上行：ifb0
 	upIPs := make([]string, 0, len(e.limits))
@@ -389,9 +430,9 @@ func (e *Enforcer) rebuildTC() ([]string, error) {
 				cmds = append(cmds, "ip link add ifb0 type ifb 2>/dev/null; ip link set ifb0 up")
 			}
 		}
-		if !e.tcIngressOwned && !e.tcIngressExists("br-lan") {
+		if !e.tcIngressOwned && !e.tcIngressExists(dev) {
 			// 已有 ingress 队列（用户 sqm 等自带）时不重复添加，也不接管
-			cmds = append(cmds, "tc qdisc add dev br-lan handle ffff: ingress")
+			cmds = append(cmds, "tc qdisc add dev "+dev+" handle ffff: ingress")
 		}
 		if !e.tcIfbRootOwned {
 			if e.tcRootHandles("ifb0")[tcHandleIfb] {
@@ -402,13 +443,13 @@ func (e *Enforcer) rebuildTC() ([]string, error) {
 		}
 		cmds = append(cmds,
 			"tc class replace dev ifb0 parent "+tcHandleIfb+" classid "+tcHandleIfb+"1 htb rate 1000000kbit ceil 1000000kbit",
-			"tc filter del dev br-lan parent ffff: prio 11 2>/dev/null",
+			"tc filter del dev "+dev+" parent ffff: prio 11 2>/dev/null",
 			"tc filter del dev ifb0 parent "+tcHandleIfb+" prio 11 2>/dev/null")
 		for _, ip := range upIPs {
 			l := e.limits[ip]
 			minor := classMinor(ip)
 			cmds = append(cmds,
-				fmt.Sprintf("tc filter add dev br-lan parent ffff: protocol ip prio 11 u32 match ip src %s/32 action mirred egress redirect dev ifb0", ip),
+				fmt.Sprintf("tc filter add dev %s parent ffff: protocol ip prio 11 u32 match ip src %s/32 action mirred egress redirect dev ifb0", dev, ip),
 				fmt.Sprintf("tc class replace dev ifb0 parent %s classid %s%d htb rate %dkbit ceil %dkbit", tcHandleIfb, tcHandleIfb, minor, l.Up, l.Up),
 				fmt.Sprintf("tc filter add dev ifb0 parent %s protocol ip prio 11 u32 match ip dst %s/32 flowid %s%d", tcHandleIfb, ip, tcHandleIfb, minor))
 		}
@@ -418,7 +459,7 @@ func (e *Enforcer) rebuildTC() ([]string, error) {
 		if _, ok := e.limits[ip]; ok {
 			continue
 		}
-		e.app.shellQuiet(fmt.Sprintf("tc class del dev br-lan classid %s%d 2>/dev/null", tcHandleRoot, classMinor(ip)))
+		e.app.shellQuiet(fmt.Sprintf("tc class del dev %s classid %s%d 2>/dev/null", dev, tcHandleRoot, classMinor(ip)))
 		e.app.shellQuiet(fmt.Sprintf("tc class del dev ifb0 classid %s%d 2>/dev/null", tcHandleIfb, classMinor(ip)))
 	}
 	// 记录本轮限速设备（失败回滚时据此清理本次新增的 class）
@@ -435,7 +476,7 @@ func (e *Enforcer) rebuildTC() ([]string, error) {
 		applied = append(applied, c)
 		// 记录创建成功
 		switch {
-		case strings.HasPrefix(c, "tc qdisc add dev br-lan root"):
+		case strings.HasPrefix(c, "tc qdisc add dev "+dev+" root"):
 			e.tcRootOwned = true
 		case strings.Contains(c, "handle ffff: ingress"):
 			e.tcIngressOwned = true
@@ -450,26 +491,30 @@ func (e *Enforcer) rebuildTC() ([]string, error) {
 
 // teardownTC 清理限速配置。
 // 只删除本程序创建的队列与 class（先用 tc qdisc show 比对句柄），
-// 绝不误删用户自有 QoS（luci-app-sqm 等的 br-lan 根队列 / ifb0）。
+// 绝不误删用户自有 QoS（luci-app-sqm 等的 LAN 根队列 / ifb0）。
+// LAN 接口探测不到时跳过所有针对 LAN 接口的命令（接口都不在了，无需也不该操作）。
 func (e *Enforcer) teardownTC(force bool) {
 	// force=true 用于"一键清空/撤销"场景；删除动作一律按句柄比对，
-	// 不再像旧实现那样无条件删除 br-lan 根队列与 ifb0。
+	// 不再像旧实现那样无条件删除 LAN 根队列与 ifb0。
 	_ = force
 	e.tcConflict = ""
+	dev, hasDev := e.lanDev()
 	// 本程序下发过的设备 class
 	for ip := range e.tcLimited {
-		e.app.shellQuiet(fmt.Sprintf("tc class del dev br-lan classid %s%d 2>/dev/null", tcHandleRoot, classMinor(ip)))
+		if hasDev {
+			e.app.shellQuiet(fmt.Sprintf("tc class del dev %s classid %s%d 2>/dev/null", dev, tcHandleRoot, classMinor(ip)))
+		}
 		e.app.shellQuiet(fmt.Sprintf("tc class del dev ifb0 classid %s%d 2>/dev/null", tcHandleIfb, classMinor(ip)))
 	}
 	e.tcLimited = map[string]bool{}
-	// br-lan 根队列：句柄一致（本程序的 10:）才删除
-	if e.dryRunMode() || e.tcRootHandles("br-lan")[tcHandleRoot] {
-		e.app.shellQuiet("tc qdisc del dev br-lan root 2>/dev/null")
+	// LAN 根队列：句柄一致（本程序的 10:）才删除
+	if hasDev && (e.dryRunMode() || e.tcRootHandles(dev)[tcHandleRoot]) {
+		e.app.shellQuiet("tc qdisc del dev " + dev + " root 2>/dev/null")
 	}
 	e.tcRootOwned = false
 	// ingress 队列：只有本程序创建（用户自有的 ffff: ingress 不动）
-	if e.tcIngressOwned {
-		e.app.shellQuiet("tc qdisc del dev br-lan handle ffff: ingress 2>/dev/null")
+	if e.tcIngressOwned && hasDev {
+		e.app.shellQuiet("tc qdisc del dev " + dev + " handle ffff: ingress 2>/dev/null")
 	}
 	e.tcIngressOwned = false
 	// ifb0 根队列：句柄一致（本程序的 20:）才删除
@@ -661,12 +706,17 @@ func (e *Enforcer) SetLimit(ip string, down, up int) ([]string, error) {
 		return applied, err
 	}
 	minor := classMinor(ip)
+	dev, hasDev := e.lanDev()
+	if !hasDev {
+		// 未探测到 LAN 接口：applyDeviceState 已安全跳过 tc，这里只回显原因。
+		return []string{"（未探测到可用 LAN 接口，已跳过 tc 限速下发）"}, nil
+	}
 	if down <= 0 && up <= 0 {
-		return []string{fmt.Sprintf("tc class del dev br-lan classid %s%d", tcHandleRoot, minor)}, nil
+		return []string{fmt.Sprintf("tc class del dev %s classid %s%d", dev, tcHandleRoot, minor)}, nil
 	}
 	out := []string{}
 	if down > 0 {
-		out = append(out, fmt.Sprintf("tc class replace dev br-lan parent %s classid %s%d htb rate %dkbit", tcHandleRoot, tcHandleRoot, minor, down))
+		out = append(out, fmt.Sprintf("tc class replace dev %s parent %s classid %s%d htb rate %dkbit", dev, tcHandleRoot, tcHandleRoot, minor, down))
 	}
 	if up > 0 {
 		out = append(out, fmt.Sprintf("tc class replace dev ifb0 parent %s classid %s%d htb rate %dkbit", tcHandleIfb, tcHandleIfb, minor, up))
@@ -1472,7 +1522,7 @@ func (e *Enforcer) Reset() ([]string, error) {
 	e.app.shellQuiet("ipset flush " + ipsetName + " 2>/dev/null; ipset destroy " + ipsetName + " 2>/dev/null")
 	removed = append(removed, "ipset: ubm_block 已销毁")
 	e.teardownTC(true)
-	removed = append(removed, "tc: br-lan / ifb0 队列已清理")
+	removed = append(removed, fmt.Sprintf("tc: %s / ifb0 队列已清理", e.app.LanIfaceName()))
 	// 停用全部策略、清空手工管控状态与持久化记录，避免 15s 后又被重新下发
 	if e.app.store != nil {
 		pols := e.app.store.Policies()

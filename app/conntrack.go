@@ -130,6 +130,10 @@ type ConnEngine struct {
 	mu         sync.Mutex // 串行化 Reset 与 Collect 对 flows/retired/baseline 的访问
 	flowMu     sync.Mutex // 保护 flowHook
 	flowHook   func(FlowContext)
+	// lanIface 当前 LAN 接口名（运行期由 App.syncConnNets 写入）：
+	// 设备网段没带接口名时用它补齐；探测不到就保持空串，归因结果 Iface 留空，
+	// 不再硬编码 br-lan（不同路由器 LAN 桥可能叫 br0/br-guest 或单网口 eth0）。
+	lanIface atomic.Value // string
 }
 
 // netsSnapshot 设备网段 / 路由网段 / 本机 IP 的不可变快照。
@@ -197,6 +201,24 @@ func (e *ConnEngine) setNets(device, route []ipNet) {
 	snap.device = append([]ipNet(nil), device...)
 	snap.route = append([]ipNet(nil), route...)
 	e.nets.Store(snap)
+}
+
+// SetLANIface 记录当前 LAN 接口名（由 App.syncConnNets 按接口采集结果写入）。
+// 传空串表示探测不到 LAN 接口：归因时 Iface 保持为空，而不是编造一个接口名。
+func (e *ConnEngine) SetLANIface(name string) {
+	if e == nil {
+		return
+	}
+	e.lanIface.Store(name)
+}
+
+// LANIfaceName 返回当前记录的 LAN 接口名（未探测到为空串）。
+func (e *ConnEngine) LANIfaceName() string {
+	if e == nil {
+		return ""
+	}
+	name, _ := e.lanIface.Load().(string)
+	return name
 }
 
 // netsSnapshot 取当前网段快照（未初始化时返回空快照）。
@@ -524,7 +546,9 @@ func (e *ConnEngine) normalize(ent ctEntry) (flowKey, int64, int64, flowMeta, bo
 			device: true,
 		}
 		if meta.iface == "" {
-			meta.iface = "br-lan"
+			// 设备网段没带接口名（例如从 config.json 的 lanCidr 兜底建网段）：
+			// 用运行期探测到的 LAN 接口；再探测不到就留空，不硬编码 br-lan。
+			meta.iface = e.LANIfaceName()
 		}
 		return k, ent.OrigBytes, ent.ReplyBytes, meta, true
 	}
@@ -542,7 +566,7 @@ func (e *ConnEngine) normalize(ent ctEntry) (flowKey, int64, int64, flowMeta, bo
 			inbound: true, // 设备是接收方：远端主动连入
 		}
 		if meta.iface == "" {
-			meta.iface = "br-lan"
+			meta.iface = e.LANIfaceName()
 		}
 		return k, ent.ReplyBytes, ent.OrigBytes, meta, true
 	}

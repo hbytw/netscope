@@ -13,11 +13,13 @@
       4) tools\verify\report.mjs      汇总报告写入 docs/
 
   依赖：Node 18+、Python + paramiko；截图需要本机 Chrome（playwright-core 用系统 Chrome）。
+  主机：环境变量 OWRT_HOST（或用 -Host_ 传入）必须设置 —— 脚本不内置任何默认 IP，
+        不同路由器网段不同，默认到某个地址会把验收流量打到错误设备。
   密码：环境变量 OWRT_PASS（必须设置）。
 #>
 [CmdletBinding()]
 param(
-    [string]$Host_ = $(if ($env:OWRT_HOST) { $env:OWRT_HOST } else { '192.168.1.254' }),
+    [string]$Host_ = $(if ($env:OWRT_HOST) { $env:OWRT_HOST } else { '' }),
     [string]$Pass = $(if ($env:OWRT_PASS) { $env:OWRT_PASS } else { '' }),
     [switch]$SkipBuild,
     [switch]$SkipShots,
@@ -30,6 +32,14 @@ $ErrorActionPreference = 'Stop'
 function Write-Step($m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Write-Ok($m) { Write-Host "    OK  $m" -ForegroundColor Green }
 function Write-Err($m) { Write-Host "    ERR $m" -ForegroundColor Red }
+
+if (-not $Host_) {
+    Write-Err '未指定目标主机：请设置环境变量 OWRT_HOST，或用 -Host_ 传入。'
+    Write-Host '  例：$env:OWRT_HOST = "192.168.8.4"' -ForegroundColor Yellow
+    Write-Host '  例：powershell -ExecutionPolicy Bypass -File deploy\run-verify.ps1 -Host_ 192.168.8.4' -ForegroundColor Yellow
+    Write-Host '本脚本不内置任何默认 IP：不同路由器网段不同。' -ForegroundColor Yellow
+    exit 2
+}
 
 if (-not $Pass) {
     Write-Err '请先设置环境变量 OWRT_PASS（路由器 root 密码）。'

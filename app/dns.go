@@ -1285,6 +1285,22 @@ func (a *App) dnsConfLogFacility() (string, bool) {
 	return strings.TrimSpace(line), true
 }
 
+// ensureDnsmasqConfLogQueries 确保 /etc/dnsmasq.conf 含一行 log-queries。
+//
+// 背景：OpenWrt 会把 uci 的 logqueries 写进它生成的 /var/etc/dnsmasq.conf.cfgXXXX，
+// 但 passwall/Xray 等插件会另起一个 dnsmasq 实例接管 DNS（iptables PSW_DNS 重定向），
+// 该实例只读 /etc/dnsmasq.conf（以及它自己的 conf），不会读生成的 cfg 文件。
+// 结果：系统 dnsmasq 有 log-queries，真正处理查询的实例没有 → 日志永远为空、
+// 域名/分类归因整体失效。这里补一行保证两种实例都记日志。
+// 多余的 log-queries 不会导致 dnsmasq 启动失败（已验证），且本函数幂等。
+func (a *App) ensureDnsmasqConfLogQueries() {
+	if a.cfg.Demo || a.cfg.DryRun {
+		return
+	}
+	a.shellQuiet("grep -q '^[[:space:]]*log-queries' " + dnsmasqConfPath + " || echo 'log-queries' >> " + dnsmasqConfPath)
+	// 关闭旁挂时若仍残留另一处 log-queries 也不算故障，保持不动（避免误删用户配置）
+}
+
 // dnsConfSetLogFacility 把 /etc/dnsmasq.conf 的 log-facility 行替换为 newVal。
 // 若该行存在则 sed 替换；不存在则追加一行（通常不会走到，conf 恒有该行）。
 // 首次替换前把原值备份到 dnsConfBackup（供关闭时还原）。
@@ -1373,6 +1389,12 @@ func (a *App) ApplyDNSTap(enabled bool) error {
 			}
 			return fmt.Errorf("设置 DNS 日志去向失败，已回滚: %w", err)
 		}
+		// passwall/v2ray 等插件会另起一个 dnsmasq 实例接管 DNS（iptables PSW_DNS 重定向到本地高端口），
+		// 该实例读取的是 /etc/dnsmasq.conf（conf-file 包含它），而 OpenWrt 生成的
+		// /var/etc/dnsmasq.conf.cfgXXXX 里的 log-queries 只对系统实例有效。
+		// 因此必须在 /etc/dnsmasq.conf 里也补一条 log-queries，否则这类设备上
+		// DNS 查询日志永远为空（域名/分类归因整体失效）。重复的 log-queries 不会让 dnsmasq 启动失败。
+		a.ensureDnsmasqConfLogQueries()
 		if _, err := a.shell("uci commit dhcp"); err != nil {
 			a.shellQuiet("uci delete dhcp.@dnsmasq[0].logqueries")
 			_ = a.dnsConfRestoreLogFacility()

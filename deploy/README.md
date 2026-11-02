@@ -1,10 +1,10 @@
 # 观澜 NetScope · 部署与运维
 
-本文档描述如何把观澜 NetScope 服务端构建、部署到 OpenWrt 旁路由 `192.168.1.254`，
+本文档描述如何把观澜 NetScope 服务端构建、部署到任意 OpenWrt 旁路由（地址通过 `OWRT_HOST` 指定，不内置默认 IP），
 以及如何回滚与卸载。
 
-> **目标设备**：Phicomm N1 · aarch64 · OpenWrt SNAPSHOT R2024.11.05 flippy-92+o
-> **访问地址**：`http://192.168.1.254:8088`
+> **目标设备**：任意 OpenWrt 旁路由，支持 **aarch64** 与 **x86_64**（架构按本机/远端自动探测）
+> **访问地址**：`http://<路由器LAN地址>:8088`（安装脚本会自动打印探测到的地址）
 > **数据分区**：`/mnt/mmcblk2p4/guanlan`（overlay 仅剩 ~209 MB，数据一律落 mmcblk2p4）
 
 ---
@@ -13,7 +13,7 @@
 
 | 文件 | 运行位置 | 说明 |
 |---|---|---|
-| `build.ps1` | Windows | 交叉编译 `linux/arm64` 静态二进制 → `dist/guanlan`，输出体积与 sha256 |
+| `build.ps1` | Windows | 交叉编译静态二进制 → `dist/guanlan-<arch>`（默认 arm64，`-GoArch amd64` 或 `-Both` 构建两架构），输出体积与 sha256 |
 | `deploy.ps1` | Windows | 构建 → 上传 → 远端执行安装 → 打印访问地址 |
 | `install.sh` | 路由器 | 幂等安装：二进制、init 脚本、配置、UCI DNS 旁挂、启动自检 |
 | `uninstall.sh` | 路由器 | 幂等卸载：停服务、删文件、还原 UCI、清理 iptables/tc、残留检查 |
@@ -32,7 +32,7 @@ powershell -ExecutionPolicy Bypass -File deploy\build.ps1
 ```
 
 产物：`dist/guanlan`（约 11 MB）+ `dist/build-meta.json`（体积/sha256/构建时间）。
-脚本会校验 ELF 头必须是 **aarch64**，架构不符直接报错退出。
+脚本会按路由器本机架构（`uname -m`）校验 ELF 头：aarch64 需 `0xB7`、x86_64 需 `0x3E`，架构不符直接报错退出。
 
 ### 2.2 部署（构建 + 上传 + 安装 + 自检）
 
@@ -334,7 +334,7 @@ UPTIME_SEC=3600
 | 症状 | 排查 |
 |---|---|
 | 安装脚本报"找不到二进制来源" | 先确认 `dist/guanlan` 已构建并上传到 `/tmp/guanlan.new` |
-| 报"不是有效的 ELF"或"架构不是 aarch64" | 产物不对，重新执行 `build.ps1` |
+| 报"不是有效的 ELF"或"架构不匹配" | 产物与本机架构不符，重新执行 `build.ps1 -GoArch <arm64\|amd64>` |
 | 报"安装后大小不一致" | 上传过程中断，重新上传 |
 | 服务起不来 | `cat /mnt/mmcblk2p4/guanlan/logs/guanlan.log`；`/etc/init.d/guanlan status` |
 | healthz 不通 | 确认端口未被占：`netstat -lnt \| grep 8088` |
@@ -378,6 +378,6 @@ powershell -ExecutionPolicy Bypass -File deploy" + [IO.Path]::DirectorySeparator
 | 组件 | 版本 |
 |---|---|
 | Go | 1.26.1（Windows 交叉编译） |
-| 目标架构 | linux/arm64（aarch64），CGO_ENABLED=0 |
+| 目标架构 | linux/arm64（aarch64）或 linux/amd64（x86_64），CGO_ENABLED=0 |
 | OpenWrt | SNAPSHOT R2024.11.05 flippy-92+o |
 | Node（仅本机验收） | 24.x + playwright-core（用系统 Chrome，不下载浏览器） |
