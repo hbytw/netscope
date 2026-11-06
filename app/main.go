@@ -104,6 +104,9 @@ type App struct {
 	proxyMu  sync.Mutex
 	proxyUp  bool
 	proxyAt  int64
+	// proxyTool 缓存可用的监听端口查询工具：ss 或 netstat（空=尚未探测，"none"=都不可用）。
+	// 有些 OpenWrt 固件不带 ss，若每轮都先试 ss 就会每 18 秒刷一条 "exec 失败" 日志。
+	proxyTool string
 
 	// 本机/网关保护集合（防止误封路由器自身导致断网）
 	protMu  sync.Mutex
@@ -153,6 +156,26 @@ func NewApp(cfg *Config) *App {
 // logf 统一日志（procd 收集 stdout）。
 func logf(format string, args ...interface{}) {
 	log.Printf(format, args...)
+}
+
+// logDebug 控制是否输出调试日志，默认关闭，用环境变量 GUANLAN_DEBUG=1 打开。
+//
+// 为什么需要这个开关：
+// 采集/拓扑/设备刷新每 2~10 秒就会执行一批 shell 命令（ip/ss/df/ping），
+// 每成功一条都打一行 "exec: ..." —— 实测每 10 秒约 4 行、一小时 1400+ 行。
+// 后果是把真正重要的告警和故障信息挤掉：等到需要排查问题时，
+// 日志缓冲区里全是 exec 噪声，故障现场早就被冲没了。
+//
+// 所以「命令执行成功」属于调试信息，不是运行日志；默认不输出。
+// 需要排查具体命令时要打开：GUANLAN_DEBUG=1 /etc/init.d/guanlan restart
+var logDebug = os.Getenv("GUANLAN_DEBUG") == "1"
+
+// logDebugf 只在调试模式下输出。
+func logDebugf(format string, args ...interface{}) {
+	if !logDebug {
+		return
+	}
+	log.Printf("[debug] "+format, args...)
 }
 
 // collectIntervalSec 采集间隔（可在设置页动态调整）。
@@ -344,6 +367,11 @@ func (a *App) ApplySwitchPatch(patch settingsPatch) (Settings, []string, []strin
 	// 采集链路开启/恢复后，同步多网段识别（zt/vpn 设备与流向）
 	if switchPatch && out.Enabled && out.Collect {
 		a.syncConnNets()
+	}
+	// 手工封禁域名跟随开关恢复下发（域名封堵/总开关/采集开启后立即生效，不等 15s 轮询）。
+	// 必须放在 UpdateSettings 之后：ApplyManualDomains 内部按「落库后」的开关状态判定。
+	if switchPatch || patch.DomainBlock != nil || patch.Collect != nil {
+		a.enf.ApplyManualDomains()
 	}
 	// 明文 HTTP URL 抓取：跟随 httpTap 开关即时启停（失败只记日志，不影响开关本身）
 	if patch.HTTPTap != nil || (switchPatch && !out.Enabled) {
@@ -691,9 +719,10 @@ func (a *App) restoreAllControl(snap enforceSnapshot) error {
 
 // enforceSnapshot 管控层可恢复状态快照。
 type enforceSnapshot struct {
-	domains      map[string]bool     // 已下发的域名封堵集合
-	domainIPs    map[string][]uint32 // 域名 → 已解析 IP（回滚时免去重新解析）
-	policyActive map[string]bool     // 已命中的策略集合
+	domains       map[string]bool     // 已下发的域名封堵集合
+	domainIPs     map[string][]uint32 // 域名 → 已解析 IP（回滚时免去重新解析）
+	policyActive  map[string]bool     // 已命中的策略集合
+	manualDomains map[string]bool     // 手工封禁域名镜像（回滚后策略下发不会丢手工封禁）
 }
 
 // snapshotEnforce 快照当前管控状态（撤销动作前调用）。
@@ -701,9 +730,10 @@ func (e *Enforcer) snapshotEnforce() enforceSnapshot {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	snap := enforceSnapshot{
-		domains:      copyBoolMap(e.dnsDomains),
-		domainIPs:    make(map[string][]uint32, len(e.domainIPs)),
-		policyActive: copyBoolMap(e.policyActive),
+		domains:       copyBoolMap(e.dnsDomains),
+		domainIPs:     make(map[string][]uint32, len(e.domainIPs)),
+		policyActive:  copyBoolMap(e.policyActive),
+		manualDomains: copyBoolMap(e.manualDomains),
 	}
 	for d, ips := range e.domainIPs {
 		snap.domainIPs[d] = append([]uint32(nil), ips...)
@@ -733,6 +763,8 @@ func (e *Enforcer) restoreDomains(snap enforceSnapshot) error {
 	e.dnsDomains = map[string]bool{}
 	e.dnsDesired = map[string]bool{}
 	e.pending = map[string]int64{}
+	// 手工封禁镜像随快照还原：否则回滚后的下一次策略下发会把手工域从期望集合里丢掉
+	e.manualDomains = copyBoolMap(snap.manualDomains)
 	if len(snap.domains) == 0 {
 		return nil
 	}
@@ -792,7 +824,7 @@ func (a *App) shellTimeout(cmd string, timeout time.Duration) (string, error) {
 		logf("exec 失败: %s => %v: %s", cmd, err, out)
 		return out, fmt.Errorf("%v: %s", err, out)
 	}
-	logf("exec: %s", cmd)
+	logDebugf("exec: %s", cmd)
 	return out, nil
 }
 
@@ -820,7 +852,7 @@ func (a *App) shellInput(cmd, input string) (string, error) {
 		logf("exec(stdin) 失败: %s => %v: %s", cmd, err, out)
 		return out, fmt.Errorf("%v: %s", err, out)
 	}
-	logf("exec(stdin): %s", cmd)
+	logDebugf("exec(stdin): %s", cmd)
 	return out, nil
 }
 
@@ -1035,7 +1067,7 @@ func (a *App) updateScale() {
 	a.agg.SetScale(next)
 	a.scaleLogN++
 	if a.scaleLogN%30 == 1 {
-		logf("[scale] 物理(单向)=%.2f Mbps conntrack=%.2f Mbps 系数=%.6f", float64(phys)/1e6, float64(ct)/1e6, next)
+		logDebugf("[scale] 物理(单向)=%.2f Mbps conntrack=%.2f Mbps 系数=%.6f", float64(phys)/1e6, float64(ct)/1e6, next)
 	}
 }
 
@@ -1448,6 +1480,10 @@ func (a *App) Run() error {
 	a.sec.RestoreWhitelist()
 	// 初始化 conntrack 多网段识别（LAN + zt/vpn 本地接口 + zt/vpn 远端路由）
 	a.syncConnNets()
+	// 手工封禁域名恢复下发（domainBlock 开关开启时；关闭时内部直接跳过）
+	if a.enf.ApplyManualDomains() {
+		logf("已恢复手工封禁域名 %d 条", len(a.store.DomainBlocks()))
+	}
 	// 明文 HTTP URL 抓取（可选开关，默认关闭）：只在开启且采集生效时启动
 	if s := a.store.Settings(); s.Enabled && s.Collect && s.HTTPTap {
 		if err := a.StartHTTPTap(); err != nil {

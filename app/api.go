@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -245,8 +246,23 @@ func (a *App) logMiddleware(next http.Handler) http.Handler {
 		start := time.Now()
 		lw := &logWriter{ResponseWriter: w, status: 200}
 		next.ServeHTTP(lw, r)
-		if !strings.HasPrefix(r.URL.Path, "/api/stream") {
-			logf("%s %s %d %s", r.Method, r.URL.Path, lw.status, time.Since(start).Round(time.Millisecond))
+		if strings.HasPrefix(r.URL.Path, "/api/stream") {
+			return // SSE 长连接本来就不会正常结束，不记
+		}
+		dur := time.Since(start)
+		// 只记「异常请求」：非 2xx 状态码，或者慢请求（>=1s）。
+		//
+		// 为什么不记全部：仪表盘会持续轮询 /api/devices、/api/settings、/api/overview，
+		// 每个请求一行，页面开着时约 10~20 行/分钟，几个小时就把内核日志缓冲区
+		// （logd 默认 64KB）刷满，真正有用的告警和开机日志全被挤掉 ——
+		// 实测正是这个现象导致故障现场无法回溯。
+		// 正常的 200 快速响应没有诊断价值，异常与慢请求才值得记。
+		//
+		// 401 单独排除：浏览器标签页开久了会话必然过期，前端会继续轮询并持续拿 401，
+		// 这属于客户端登录状态问题，登录失败本身由 LoginGuard 单独记录并限频；
+		// 写进访问日志只会变成另一股噪声。
+		if lw.status >= 400 && lw.status != 401 || dur >= time.Second {
+			logf("%s %s %d %s", r.Method, r.URL.Path, lw.status, dur.Round(time.Millisecond))
 		}
 	})
 }
@@ -505,8 +521,11 @@ func (a *App) handleOverview(w http.ResponseWriter, r *http.Request) {
 }
 
 type kpiJSON struct {
-	Online    int     `json:"online"`
-	Devices   int     `json:"devices"`
+	Online  int `json:"online"`
+	Devices int `json:"devices"`
+	// ZeroTier 设备单独计数（口径：lan 才是内网设备，zerotier 另算）
+	ZtDevices int     `json:"ztDevices"`
+	ZtOnline  int     `json:"ztOnline"`
 	Conns     int64   `json:"conns"`
 	NewConns  int     `json:"newConns"`
 	DNSQps    float64 `json:"dnsQps"`
@@ -616,9 +635,18 @@ func (a *App) buildOverview() overviewResp {
 
 	devJSON := make([]DeviceJSON, 0, len(states))
 	online := 0
+	ztDevices, ztOnline := 0, 0
 	for _, st := range states {
 		meta := metas[st.IP]
 		if meta.Hidden || !isInternalNetwork(st.Network) {
+			continue
+		}
+		// 口径：KPI 的设备数/在线只算本地 DHCP 网段（lan）；ZeroTier 另算
+		if st.Network == "zerotier" {
+			ztDevices++
+			if st.Online {
+				ztOnline++
+			}
 			continue
 		}
 		dj := a.deviceJSON(st, meta, connCounts[st.IP], pols)
@@ -687,7 +715,9 @@ func (a *App) buildOverview() overviewResp {
 	return overviewResp{
 		Ts: now,
 		KPI: kpiJSON{
-			Online: online, Devices: len(devJSON), Conns: sys.ConnCount,
+			Online: online, Devices: len(devJSON),
+			ZtDevices: ztDevices, ZtOnline: ztOnline,
+			Conns:    sys.ConnCount,
 			NewConns: rates.NewConnsLastMin, DNSQps: round1f(a.dns.QPS(now)),
 			Alerts: a.store.UnackedCount(),
 			// 实时上下行：有真 WAN 口时取 WAN 接口计数（每字节只计一次）；
@@ -1089,11 +1119,13 @@ type domainDevBriefJSON struct {
 type domainEntryJSON struct {
 	Domain string `json:"domain"`
 	// URL 完整访问地址（scheme://host[:port]/）；HTTP(S) 路径属加密内容不可见
-	URL        string               `json:"url"`
-	Scheme     string               `json:"scheme"`
-	Port       int                  `json:"port"`
-	Label      string               `json:"label"`
-	Category   string               `json:"category"`
+	URL      string `json:"url"`
+	Scheme   string `json:"scheme"`
+	Port     int    `json:"port"`
+	Label    string `json:"label"`
+	Category string `json:"category"`
+	// Blocked 是否已被手工封禁（列表/详情可直接展示与解封）
+	Blocked    bool                 `json:"blocked"`
 	Hits       int64                `json:"hits"`
 	Bytes      int64                `json:"bytes"`
 	Devices    int                  `json:"devices"`
@@ -1428,7 +1460,8 @@ func (a *App) handleTrafficDomains(w http.ResponseWriter, r *http.Request) {
 		out = append(out, domainEntryJSON{
 			Domain: d.Domain, URL: urlStr, Scheme: scheme, Port: d.Port,
 			Label: d.Label, Category: d.Category,
-			Hits: d.Hits, Bytes: scBytes(d.Bytes), Devices: d.Devices, LastSeen: d.LastSeen,
+			Blocked: a.store.IsDomainBlock(d.Domain),
+			Hits:    d.Hits, Bytes: scBytes(d.Bytes), Devices: d.Devices, LastSeen: d.LastSeen,
 			DeviceList: devList, Paths: paths,
 		})
 	}
@@ -1700,11 +1733,104 @@ func (a *App) handleEnforce(w http.ResponseWriter, r *http.Request, parts []stri
 			domains = []string{}
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"domains": domains})
+	case "domains":
+		// 手工封禁/解封域名：可直接贴完整 URL（取其主机名）。
+		a.handleEnforceDomains(w, r)
 	case "blocks":
 		a.handleEnforceBlocks(w, r, parts[1:])
 	default:
 		writeErr(w, http.StatusNotFound, "接口不存在", "not_found")
 	}
+}
+
+// blockDomainRe 手工封禁的域名格式：多级标签 + 至少两字母 TLD（含 punycode）。
+var blockDomainRe = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$`)
+
+// blockTargetHost 从用户输入（完整 URL 或裸域名）提取要封禁的主机名。
+//
+// 说明：HTTPS 的路径在 TLS 内加密、明文 HTTP 的路径也不参与拦截（dnsmasq/ipset
+// 只能按域名生效），所以封禁一律以域名为单位；这里接受 `http://evil.com/a/b?x=1`
+// 这类完整 URL 并自动去掉 scheme/路径/端口。
+func blockTargetHost(raw string) (string, error) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if s == "" {
+		return "", fmt.Errorf("请输入要封禁的 URL 或域名")
+	}
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.IndexAny(s, "/?#"); i >= 0 {
+		s = s[:i]
+	}
+	// 去端口（仅 host:port；出现多个冒号按 IPv6 拒绝）
+	if i := strings.LastIndex(s, ":"); i >= 0 {
+		if strings.Contains(s[i+1:], ":") {
+			return "", fmt.Errorf("不支持 IPv6，请输入域名")
+		}
+		if port := s[i+1:]; port != "" && isAllDigits(port) {
+			s = s[:i]
+		}
+	}
+	s = strings.TrimSuffix(s, ".")
+	if s == "" {
+		return "", fmt.Errorf("请输入要封禁的 URL 或域名")
+	}
+	if ip := net.ParseIP(s); ip != nil {
+		return "", fmt.Errorf("请输入域名而不是 IP（IP 请在设备/连接列表里直接封禁）")
+	}
+	if len(s) > 253 || !blockDomainRe.MatchString(s) {
+		return "", fmt.Errorf("域名格式不正确：%s", s)
+	}
+	return s, nil
+}
+
+func isAllDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+// handleEnforceDomains 手工封禁/解封域名。
+//
+//	POST /api/enforce/domains  {"url":"http://evil.com/path","action":"add|remove"}
+//
+// action 留空按 add 处理。返回 {ok,domain,effective[,hint]}：
+// effective=false 表示已保存但「域名封堵」开关未开启（开启后自动生效）。
+func (a *App) handleEnforceDomains(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	var req struct {
+		URL    string `json:"url"`
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体不是合法 JSON", "bad_json")
+		return
+	}
+	host, err := blockTargetHost(req.URL)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error(), "bad_domain")
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(req.Action)) {
+	case "", "add":
+		a.store.AddDomainBlock(host)
+	case "remove":
+		a.store.RemoveDomainBlock(host)
+	default:
+		writeErr(w, http.StatusBadRequest, "action 仅支持 add / remove", "bad_action")
+		return
+	}
+	effective := a.enf.ApplyManualDomains()
+	resp := map[string]interface{}{"ok": true, "domain": host, "effective": effective}
+	if !effective {
+		resp["hint"] = "域名封堵开关未开启：已保存到列表，开启「域名封堵」后自动生效"
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleEnforceBlocks 封禁列表 / 解封。
@@ -2408,13 +2534,22 @@ func (a *App) buildTick(now int64, full bool, last map[string]tickDevice) tickFr
 
 	devices := make([]tickDevice, 0, len(states))
 	seen := make(map[string]bool, len(states))
-	visible := 0
+	visible := 0 // KPI 口径：只算 lan（本地 DHCP 网段）
+	ztDevices, ztOnline := 0, 0
 	for _, st := range states {
 		meta := metas[st.IP]
 		if meta.Hidden || !isInternalNetwork(st.Network) {
 			continue
 		}
-		visible++
+		if st.Network == "zerotier" {
+			// ZeroTier 另算：不进 KPI 设备数，但设备行仍下发（设备页需要实时更新）
+			ztDevices++
+			if st.Online {
+				ztOnline++
+			}
+		} else {
+			visible++
+		}
 		topCat := st.TopCat
 		if topCat == "" {
 			topCat = "other"
@@ -2480,6 +2615,7 @@ func (a *App) buildTick(now int64, full bool, last map[string]tickDevice) tickFr
 		Ts: now,
 		KPI: kpiJSON{
 			Online: countOnline(states, metas), Devices: visible,
+			ZtDevices: ztDevices, ZtOnline: ztOnline,
 			Conns: sys.ConnCount, NewConns: rates.NewConnsLastMin,
 			DNSQps: round1f(a.dns.QPS(now)), Alerts: a.store.UnackedCount(),
 			// 有真 WAN 取 WAN 计数；旁路由取 conntrack 外发链路速率（详见 buildOverview 注释）
@@ -2524,15 +2660,15 @@ func tickDeviceEqual(a, b tickDevice) bool {
 }
 
 // countOnline 统计在线设备数。
-// 口径与 buildOverview 的「在线设备」保持一致：只统计未隐藏的内网（LAN/zt/vpn）设备，
-// 否则可能出现 online > devices。
+// 口径与 buildOverview 的「在线设备」保持一致：只统计未隐藏的 LAN 设备
+// （本地 DHCP 网段）；ZeroTier 由 KPI 的 ztOnline 单独计数。
 func countOnline(states []DeviceState, metas map[string]DeviceMeta) int {
 	n := 0
 	for _, st := range states {
 		if metas[st.IP].Hidden {
 			continue
 		}
-		if !isInternalNetwork(st.Network) {
+		if st.Network != "lan" {
 			continue
 		}
 		if st.Online {

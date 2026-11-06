@@ -639,6 +639,7 @@ function makeDomains(range, limit) {
     const port = 443;
     return {
       domain: d.domain, url: `https://${d.domain}/`, scheme: 'https', port,
+      blocked: mockState.dnsBlocked.includes(d.domain),
       paths: i % 3 === 0 ? [{ url: `http://${d.domain}/index.html`, hits: 3 + i, lastSeen: now - 60 * i, devices: 1 }] : [],
       label: d.label, category: d.category,
       hits: 8 + Math.floor(rnd(s) * 460),
@@ -1040,6 +1041,25 @@ function mockRequest(path, { method = 'GET', body, query = {} } = {}) {
     // 去重升序，空值强制 []（与后端一致）
     return { domains: [...new Set(mockState.dnsBlocked)].sort() };
   }
+  if (p === '/api/enforce/domains' && method === 'POST') {
+    // 手工封禁/解封：接受完整 URL 或裸域名，取其主机名（与后端 blockTargetHost 同口径）
+    const raw = String((body && body.url) || '').trim().toLowerCase();
+    const host = raw.replace(/^[a-z][a-z0-9+.-]*:\/\//, '').split(/[/?#]/)[0].replace(/:\d+$/, '').replace(/\.$/, '');
+    if (!host || !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(host)) {
+      if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+        throw makeError('请输入域名而不是 IP（IP 请在设备/连接列表里直接封禁）', 'bad_domain', 400);
+      }
+      throw makeError(`域名格式不正确：${host || raw}`, 'bad_domain', 400);
+    }
+    const act = String((body && body.action) || 'add').toLowerCase();
+    const set = new Set(mockState.dnsBlocked);
+    if (act === 'remove') set.delete(host); else set.add(host);
+    mockState.dnsBlocked = [...set].sort();
+    const effective = isSwitchOn('domainBlock');
+    const resp = { ok: true, domain: host, effective };
+    if (!effective) resp.hint = '域名封堵开关未开启：已保存到列表，开启「域名封堵」后自动生效';
+    return resp;
+  }
   if (p === '/api/enforce/reset' && method === 'POST') {
     const removed = [];
     mockState.blocked.forEach((ip) => removed.push(`iptables -D UBM_FWD -s ${ip} -j DROP`));
@@ -1294,6 +1314,14 @@ export const api = {
   async getDnsBlocked() {
     const r = await request('/api/enforce/dns');
     return (r && Array.isArray(r.domains)) ? r.domains : [];
+  },
+  /** 手工封禁域名（可传完整 URL，取其主机名生效） */
+  async addDomainBlock(url) {
+    return request('/api/enforce/domains', { method: 'POST', body: { url, action: 'add' } });
+  },
+  /** 解封域名 */
+  async removeDomainBlock(domain) {
+    return request('/api/enforce/domains', { method: 'POST', body: { url: domain, action: 'remove' } });
   },
   async enforceReset() {
     return request('/api/enforce/reset', { method: 'POST' });

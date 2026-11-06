@@ -374,6 +374,29 @@ func TestParseDHCPAndNeigh(t *testing.T) {
 	}
 }
 
+// TestIsNeighOnlineSTALE 锁定「STALE 不算在线」这一口径。
+//
+// 背景（实机反馈，2026-11-06）：br-lan 上有 64 条邻居，其中 32 条是 STALE。
+// 设备关机/离开网络后内核不会主动删邻居条目，旧实现把 STALE 也判为在线，
+// 于是每一条陈旧邻居都变成一个「设备」，设备数虚高到 28（而 DHCP 租约只有 8 条）。
+// 只有内核正在/刚刚确认可达的状态（REACHABLE/DELAY/PROBE）和静态条目
+// （PERMANENT）才算在场。
+func TestIsNeighOnlineSTALE(t *testing.T) {
+	online := []string{"REACHABLE", "DELAY", "PROBE", "PERMANENT", "reachable", "Delay"}
+	for _, st := range online {
+		if !isNeighOnline(st) {
+			t.Errorf("%q 应判定为在线", st)
+		}
+	}
+	// STALE 是虚高的主因；FAILED/INCOMPLETE 本来就不该算。
+	notOnline := []string{"STALE", "stale", "FAILED", "INCOMPLETE", "NONE", ""}
+	for _, st := range notOnline {
+		if isNeighOnline(st) {
+			t.Errorf("%q 不应判定为在线（陈旧/失败条目不能建成设备）", st)
+		}
+	}
+}
+
 func TestScheduleActive(t *testing.T) {
 	// 2024-11-05 是周二
 	tue := time.Date(2024, 11, 5, 23, 30, 0, 0, time.Local)

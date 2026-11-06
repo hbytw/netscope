@@ -1109,6 +1109,55 @@ func (s *Store) SetDomainBlocks(domains []string) {
 	s.markDirtyLocked()
 }
 
+// maxDomainBlocks 手工封堵域名上限（防误操作/脚本刷入导致 state.json 膨胀）。
+const maxDomainBlocks = 1000
+
+// AddDomainBlock 新增手工封堵域名（返回 false 表示重复或已达上限）。
+// 调用方负责随后调用 Enforcer.ApplyManualDomains 下发生效。
+func (s *Store) AddDomainBlock(domain string) bool {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	domain = strings.TrimSuffix(domain, ".")
+	if domain == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.domainBlocks == nil {
+		s.domainBlocks = map[string]bool{}
+	}
+	if s.domainBlocks[domain] {
+		return false
+	}
+	if len(s.domainBlocks) >= maxDomainBlocks {
+		return false
+	}
+	s.domainBlocks[domain] = true
+	s.markDirtyLocked()
+	return true
+}
+
+// RemoveDomainBlock 移除手工封堵域名（返回 false 表示本就不在列表）。
+func (s *Store) RemoveDomainBlock(domain string) bool {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	domain = strings.TrimSuffix(domain, ".")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.domainBlocks[domain] {
+		return false
+	}
+	delete(s.domainBlocks, domain)
+	s.markDirtyLocked()
+	return true
+}
+
+// IsDomainBlock 域名是否在手工封禁列表（展示用）。
+func (s *Store) IsDomainBlock(domain string) bool {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.domainBlocks[domain]
+}
+
 // DstBlocks 目标 IP 封禁记录（ip -> 封禁时间戳），用于封禁列表展示与重启恢复。
 func (s *Store) DstBlocks() map[string]int64 {
 	s.mu.Lock()

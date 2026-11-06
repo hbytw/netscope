@@ -23,6 +23,15 @@ const dhcpLeasePath = "/tmp/dhcp.leases"
 // 在线判定窗口（秒）
 const onlineWindowSec = 300
 
+// 设备保留时长（秒）：超过这个时间没有任何活动（租约/邻居/流量）就淘汰。
+//
+// 为什么必须淘汰：设备表原先对「内网设备」无条件保留，只把状态置为离线，
+// 于是任何曾经出现过的设备都会永久留在列表里。结果是设备数越跑越多
+// （实机反馈 28 台，但 DHCP 租约只有 8 条），用户看到的数字完全不可信。
+// 24 小时足够覆盖「手机晚上关机、第二天再连」这类正常场景，
+// 又不会让设备表无限膨胀。
+const deviceRetainSec = 24 * 3600
+
 // DeviceState 设备运行时状态（内存态）。
 type DeviceState struct {
 	IP          string
@@ -93,6 +102,11 @@ func (m *DeviceMgr) ensureLocked(ip string, now int64) (*DeviceState, bool) {
 	if st.Network == "" {
 		st.Network = "other"
 	}
+	// 非内网地址（vpn/未知私网段等）不建设备：流量侧发现的对端不混入设备列表。
+	// 返回 (nil, false) 表示「该 IP 不是设备」，调用方需判空跳过。
+	if !isInternalNetwork(st.Network) {
+		return nil, false
+	}
 	m.devices[ip] = st
 	return st, true
 }
@@ -104,6 +118,10 @@ func (m *DeviceMgr) NoteTraffic(ip string, up, down, now int64) {
 	}
 	m.mu.Lock()
 	st, created := m.ensureLocked(ip, now)
+	if st == nil {
+		m.mu.Unlock()
+		return // 非内网地址：不建设备、不产生事件
+	}
 	st.TotalUp += up
 	st.TotalDown += down
 	if up > 0 || down > 0 {
@@ -146,6 +164,9 @@ func (m *DeviceMgr) ApplyRates(r IntervalRates, now int64) {
 	defer m.mu.Unlock()
 	for ip, pair := range r.DevBps {
 		st, _ := m.ensureLocked(ip, now)
+		if st == nil {
+			continue // 非内网地址：不建设备
+		}
 		st.UpBps = int64(float64(pair[0]) * sc)
 		st.DownBps = int64(float64(pair[1]) * sc)
 		if st.UpBps > 0 || st.DownBps > 0 {
@@ -261,22 +282,29 @@ func (m *DeviceMgr) Refresh(now int64) {
 		ifaceInternal[f.Name] = f.Internal
 	}
 
-	// 1) 计算本轮接受的内网设备集合 ip -> network
+	// 1) 计算本轮接受的设备集合 ip -> network
 	accepted := make(map[string]string, len(leases)+len(neighs))
 	for _, l := range leases {
 		if l.IP == "" {
 			continue
 		}
-		net, _ := m.app.networkForIP(l.IP)
-		if net == "" || net == "other" {
-			net = "lan" // DHCP 租约默认视为 LAN 客户端
-		}
-		accepted[l.IP] = net
+		// 本地 DHCP 租约 = 内网（口径：本地 DHCP 分配的地址才算内网）
+		accepted[l.IP] = "lan"
 	}
 	var acceptedNeigh []neighEntry
+	// 上游网关（主路由）不是「设备」：它出现在 br-lan 邻居表里只是因为要转发外网流量。
+	// 把它统计进设备数会让用户困惑（家里 8 台设备却显示 9 台，多出来的就是路由器自己）。
+	// 只从邻居侧排除；DHCP 租约侧不受影响（网关不会是 DHCP 客户端）。
+	gateway := ""
+	if m.app != nil {
+		gateway = parseDefaultGateway(m.app.routeLines())
+	}
 	for _, n := range neighs {
 		if n.IP == "" {
 			continue
+		}
+		if gateway != "" && n.IP == gateway {
+			continue // 上游网关不是终端设备
 		}
 		if _, ok := accepted[n.IP]; ok {
 			continue // 已有租约，后续仅补 MAC
@@ -293,6 +321,9 @@ func (m *DeviceMgr) Refresh(now int64) {
 		}
 		if k := ifaceNet[n.Dev]; k != "" && k != "other" {
 			net = k
+		}
+		if net != "lan" && net != "zerotier" {
+			continue // 其他网络（vpn/tailscale 等）不算设备
 		}
 		accepted[n.IP] = net
 		acceptedNeigh = append(acceptedNeigh, n)
@@ -312,6 +343,9 @@ func (m *DeviceMgr) Refresh(now int64) {
 			continue
 		}
 		st, _ := m.ensureLocked(l.IP, now)
+		if st == nil {
+			continue // 理论不可达（租约恒为 lan），防御性判空
+		}
 		if net, ok := accepted[l.IP]; ok {
 			st.Network = net
 		}
@@ -333,6 +367,9 @@ func (m *DeviceMgr) Refresh(now int64) {
 	// 3) 内网邻居合并
 	for _, n := range acceptedNeigh {
 		st, _ := m.ensureLocked(n.IP, now)
+		if st == nil {
+			continue // 理论不可达（accepted 已过滤），防御性判空
+		}
 		if net, ok := accepted[n.IP]; ok {
 			st.Network = net
 		}
@@ -352,16 +389,21 @@ func (m *DeviceMgr) Refresh(now int64) {
 			m.recordFirstSeen(n.IP, now)
 		}
 	}
-	// 4) 清除误加入的非内网设备（公网/docker 邻居等）；内网历史设备保留为离线
+	// 4) 清除误加入的非内网设备（公网/docker 邻居等）；内网设备保留离线供历史查看，
+	//    但超过保留期就淘汰 —— 否则设备表只增不减，设备数越跑越多。
 	for ip, st := range m.devices {
 		if _, ok := accepted[ip]; ok {
 			continue
 		}
-		if isInternalNetwork(st.Network) {
+		if !isInternalNetwork(st.Network) {
+			delete(m.devices, ip)
+			delete(m.known, ip)
 			continue
 		}
-		delete(m.devices, ip)
-		delete(m.known, ip)
+		if now-st.LastSeen > deviceRetainSec {
+			delete(m.devices, ip)
+			delete(m.known, ip)
+		}
 	}
 	// 5) 在线状态迁移
 	for ip, st := range m.devices {
@@ -525,19 +567,29 @@ func parseNeigh(out string) []neighEntry {
 	return list
 }
 
-// isNeighOnline 邻居状态是否表示设备在线。
+// isNeighOnline 邻居状态是否表示设备「此刻确实在场」。
+//
+// 关键：STALE 不算在线。STALE 只表示这条邻居记录本身还没失效，
+// 内核不会主动删它 —— 设备关机、离开网络后，条目可能还会挂很久。
+// 旧实现把 STALE 也当成在线，于是每一条陈旧邻居都会变成一个「设备」，
+// 实机表现为 br-lan 上 64 条邻居（其中 32 条 STALE）被算成了一大堆设备。
+//
+// REACHABLE/DELAY/PROBE 是内核正在或刚刚确认过可达的状态，才算在线；
+// PERMANENT 是静态条目（如手工配置的 ARP），也视为在场。
 func isNeighOnline(state string) bool {
 	switch strings.ToUpper(state) {
-	case "REACHABLE", "STALE", "DELAY", "PROBE", "PERMANENT", "NOARP":
+	case "REACHABLE", "DELAY", "PROBE", "PERMANENT":
 		return true
 	}
 	return false
 }
 
-// isInternalNetwork 是否属于需要展示的内网（LAN / ZeroTier / VPN）。
+// isInternalNetwork 是否属于需要展示的设备网络。
+// 口径（用户确认）：本地 DHCP 网段（lan）算内网；ZeroTier 另算（保留展示与单独计数）；
+// 其他网络（vpn/tailscale、docker、未知私网段等）一律不算设备。
 func isInternalNetwork(network string) bool {
 	switch network {
-	case "lan", "zerotier", "vpn":
+	case "lan", "zerotier":
 		return true
 	}
 	return false

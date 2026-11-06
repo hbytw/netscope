@@ -1187,6 +1187,13 @@ func (a *App) runDNSTailer() {
 	missingLogged := false
 	missingTicks := 0
 	lastHealAt := int64(0)
+	// healLogged 保证「本轮日志缺失」期间自愈只记一次日志。
+	//
+	// 自愈动作本身每 60 秒才做一次（有 lastHealAt 限频），但如果每次都记一行，
+	// 一旦是权限/配置这类不会自愈的问题（例如 /tmp/guanlan 被重建后属主变成 root，
+	// dnsmasq 写不进去），就会每小时稳定刷 60 行无意义日志 —— 正是它把
+	// 真正有用的告警从日志缓冲区里挤掉了。所以只在首次尝试时记录一次。
+	healLogged := false
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -1223,7 +1230,10 @@ func (a *App) runDNSTailer() {
 				missingTicks++
 				if missingTicks >= 10 && nowUnix()-lastHealAt >= 60 {
 					lastHealAt = nowUnix()
-					logf("DNS 日志缺失自愈：向 dnsmasq 发送 SIGUSR2 重开日志")
+					if !healLogged {
+						healLogged = true
+						logf("DNS 日志缺失自愈：向 dnsmasq 发送 SIGUSR2 重开日志")
+					}
 					a.shellQuiet("kill -USR2 $(pidof dnsmasq) 2>/dev/null")
 				}
 				st.reset()
@@ -1231,6 +1241,7 @@ func (a *App) runDNSTailer() {
 			}
 			missingTicks = 0
 			missingLogged = false
+			healLogged = false
 			ino := fileInode(fi)
 			mod := fi.ModTime().UnixNano()
 			// 同一文件判定：优先 inode（文件被轮转/重建后 inode 必变，即使新文件

@@ -25,7 +25,7 @@
 ```json
 {
   "ts": 1761900000,
-  "kpi": {"online":11,"devices":14,"conns":14559,"newConns":42,"dnsQps":3.5,
+  "kpi": {"online":11,"devices":14,"ztDevices":3,"ztOnline":2,"conns":14559,"newConns":42,"dnsQps":3.5,
           "alerts":2,"upBps":123456,"downBps":8901234,"riskLevel":"low"},
   "sys": {"cpuPct":23.4,"memPct":41.2,"memUsedMb":760,"load1":0.42,"uptimeSec":3600,
           "tempC":52.0,"wanRxBps":123456,"wanTxBps":23456,"connCount":14559},
@@ -75,9 +75,12 @@
  "blocked":false,"limitKbps":{"down":0,"up":0},"topCat":"video","topDomain":"bilibili.com",
  "policyIds":["p-1"]}
 ```
-- `network`：设备所属网络，取值 `lan` / `zerotier` / `vpn`。设备列表只返回内网设备：
-  DHCP 租约 + 内网接口（`br-lan`/`zt*`/`tun*`/`wg*`/`tailscale0`/`ppp*`）上的私网邻居；
-  `docker0` 等非内网接口、公网 IP、FAILED/INCOMPLETE 邻居不会出现在列表中。
+- `network`：设备所属网络，取值 `lan` / `zerotier`。**设备口径（v1.7.0 起收紧）**：
+  只有本地 DHCP 网段（`br-lan`，租约 + 该网段邻居）算 `lan` 内网设备；
+  ZeroTier 网段设备为 `zerotier`（**另算**，不计入 KPI 的 `online/devices`，由
+  `ztOnline/ztDevices` 单独计数，设备页有独立「网络」列与统计）；
+  `vpn`（tailscale 等）、`docker0`、其他私网穿透网段一律**不进设备列表**。
+  `docker0` 等非内网接口、公网 IP、FAILED/INCOMPLETE 邻居也不会出现在列表中。
 - 本机接口地址、默认网关、回环/链路本地、内网网络/广播地址受保护：对其调用断网/限速/封禁目标
   会返回 `400 {"error":"不能封禁本机/网关/关键内网地址，已拒绝","code":"protected_ip"}`。
 
@@ -98,13 +101,18 @@
 
 ### GET `/api/traffic/domains?range=1h&limit=50`
 ```json
-{"domains":[{"domain":"bilibili.com","label":"哔哩哔哩","category":"video","hits":123,
+{"domains":[{"domain":"bilibili.com","url":"https://bilibili.com/","scheme":"https","port":443,
+             "label":"哔哩哔哩","category":"video","blocked":false,"hits":123,
              "bytes":1048576,"devices":3,"lastSeen":1761900000,
+             "paths":[{"url":"http://bilibili.com/index.html","hits":6,"lastSeen":1761900000,"devices":1}],
              "deviceList":[{"ip":"192.168.1.31","name":"MEIZU-Note-16","alias":"妈妈的手机",
                             "hits":80,"bytes":900000,"lastSeen":1761900000},
                            {"ip":"192.168.1.32","name":"iPhone-15-Pro","alias":"爸爸的手机",
                             "hits":43,"bytes":148576,"lastSeen":1761899000}]}]}
 ```
+- `url/scheme/port`：完整地址（HTTPS 路径在 TLS 内加密，最多还原到「协议+域名+端口」）。
+- `paths`：明文 HTTP（`http://`，需开启「HTTP 明文 URL 抓取」）观测到的完整路径含查询串，按命中降序、最多 5 条；`httpTap` 关闭或无记录时字段省略。
+- `blocked`：该域名是否在手工封禁列表（`POST /api/enforce/domains` 写入）。
 - `devices`：访问设备数量（兼容旧字段）；`deviceList`：访问该 URL 的设备明细，按 `bytes` 降序取前 20，含 `ip/name/alias/hits/bytes/lastSeen`（`hits` 来自 DNS 查询次数）。
 ### GET `/api/traffic/conns?limit=200&q=&device=`
 ```json
@@ -150,6 +158,7 @@
 | POST | `/api/policies/{id}/toggle` | `{"enabled":false}` |
 | GET | `/api/enforce/status` | `{"iptablesRules":3,"tcDevices":1,"dnsBlockedDomains":5,"activePolicies":2,"dnsTap":true}` |
 | GET | `/api/enforce/dns` | DNS 拦截域名明细（只读，仅 GET；鉴权同其他 `/api/*`）：`{"domains":["a.com","b.com"]}`，数组元素为域名字符串、按字典序升序。口径 = 策略下发的域名集合 ∪ 手工封堵列表，去重；无封堵时返回 `{"domains":[]}`。`/api/enforce/status.dnsBlockedDomains` 仍是计数口径 |
+| POST | `/api/enforce/domains` | **手工封禁/解封域名（v1.7.0）**：`{"url":"http://evil.com/path","action":"add\|remove"}`（`action` 留空按 `add`）。`url` 可为完整 URL 或裸域名，服务端取其主机名（去 scheme/路径/端口），拒绝 IP 与非法格式。返回 `{"ok":true,"domain":"evil.com","effective":true}`；`effective:false` + `hint` 表示「域名封堵」开关未开启、已保存待生效。封禁持久化在 `state.json`，经 ipset 下发（与策略域名同一执行链），策略撤销/重启不丢 |
 | POST | `/api/enforce/reset` | 清空全部管控并还原 DNS 拦截，`{"ok":true,"removed":[...]}` |
 | GET | `/api/enforce/blocks` | 封禁/限速列表：`{"blocks":[{"ip":"192.168.1.33","type":"device","reason":"手动断网","at":1761900000,"downKbps":0,"upKbps":0}]}`。`type` 取值 `device`（断网设备）/`dst`（封禁目标 IP）/`limit`（限速），`at` 为首次下发时间（Unix 秒） |
 | POST | `/api/enforce/blocks/{ip}/unblock` | 解封/取消限速，返回 `{"ok":true,"applied":[...],"revoked":[...]}`。可选 query `?type=device|dst|limit` 只解封指定类型；不传则解封该 IP 的全部记录 |

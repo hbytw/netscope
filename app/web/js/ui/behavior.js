@@ -88,11 +88,20 @@ export async function mount(host, ctx) {
   /* ---------- DNS 拦截 ---------- */
   const dnsBody = h('div', { class: 'col gap-2' });
   const dnsRestoreBtn = button('还原全部拦截', { variant: 'danger', size: 'sm', icon: ICONS.undo, onClick: onRestoreDns });
+  // 手工封禁入口：可直接粘贴完整 URL（取其域名生效；HTTPS 路径加密不可见）
+  const dnsInput = h('input', {
+    class: 'input', type: 'text',
+    placeholder: '粘贴要封禁的 URL 或域名，如 http://evil.com/path',
+    style: { flex: '1', minWidth: '0' }
+  });
+  const dnsAddBtn = button('封禁', { variant: 'primary', size: 'sm', icon: ICONS.ban, onClick: onAddDomain });
+  dnsInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') onAddDomain(); });
+  const dnsForm = h('div', { class: 'row-gap-2', style: { paddingBottom: '2px' } }, [dnsInput, dnsAddBtn]);
   const dnsCard = card({
     title: 'DNS 拦截域名',
-    sub: 'dnsmasq 旁挂重定向记录',
+    sub: '手工封禁可直接贴 URL，按域名生效',
     actions: [dnsRestoreBtn],
-    body: [dnsBody],
+    body: [dnsForm, dnsBody],
     style: { height: '100%' }
   });
 
@@ -470,17 +479,49 @@ export async function mount(host, ctx) {
     // 明细列表
     const domains = dnsDomains || [];
     if (!domains.length) {
-      dnsBody.appendChild(hintLine('当前无 DNS 拦截记录（策略下发的域名集合与手工封堵列表合并后为空）', ICONS.shield));
+      dnsBody.appendChild(hintLine('暂无封禁域名 —— 上方输入 URL/域名即可封禁恶意站点', ICONS.shield));
       return;
     }
     const list = h('div', { class: 'col gap-2' });
     domains.forEach((d) => {
       list.appendChild(h('div', { class: 'row-gap-2 fs-12 dns-row' }, [
         chip('DNS', { sem: 'warn' }),
-        h('span', { class: 'truncate mono', style: { flex: '1' }, text: d })
+        h('span', { class: 'truncate mono', style: { flex: '1', minWidth: '0' }, text: d }),
+        button('解封', { variant: 'ghost', size: 'sm', onClick: () => onRemoveDomain(d) })
       ]));
     });
     dnsBody.appendChild(list);
+  }
+
+  /* 手工封禁 / 解封域名（POST /api/enforce/domains） */
+  async function onAddDomain() {
+    const v = (dnsInput.value || '').trim();
+    if (!v) { toast('请输入要封禁的 URL 或域名', 'warn'); return; }
+    dnsAddBtn.disabled = true;
+    try {
+      const r = await api.addDomainBlock(v);
+      dnsInput.value = '';
+      if (r && r.effective === false) {
+        toast(`已保存 ${r.domain}；「域名封堵」开关未开启，开启后自动生效`, 'warn');
+      } else {
+        toast(`已封禁 ${r && r.domain ? r.domain : v}`, 'success');
+      }
+      await loadEnforce();
+    } catch (e) {
+      toast(e.message || '封禁失败', 'error');
+    } finally {
+      dnsAddBtn.disabled = false;
+    }
+  }
+
+  async function onRemoveDomain(d) {
+    try {
+      await api.removeDomainBlock(d);
+      toast(`已解封 ${d}`, 'success');
+      await loadEnforce();
+    } catch (e) {
+      toast(e.message || '解封失败', 'error');
+    }
   }
 
   /* ---------- 执行状态 ---------- */

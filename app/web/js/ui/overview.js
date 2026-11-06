@@ -115,7 +115,8 @@ export async function mount(host, ctx) {
       {
         label: '在线设备', value: String(k.online ?? 0), unit: `/ ${k.devices ?? 0}`,
         sem: 'brand', icon: ICONS.device,
-        deltaLabel: `活跃连接 ${formatNumber(k.conns || 0)}`,
+        // 口径：KPI 设备数只算 LAN；ZeroTier 另算（有 ZT 设备时单独标注）
+        deltaLabel: `${k.ztDevices ? `ZeroTier ${k.ztOnline ?? 0}/${k.ztDevices} · ` : ''}活跃连接 ${formatNumber(k.conns || 0)}`,
         delta: null
       },
       {

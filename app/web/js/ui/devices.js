@@ -58,7 +58,7 @@ export async function mount(host, ctx) {
   /* ---------- 表格 ---------- */
   const cols = [
     {
-      key: 'name', title: '设备', width: '260px',
+      key: 'name', title: '设备', width: '240px',
       render: (d) => {
         const wrap = h('div', { class: 'dev-cell' }, [
           deviceIcon(d, 30),
@@ -82,6 +82,14 @@ export async function mount(host, ctx) {
           h('span', { text: '在线' })
         ]);
       }
+    },
+    {
+      // 口径：LAN = 本地 DHCP 网段设备；ZeroTier 单独一类；其他网络不进列表
+      key: 'network', title: '网络', width: '96px',
+      render: (d) => (d.network === 'zerotier'
+        ? chip('ZeroTier', { sem: 'info' })
+        : chip('LAN', { sem: 'ok', plain: true })),
+      sortValue: (d) => (d.network === 'zerotier' ? 'z' : 'a')
     },
     {
       key: 'downBps', title: '实时速率', width: '128px',
@@ -167,14 +175,17 @@ export async function mount(host, ctx) {
   }
 
   function renderStats() {
-    const online = devices.filter((d) => d.online).length;
+    // 统计口径：LAN（本地 DHCP 网段）为主，ZeroTier 单独计数（其他网络不进列表）
+    const lan = devices.filter((d) => d.network !== 'zerotier');
+    const zt = devices.filter((d) => d.network === 'zerotier');
+    const lanOnline = lan.filter((d) => d.online).length;
     const blocked = devices.filter((d) => d.blocked).length;
     const limited = devices.filter((d) => d.limitKbps && (d.limitKbps.down || d.limitKbps.up)).length;
     const risky = devices.filter((d) => (d.risk || 0) >= 0.6).length;
     statBar.innerHTML = '';
     const items = [
-      ['在线', online, 'var(--ok)'], ['离线', devices.length - online, 'var(--text-2)'],
-      ['总数', devices.length, 'var(--text-0)'], ['已断网', blocked, 'var(--crit)'],
+      ['LAN 总数', lan.length, 'var(--text-0)'], ['LAN 在线', lanOnline, 'var(--ok)'],
+      ['ZeroTier', zt.length, 'var(--brand)'], ['已断网', blocked, 'var(--crit)'],
       ['限速中', limited, 'var(--warn)'], ['高风险', risky, 'var(--crit)']
     ];
     items.forEach(([k, v, c], i) => {

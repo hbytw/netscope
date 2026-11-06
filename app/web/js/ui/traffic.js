@@ -136,7 +136,11 @@ export async function mount(host, ctx) {
       key: 'domain', title: 'URL / 域名', width: '31%',
       render: (d) => h('div', { class: 'col', style: { lineHeight: '1.3', minWidth: '0' } }, [
         h('span', { class: 'td-strong truncate', title: `${urlText(d)}${d.label ? ' · ' + d.label : ''}`, text: urlText(d) }),
-        h('span', { class: 'dim fs-11 truncate', text: d.domain })
+        h('span', {
+          class: 'dim fs-11 truncate',
+          style: d.blocked ? { color: 'var(--crit)' } : null,
+          text: d.blocked ? `${d.domain} · 已封禁` : d.domain
+        })
       ]),
       sortValue: (d) => d.domain
     },
@@ -588,7 +592,7 @@ export async function mount(host, ctx) {
         ])))
       ]) : null
     ].filter(Boolean));
-    modal({
+    const dlg = modal({
       title: `URL 详情 · ${d.url || d.domain}`,
       width: 560,
       body: [body, h('div', { class: 'fs-11 dim', style: { marginTop: '8px', lineHeight: '1.5' } }, [
@@ -598,7 +602,32 @@ export async function mount(host, ctx) {
             + 'HTTPS 的路径（/xxx）在 TLS 内加密，DNS 与连接跟踪都看不到，'
             + '如需 HTTPS 完整路径需在路由器上做 TLS 解密（MITM），需给设备装 CA 且有兼容性风险。'
         })
-      ])]
+      ])],
+      foot: [
+        button(d.blocked ? '解除封禁' : '封禁该域名', {
+          variant: d.blocked ? 'ghost' : 'danger', size: 'sm', icon: ICONS.ban,
+          onClick: async () => {
+            try {
+              if (d.blocked) {
+                await api.removeDomainBlock(d.domain);
+                toast(`已解封 ${d.domain}`, 'success');
+              } else {
+                const r = await api.addDomainBlock(d.domain);
+                if (r && r.effective === false) {
+                  toast(`已保存 ${r.domain}；「域名封堵」开关未开启，开启后自动生效`, 'warn');
+                } else {
+                  toast(`已封禁 ${d.domain}`, 'success');
+                }
+              }
+              dlg.close();
+              loadTraffic();
+            } catch (e) {
+              toast(e.message || '操作失败', 'error');
+            }
+          }
+        }),
+        h('span', { class: 'dim fs-11', style: { alignSelf: 'center' }, text: '按域名生效（HTTPS 路径加密，无法只封路径）' })
+      ]
     });
   }
 

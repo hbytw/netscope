@@ -513,9 +513,13 @@ func (a *App) networkForIP(ip string) (network string, internal bool) {
 			return f.Network, f.Internal
 		}
 	}
-	// 接口信息缺失时退化为私网判定
-	if isPrivateIPStr(ip) {
-		return "lan", true
+	// 接口信息缺失时的兜底：只有「本地 LAN 网段」（本地 DHCP 分配的网段）算内网。
+	// 其余私网地址（ZeroTier 远端网段、VPN 对端、内网穿透网段等）一律不算 ——
+	// 口径：本地 DHCP 才算内网，ZeroTier 另算，其他都不算。
+	if cidr := strings.TrimSpace(a.cfg.LANCIDR); cidr != "" {
+		if prefix, err := netip.ParsePrefix(cidr); err == nil && prefix.Addr().Is4() && prefix.Contains(addr) {
+			return "lan", true
+		}
 	}
 	return "other", false
 }
@@ -621,6 +625,10 @@ func wanIface(ifaces []ifaceInfo, routes []string) string {
 }
 
 // detectProxy 探测本机是否有常见代理在监听（15s 缓存）。
+//
+// 监听端口查询工具只探测一次并缓存（a.proxyTool）：
+// 实测部分 OpenWrt 固件不带 ss，若每次都"先试 ss、失败再退 netstat"，
+// 就会每 18 秒往日志里写一条 "exec 失败: ss -lntp ..." —— 纯噪声。
 func (a *App) detectProxy() bool {
 	now := nowUnix()
 	a.proxyMu.Lock()
@@ -632,11 +640,21 @@ func (a *App) detectProxy() bool {
 	if a.cfg.Demo {
 		up = true
 	} else {
-		out, _ := a.shellQuietOutput("ss -lntp 2>/dev/null")
-		if strings.TrimSpace(out) == "" {
-			out, _ = a.shellQuietOutput("netstat -lntp 2>/dev/null")
+		if a.proxyTool == "" {
+			for _, tool := range []string{"ss", "netstat"} {
+				if _, err := a.shellQuietOutput(tool + " -lntp 2>/dev/null"); err == nil {
+					a.proxyTool = tool
+					break
+				}
+			}
+			if a.proxyTool == "" {
+				a.proxyTool = "none"
+			}
 		}
-		up = parseProxyOutput(out)
+		if a.proxyTool != "none" {
+			out, _ := a.shellQuietOutput(a.proxyTool + " -lntp 2>/dev/null")
+			up = parseProxyOutput(out)
+		}
 	}
 	a.proxyUp = up
 	a.proxyAt = now

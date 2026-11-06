@@ -75,6 +75,11 @@ type Enforcer struct {
 	domainIPs  map[string][]uint32
 	dnsDesired map[string]bool  // 期望封堵的域名集合（含尚未解析成功的）
 	pending    map[string]int64 // 待重试域名 -> 下次重试时间
+	// manualDomains 手工封堵域名（store.DomainBlocks 的执行侧镜像）。
+	// applyDomainState 每次都把它并入期望集合，因此：
+	//   - 策略撤销（定时策略关闭）不会连带清掉手工封禁；
+	//   - 手工列表变化时只需重新调用一次 applyDomainState 即可增删生效。
+	manualDomains map[string]bool
 
 	policyActive map[string]bool
 	protWarned   map[string]bool // 已提示过的受保护策略目标（避免 15s 轮询刷日志）
@@ -91,20 +96,21 @@ type Enforcer struct {
 // NewEnforcer 创建执行器（初始全部关闭）。
 func NewEnforcer(a *App) *Enforcer {
 	return &Enforcer{
-		app:          a,
-		blocked:      map[string]bool{},
-		blockedAt:    map[string]int64{},
-		dstBlocks:    map[string]bool{},
-		dstAt:        map[string]int64{},
-		limits:       map[string]LimitKbps{},
-		limitsAt:     map[string]int64{},
-		dnsDomains:   map[string]bool{},
-		domainIPs:    map[string][]uint32{},
-		dnsDesired:   map[string]bool{},
-		pending:      map[string]int64{},
-		protWarned:   map[string]bool{},
-		policyActive: map[string]bool{},
-		tcLimited:    map[string]bool{},
+		app:           a,
+		blocked:       map[string]bool{},
+		blockedAt:     map[string]int64{},
+		dstBlocks:     map[string]bool{},
+		dstAt:         map[string]int64{},
+		limits:        map[string]LimitKbps{},
+		limitsAt:      map[string]int64{},
+		dnsDomains:    map[string]bool{},
+		domainIPs:     map[string][]uint32{},
+		dnsDesired:    map[string]bool{},
+		pending:       map[string]int64{},
+		manualDomains: map[string]bool{},
+		protWarned:    map[string]bool{},
+		policyActive:  map[string]bool{},
+		tcLimited:     map[string]bool{},
 	}
 }
 
@@ -964,6 +970,14 @@ func (e *Enforcer) RestoreFromStore() {
 // 且只包含真正封堵成功的域名（解析失败/下发失败的域名留在 pending，
 // 下一轮继续重试，不会因"状态相同"而永不重试）。
 func (e *Enforcer) applyDomainState(desired map[string]bool) ([]string, error) {
+	// 手工封堵列表（store.DomainBlocks）始终并入期望集合：
+	// 策略下发/撤销只影响策略部分，手工封禁独立生效。
+	if len(e.manualDomains) > 0 {
+		desired = copyBoolMap(desired)
+		for d := range e.manualDomains {
+			desired[d] = true
+		}
+	}
 	e.dnsDesired = copyBoolMap(desired)
 	if mapsEqualBool(e.dnsDomains, desired) && len(e.pending) == 0 {
 		return nil, nil
@@ -1146,12 +1160,29 @@ func (e *Enforcer) warnProtectedOnce(ip, action string) {
 // 背景：策略评估只在 policyEngineOn() 为真时运行，关闭「定时策略」后 runPolicies
 // 不再调用 ReconcilePolicies，开关切换处也没有域名撤销步骤 —— 此前策略下发的域名
 // 会一直留在 ipset 中持续生效（issue：关闭定时策略不撤销域名封堵）。
-// dnsDomains 只包含策略下发的域名（手工封堵列表存 store.DomainBlocks，仅展示层合并、
-// 不写 ipset —— 见 BlockedDomains），因此整体清空即为撤销策略域名。
+// 撤销范围只含「策略下发的域名」：手工封禁（manualDomains）是用户明确意图，
+// 由 applyDomainState 恒定并入期望集合，flush 后会立即重新下发。
+// 若当前集合里只有手工封禁（无策略域名），直接返回 —— 否则会陷入
+// 「每 15s flush + 重解析 + 重下发」的循环。
 // ipset 集合本身保留（仅 flush），待策略重新开启后由 applyDomainState 复用。
 func (e *Enforcer) revokePolicyDomains() {
 	e.mu.Lock()
-	if len(e.dnsDomains) == 0 && len(e.dnsDesired) == 0 && len(e.pending) == 0 {
+	// 三个集合里只要还有「非手工」（即策略侧）条目就需要撤销；
+	// 若只剩手工封禁（或全空）则直接返回，避免每 15s flush + 重解析的循环。
+	policyLeft := 0
+	for _, m := range []map[string]bool{e.dnsDomains, e.dnsDesired} {
+		for d := range m {
+			if _, manual := e.manualDomains[d]; !manual {
+				policyLeft++
+			}
+		}
+	}
+	for d := range e.pending {
+		if _, manual := e.manualDomains[d]; !manual {
+			policyLeft++
+		}
+	}
+	if policyLeft == 0 {
 		e.mu.Unlock()
 		return
 	}
@@ -1167,6 +1198,13 @@ func (e *Enforcer) revokePolicyDomains() {
 			e.mu.Unlock()
 			logf("撤销策略域名封堵规则失败: %v", err)
 			return
+		}
+	}
+	// 手工封堵列表（store.DomainBlocks）继续生效：策略撤销只清策略部分，
+	// 手工封禁是用户的明确意图，flush ipset 后需要重新下发。
+	if len(e.manualDomains) > 0 {
+		if _, err := e.applyDomainState(map[string]bool{}); err != nil {
+			logf("策略域名撤销后重新下发手工封禁失败: %v", err)
 		}
 	}
 	e.mu.Unlock()
@@ -1508,6 +1546,38 @@ func (e *Enforcer) BlockedDomains() []string {
 	return out
 }
 
+// ApplyManualDomains 把手工封堵列表（store.DomainBlocks）同步到执行侧并下发。
+//
+// 调用时机：手工列表变更、域名封堵开关开启、总开关开启、程序启动。
+// domainBlock 开关关闭时不下发（开关语义），store 列表保留，
+// 开关重新开启时自动恢复。返回值表示是否已实际下发。
+func (e *Enforcer) ApplyManualDomains() bool {
+	if e.app.store == nil {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.app.domainBlockOn() {
+		return false // 开关关闭：不下发；列表保存在 store，开启后由开关动作恢复
+	}
+	manual := make(map[string]bool, 8)
+	for _, d := range e.app.store.DomainBlocks() {
+		manual[d] = true
+	}
+	// dnsDesired 里混有上一轮并入的手工域：先把「旧手工列表」从期望集合中剔除，
+	// 再并入新列表 —— 否则解封时旧条目残留，域名会一直留在 ipset 里。
+	base := copyBoolMap(e.dnsDesired)
+	for d := range e.manualDomains {
+		delete(base, d)
+	}
+	e.manualDomains = manual
+	if _, err := e.applyDomainState(base); err != nil {
+		logf("手工域名封禁下发失败: %v", err)
+		return false
+	}
+	return true
+}
+
 // Reset 清空全部管控并还原 DNS 拦截，返回 removed 描述列表。
 func (e *Enforcer) Reset() ([]string, error) {
 	e.mu.Lock()
@@ -1583,6 +1653,8 @@ func (e *Enforcer) RevokeDeviceControl() {
 }
 
 // RevokeDomainBlock 撤销域名封堵：销毁 ipset 并移除链内引用规则。
+// 手工封禁的内存镜像一并清空（store 列表保留，开关重新开启时由
+// ApplyManualDomains 恢复下发）。
 func (e *Enforcer) RevokeDomainBlock() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1591,6 +1663,7 @@ func (e *Enforcer) RevokeDomainBlock() {
 	e.dnsDesired = map[string]bool{}
 	e.domainIPs = map[string][]uint32{}
 	e.pending = map[string]int64{}
+	e.manualDomains = map[string]bool{}
 	if e.chainsReady {
 		if _, err := e.rebuildDeviceRules(); err != nil {
 			logf("移除域名封堵 iptables 规则失败: %v", err)
@@ -1618,6 +1691,7 @@ func (e *Enforcer) RevokeAll() {
 	e.dnsDesired = map[string]bool{}
 	e.domainIPs = map[string][]uint32{}
 	e.pending = map[string]int64{}
+	e.manualDomains = map[string]bool{}
 	e.policyActive = map[string]bool{}
 	logf("系统级撤销完成：iptables / tc / ipset 均已恢复")
 }
