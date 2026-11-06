@@ -71,8 +71,9 @@ const CFG = {
   sectorOuter: 10.4,
   sectorSegments: 24,
   sectorBaseY: 0.72,
-  sectorMinHeight: 0.8,
-  sectorMaxHeight: 4.2,
+  /* 分类环：只做「占比刻度」，扁平化（原 0.8~4.2 会堆成厚墙，遮住中心与托盘） */
+  sectorMinHeight: 0.06,
+  sectorMaxHeight: 0.55,
   sectorMinArc: 0.05,
   sectorGap: 0.014,
   trendRadius: 11.1,
@@ -85,8 +86,9 @@ const CFG = {
   chipThickness: 0.22,
   pillarBaseY: 0.02,
   pillarRadius: 0.09,
-  pillarMinHeight: 0.8,
-  pillarMaxHeight: 7,
+  /* 设备柱：芯片本体按流量拉高（对数刻度），一眼看出谁在跑满带宽 */
+  deviceColMin: 0.28,
+  deviceColMax: 3.1,
   deviceParticles: 6,
   particleMax: 200,
   orbitSamples: 32,
@@ -98,6 +100,9 @@ const CFG = {
   topoLinkMaxWidth: 0.085,
   topoFlowLabelHeight: 1.25,
   topoParticlesPerLink: 5,
+  /* 出口节点流量柱（对数刻度，越长=该出口当前吞吐越大） */
+  topoColMin: 0.5,
+  topoColMax: 3.8,
   autoRotateRadPerSec: 0.25 / 60, // 0.25 rad/min（手动按 dt 旋转，帧率无关）
   entryDuration: 1.2,
   focusDuration: 1.1,
@@ -149,6 +154,17 @@ function truncateChars(str, max) {
   const arr = Array.from(String(str == null ? '' : str));
   if (arr.length <= max) return arr.join('');
   return arr.slice(0, max).join('') + '…';
+}
+
+/**
+ * 速率 → 视觉柱高（对数刻度）。
+ * 线性映射会让「几百 KB/s」和「几 MB/s」的柱子差几十倍、低流量设备全贴地；
+ * 对数刻度把 1KB/s ~ 5MB/s 铺满 minH→maxH，一眼能比较量级而不被极端值压扁。
+ */
+function trafficColumnHeight(bps, minH, maxH) {
+  const bytesPerSec = Math.max(0, Number(bps) || 0) / 8;
+  const t = clamp((Math.log10(1 + bytesPerSec) - 3) / 3.7, 0, 1);
+  return minH + t * (maxH - minH);
 }
 
 /* ================================================================== */
@@ -1300,7 +1316,13 @@ export function createTrayScene(container, options = {}) {
   scene.add(deviceRoot);
 
   // 共享几何体（整个场景只创建一次，所有设备复用）
-  const chipGeo = new THREE.CylinderGeometry(CFG.chipRadius, CFG.chipRadius, CFG.chipThickness, 6);
+  // 六棱柱微收顶（上窄下宽）→ 更像「流量柱」而非药片
+  const chipGeo = new THREE.CylinderGeometry(
+    CFG.chipRadius * 0.82,
+    CFG.chipRadius,
+    CFG.chipThickness,
+    6,
+  );
   // 实心暗柱（单位高，底部在 y=0）
   const pillarGeo = new THREE.CylinderGeometry(CFG.pillarRadius, CFG.pillarRadius, 1, 8);
   pillarGeo.translate(0, 0.5, 0);
@@ -1397,13 +1419,17 @@ export function createTrayScene(container, options = {}) {
   const topoRoot = new THREE.Group();
   scene.add(topoRoot);
 
-  // 共享几何体（节点底盘 / 外环 / 链路方向箭头）
+  // 共享几何体（节点底盘 / 出口流量柱 / 外环 / 链路方向箭头）
   const topoNodeGeo = new THREE.CylinderGeometry(1.02, 1.02, 0.26, 6);
   topoNodeGeo.translate(0, 0.13, 0);
+  // 出口流量柱：单位高六棱柱（底在 y=0），scale.y = 柱高，按吞吐对数映射
+  const topoColGeo = new THREE.CylinderGeometry(0.72, 0.9, 1, 6);
+  topoColGeo.translate(0, 0.5, 0);
   const topoRingGeo = new THREE.TorusGeometry(1.3, 0.025, 4, 44);
   const topoConeGeo = new THREE.ConeGeometry(0.26, 0.78, 8);
 
   const topoNodeMaterials = new Map(); // `${type}|${up}` -> MeshStandardMaterial
+  const topoColMaterials = new Map(); // `${type}|${up}` -> MeshStandardMaterial（出口流量柱）
   const topoRingMaterials = new Map(); // `${type}|${up}` -> MeshBasicMaterial
   const topoGlowMaterials = new Map(); // `${type}|${up}` -> SpriteMaterial
   const topoFlowDotMaterials = new Map(); // kind -> SpriteMaterial（链路源端发光点）
@@ -1599,11 +1625,8 @@ export function createTrayScene(container, options = {}) {
         const up = Number.isFinite(nd.up) ? nd.up : 0;
         dev.target.down = down;
         dev.target.up = up;
-        dev.target.height = clamp(
-          (down + up) / 200000,
-          CFG.pillarMinHeight,
-          CFG.pillarMaxHeight,
-        );
+        // 设备柱高按「上下行合计」对数映射，流量越大柱子越高
+        dev.target.height = trafficColumnHeight(down + up, CFG.deviceColMin, CFG.deviceColMax);
         dev.name = nd.name;
         if (nd.status !== dev.status) {
           dev.status = nd.status;
@@ -1674,16 +1697,23 @@ export function createTrayScene(container, options = {}) {
       const group = new THREE.Group();
       group.position.set(x, 0, z);
 
-      const chip = new THREE.Mesh(chipGeo, statusMaterials[nd.status]);
-      chip.position.y = CFG.pillarBaseY + CFG.pillarMinHeight + CFG.chipThickness / 2;
+      const devDown = Number.isFinite(nd.down) ? nd.down : 0;
+      const devUp = Number.isFinite(nd.up) ? nd.up : 0;
+      const colH = trafficColumnHeight(devDown + devUp, CFG.deviceColMin, CFG.deviceColMax);
 
+      // 芯片 = 六棱柱本体：y 向拉伸成「流量柱」，柱高即流量量级
+      const chip = new THREE.Mesh(chipGeo, statusMaterials[nd.status]);
+      chip.scale.y = colH / CFG.chipThickness;
+      chip.position.y = CFG.pillarBaseY + colH / 2;
+
+      // 柱顶细亮芯：从柱顶探出一截，流量越大越像一道光
       const pillar = new THREE.Mesh(pillarGeo, statusPillarMaterials[nd.status]);
       pillar.position.y = CFG.pillarBaseY;
-      pillar.scale.y = CFG.pillarMinHeight;
+      pillar.scale.y = colH + 0.5;
 
       const pillarGlow = new THREE.Mesh(pillarGlowGeo, statusPillarGlowMaterials[nd.status]);
       pillarGlow.position.y = CFG.pillarBaseY;
-      pillarGlow.scale.set(1, CFG.pillarMinHeight, 1);
+      pillarGlow.scale.set(1, colH + 0.5, 1);
 
       const baseDisc = new THREE.Mesh(baseDiscGeo, statusGlowDiscMaterials[nd.status]);
       baseDisc.rotation.x = -Math.PI / 2;
@@ -1691,7 +1721,7 @@ export function createTrayScene(container, options = {}) {
 
       const glow = new THREE.Sprite(statusGlowMaterials[nd.status]);
       glow.scale.set(0.68, 0.68, 1);
-      glow.position.y = chip.position.y + 0.14;
+      glow.position.y = CFG.pillarBaseY + colH + 0.2;
 
       const labelMaterial = new THREE.SpriteMaterial({
         map: null,
@@ -1703,7 +1733,7 @@ export function createTrayScene(container, options = {}) {
       const labelScale = labelScaleBase;
       label.scale.set(CFG.labelHeight * (LABEL_CANVAS_W / LABEL_CANVAS_H) * labelScale, CFG.labelHeight * labelScale, 1);
       label.visible = false;
-      label.position.y = chip.position.y + 1.25 + (i % 2) * 0.55;
+      label.position.y = CFG.pillarBaseY + colH + 1.25 + (i % 2) * 0.55;
       label.userData.baseScale = labelScale;
 
       group.add(pillar, pillarGlow, baseDisc, chip, glow, label);
@@ -1711,14 +1741,6 @@ export function createTrayScene(container, options = {}) {
 
       chip.userData.ip = nd.ip;
       chipMeshes.push(chip);
-
-      const devDown = Number.isFinite(nd.down) ? nd.down : 0;
-      const devUp = Number.isFinite(nd.up) ? nd.up : 0;
-      const devHeight = clamp(
-        (devDown + devUp) / 200000,
-        CFG.pillarMinHeight,
-        CFG.pillarMaxHeight,
-      );
 
       const dev = {
         ip: nd.ip,
@@ -1741,17 +1763,17 @@ export function createTrayScene(container, options = {}) {
         target: {
           down: devDown,
           up: devUp,
-          height: devHeight,
+          height: colH,
         },
         cur: {
           down: devDown,
           up: devUp,
-          height: devHeight,
+          height: colH,
           scale: 1,
         },
         curve: new THREE.QuadraticBezierCurve3(
-          new THREE.Vector3(x, CFG.pillarBaseY + CFG.pillarMinHeight + 0.3, z),
-          new THREE.Vector3(x * 0.52, CFG.pillarMinHeight + 3.0, z * 0.52),
+          new THREE.Vector3(x, CFG.pillarBaseY + colH + 0.3, z),
+          new THREE.Vector3(x * 0.52, colH + 2.6, z * 0.52),
           new THREE.Vector3(0, CFG.trayTop + 2.2, 0),
         ),
       };
@@ -1922,34 +1944,38 @@ export function createTrayScene(container, options = {}) {
       dev.cur.down = damp(dev.cur.down, dev.target.down, 4.5, dt);
       dev.cur.up = damp(dev.cur.up, dev.target.up, 4.5, dt);
 
-      const chipY = CFG.pillarBaseY + dev.cur.height + CFG.chipThickness / 2;
-      dev.chip.position.y = chipY;
-      dev.pillar.scale.y = Math.max(dev.cur.height, 0.01);
-      dev.pillar.position.y = CFG.pillarBaseY;
-      dev.pillarGlow.scale.set(1, Math.max(dev.cur.height, 0.01), 1);
-      dev.pillarGlow.position.y = CFG.pillarBaseY;
-      dev.glow.position.y = chipY + 0.14;
-
+      const baseY = CFG.pillarBaseY;
+      const colH = Math.max(dev.cur.height, 0.06);
+      // 流量越大 → 柱顶光晕越大，远处一眼能看出「谁是热点」
+      const colT = clamp(
+        (colH - CFG.deviceColMin) / Math.max(CFG.deviceColMax - CFG.deviceColMin, 0.001),
+        0,
+        1,
+      );
+      // 六棱柱本体沿 y 拉伸 = 柱高；x/z 只跟随悬停放大，不参与流量表达
       const isHover = hoveredIp === dev.ip;
       const isSelected = selectedIp === dev.ip;
       const targetScale = isHover || isSelected ? 1.4 : 1;
       dev.cur.scale = damp(dev.cur.scale, targetScale, 10, dt);
-      dev.chip.scale.setScalar(dev.cur.scale);
-      dev.glow.scale.setScalar(0.68 * (isHover || isSelected ? 1.5 : 1));
-      dev.baseDisc.scale.setScalar(1 + dev.cur.height * 0.03);
+      dev.chip.scale.set(dev.cur.scale, colH / CFG.chipThickness, dev.cur.scale);
+      dev.chip.position.y = baseY + colH / 2;
 
-      const labelBaseY = chipY + 1.35 + ((dev.slot || 0) % 2) * 0.55;
+      dev.pillar.scale.y = colH + 0.5;
+      dev.pillar.position.y = baseY;
+      dev.pillarGlow.scale.set(1, colH + 0.5, 1);
+      dev.pillarGlow.position.y = baseY;
+      dev.glow.position.y = baseY + colH + 0.2;
+      dev.glow.scale.setScalar((0.5 + colT * 0.55) * (isHover || isSelected ? 1.5 : 1));
+      dev.baseDisc.scale.setScalar(1 + colH * 0.06);
+
+      const labelBaseY = baseY + colH + 1.25 + ((dev.slot || 0) % 2) * 0.55;
       dev.label.position.y = labelBaseY;
       dev.label.scale.set(
         CFG.labelHeight * (LABEL_CANVAS_W / LABEL_CANVAS_H) * (dev.label.userData.baseScale || 1),
         CFG.labelHeight * (dev.label.userData.baseScale || 1),
         1,
       );
-
-      if (dev.status === 'offline') {
-        // 离线设备：芯片压暗一点（通过缩放表达，材质仍复用）
-        dev.chip.scale.multiplyScalar(0.86);
-      }
+      // 离线设备沿用离线材质（不再额外压扁，避免破坏柱高语义）
     }
 
     // 选中光环跟随
@@ -2073,13 +2099,13 @@ export function createTrayScene(container, options = {}) {
     for (let i = 0; i < deviceList.length; i++) {
       const dev = devices.get(deviceList[i].ip);
       if (!dev) continue;
-      const chipY = CFG.pillarBaseY + dev.cur.height + CFG.chipThickness / 2;
-      // 起点跟随芯片，终点固定核心顶部，控制点略高
+      // 起点 = 设备柱顶（柱高随流量变化），终点固定核心顶部
+      const chipY = CFG.pillarBaseY + dev.cur.height;
       const curve = dev.curve;
-      curve.v0.set(dev.group.position.x, chipY + 0.16, dev.group.position.z);
+      curve.v0.set(dev.group.position.x, chipY + 0.1, dev.group.position.z);
       curve.v1.set(
         dev.group.position.x * 0.52,
-        Math.max(chipY, CFG.pillarMinHeight) + 2.4 + dev.cur.height * 0.12,
+        Math.max(chipY, 0.8) + 2.2 + dev.cur.height * 0.1,
         dev.group.position.z * 0.52,
       );
       curve.v2.set(0, CFG.trayTop + 2.1, 0);
@@ -2185,8 +2211,31 @@ export function createTrayScene(container, options = {}) {
     });
   }
 
-  function topoRingMaterial(type, up) {
-    return pickTopoMaterial(topoRingMaterials, type, up, (color, isUp) => {
+  /** 出口流量柱材质：实心六棱柱，颜色随节点类型；断连节点压暗 */
+  function topoColumnMaterial(type, up) {
+    return pickTopoMaterial(topoColMaterials, type, up, (color, isUp) => {
+      if (isUp) {
+        return new THREE.MeshStandardMaterial({
+          color: color.clone().multiplyScalar(0.58),
+          emissive: color,
+          emissiveIntensity: 0.9,
+          metalness: 0.34,
+          roughness: 0.4,
+          flatShading: true,
+        });
+      }
+      return new THREE.MeshStandardMaterial({
+        color: 0x33404f,
+        emissive: 0x1d2836,
+        emissiveIntensity: 0.5,
+        metalness: 0.34,
+        roughness: 0.6,
+        flatShading: true,
+      });
+    });
+  }
+
+  function topoRingMaterial(type, up) {    return pickTopoMaterial(topoRingMaterials, type, up, (color, isUp) => {
       return new THREE.MeshBasicMaterial({
         color: isUp ? color : new THREE.Color(0x64748b),
         transparent: true,
@@ -2386,8 +2435,19 @@ export function createTrayScene(container, options = {}) {
       topoNodeWorldPosition(nd, group.position);
       group.userData.nodeId = nd.id;
 
+      // 出口流量柱：柱高 = 该节点当前吞吐（上下行合计）的对数映射
+      const colH = trafficColumnHeight(
+        (nd.rxBps || 0) + (nd.txBps || 0),
+        CFG.topoColMin,
+        CFG.topoColMax,
+      );
+
       const mesh = new THREE.Mesh(topoNodeGeo, topoNodeMaterial(nd.type, nd.up));
       mesh.userData.nodeId = nd.id;
+
+      const column = new THREE.Mesh(topoColGeo, topoColumnMaterial(nd.type, nd.up));
+      column.scale.set(1, colH, 1);
+      column.userData.nodeId = nd.id;
 
       const ring = new THREE.Mesh(topoRingGeo, topoRingMaterial(nd.type, nd.up));
       ring.rotation.x = -Math.PI / 2;
@@ -2395,7 +2455,7 @@ export function createTrayScene(container, options = {}) {
 
       const glow = new THREE.Sprite(topoGlowMaterial(nd.type, nd.up));
       glow.scale.set(1.75, 1.75, 1);
-      glow.position.y = 0.6;
+      glow.position.y = colH + 0.3;
 
       const labelMaterial = new THREE.SpriteMaterial({
         map: null,
@@ -2409,10 +2469,10 @@ export function createTrayScene(container, options = {}) {
         CFG.topoLabelHeight,
         1,
       );
-      label.position.y = 1.35 + CFG.topoLabelHeight * 0.5;
+      label.position.y = colH + 1.25;
       labelMaterial.color = new THREE.Color(nd.up ? 0xffffff : 0xc7d6ea);
 
-      group.add(mesh, ring, glow, label);
+      group.add(mesh, column, ring, glow, label);
       topoRoot.add(group);
       topoMeshes.push(mesh);
 
@@ -2420,12 +2480,14 @@ export function createTrayScene(container, options = {}) {
         ...nd,
         group,
         mesh,
+        column,
         ring,
         glow,
         label,
         labelMaterial,
         labelKey: null,
         lastLabelAt: 0,
+        colH,
         scale: 1,
       };
       topoNodes.set(nd.id, rec);
@@ -2718,9 +2780,17 @@ export function createTrayScene(container, options = {}) {
       rec.scale = damp(rec.scale, targetScale, 10, dt);
       rec.mesh.scale.setScalar(rec.scale);
       rec.ring.scale.setScalar(rec.scale);
+
+      // 出口流量柱：高度随吞吐平滑变化（对数刻度），柱顶光点与标签跟随柱高
+      const rateBps = (rec.rxBps || 0) + (rec.txBps || 0);
+      const targetH = trafficColumnHeight(rateBps, CFG.topoColMin, CFG.topoColMax);
+      rec.colH = damp(rec.colH, targetH, 4.0, dt);
+      rec.column.scale.set(rec.scale, Math.max(rec.colH, 0.06), rec.scale);
+      rec.glow.position.y = rec.colH + 0.3;
       rec.glow.scale.setScalar((isHover || isSelected ? 2.3 : 1.75) * (rec.up ? 1 : 0.7));
+      rec.label.position.y = rec.colH + 1.25;
       // 有流量节点标签放大 18%，保证速率可读
-      const busy = rec.rxBps + rec.txBps > 0;
+      const busy = rateBps > 0;
       const ls = busy ? 1.18 : 1;
       rec.label.scale.set(
         CFG.topoLabelHeight * (LABEL_CANVAS_W / LABEL_CANVAS_H) * ls,
@@ -2775,16 +2845,19 @@ export function createTrayScene(container, options = {}) {
       topoNodeSelectionRing.material.dispose();
     }
     for (const m of topoNodeMaterials.values()) m.dispose();
+    for (const m of topoColMaterials.values()) m.dispose();
     for (const m of topoRingMaterials.values()) m.dispose();
     for (const m of topoGlowMaterials.values()) m.dispose();
     for (const m of topoFlowDotMaterials.values()) m.dispose();
     for (const m of topoArrowMaterials.values()) m.dispose();
     topoNodeMaterials.clear();
+    topoColMaterials.clear();
     topoRingMaterials.clear();
     topoGlowMaterials.clear();
     topoFlowDotMaterials.clear();
     topoArrowMaterials.clear();
     topoNodeGeo.dispose();
+    topoColGeo.dispose();
     topoRingGeo.dispose();
     topoConeGeo.dispose();
     scene.remove(topoRoot);
