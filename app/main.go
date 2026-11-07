@@ -1463,6 +1463,9 @@ func (a *App) Run() error {
 		}
 	}
 
+	// 先确定 DNS 日志路径：dnsmasq 若跑在 ujail 沙箱里，默认 /tmp/guanlan 在 jail 内不可见，
+	// 必须改用 jail 里 rw 挂载的 /var/run/dnsmasq（见 resolveDNSLogPath）。
+	a.resolveDNSLogPath()
 	if a.cfg.Demo && a.demo != nil {
 		a.demo.Init()
 		logf("演示模式：已生成合成设备/策略/域名/历史流量/事件")

@@ -36,18 +36,22 @@ import (
 )
 
 const (
-	dnsLogPath     = "/tmp/guanlan/dnsmasq.log"
-	dnsLogDir      = "/tmp/guanlan"
-	dnsLogMaxBytes = 32 * 1024 * 1024
-	ipMapTTL       = int64(30 * 60)     // ip→domain 反查 TTL
-	longIPTTL      = int64(6 * 60 * 60) // 长 TTL 反查索引（连接域名回退用）
-	domainStatTTL  = int64(6 * 60 * 60)
-	ipMapCap       = 20000
-	domainIPCap    = 5000
-	domainStatCap  = 5000
-	txtTrackCap    = 2000
-	devRecentTTL   = int64(10 * 60) // 设备最近查询域名的回退有效期（10min）
-	devRecentCap   = 512            // 设备数量上限（超出按最旧淘汰）
+	// 默认 DNS 查询日志路径（tmpfs，重启即失）。
+	dnsLogPathDefault = "/tmp/guanlan/dnsmasq.log"
+	// jailedDNSLogPath：dnsmasq 被 ujail 沙箱隔离时使用（jail 内私有 /tmp，
+	// 看不到 /tmp/guanlan；/var/run/dnsmasq 在 jail 里仍是 rw 挂载，两端同一路径）。
+	jailedDNSLogPath = "/var/run/dnsmasq/guanlan-dns.log"
+	dnsLogDir        = "/tmp/guanlan"
+	dnsLogMaxBytes   = 32 * 1024 * 1024
+	ipMapTTL         = int64(30 * 60)     // ip→domain 反查 TTL
+	longIPTTL        = int64(6 * 60 * 60) // 长 TTL 反查索引（连接域名回退用）
+	domainStatTTL    = int64(6 * 60 * 60)
+	ipMapCap         = 20000
+	domainIPCap      = 5000
+	domainStatCap    = 5000
+	txtTrackCap      = 2000
+	devRecentTTL     = int64(10 * 60) // 设备最近查询域名的回退有效期（10min）
+	devRecentCap     = 512            // 设备数量上限（超出按最旧淘汰）
 
 	// dnsmasq 主配置。该固件在 /etc/dnsmasq.conf 硬编码 log-facility=/dev/null，
 	// 与 UCI dhcp.@dnsmasq[0].logfacility 生成的第二个 log-facility 重复，
@@ -57,6 +61,33 @@ const (
 	dnsmasqConfPath = "/etc/dnsmasq.conf"
 	dnsConfBackup   = dnsLogDir + "/logfacility.orig"
 )
+
+// dnsLogPath 当前使用的 DNS 日志路径。默认 /tmp/guanlan/dnsmasq.log；
+// 启动时若检测到 dnsmasq 跑在 ujail 里，会切到 jailedDNSLogPath（见 resolveDNSLogPath）。
+var dnsLogPath = dnsLogPathDefault
+
+// resolveDNSLogPath 按运行环境确定 DNS 日志路径（启动时调用一次）。
+//
+// 背景：部分固件把 dnsmasq 放进 ujail 沙箱（`ujail -n dnsmasq ...`），jail 内 /tmp
+// 是私有 tmpfs（只挂载 dhcp.leases / dnsmasq.d 等白名单条目），宿主机的
+// /tmp/guanlan 在 jail 内不可见 —— dnsmasq 打不开日志文件会直接起不来，
+// 旁挂健康检查失败后整体回滚。这类环境改用 /var/run/dnsmasq/：
+// init 脚本本来就 `procd_add_jail_mount_rw /var/run/dnsmasq/`，两端同路径可写。
+func (a *App) resolveDNSLogPath() {
+	if a.cfg.Demo || a.cfg.DryRun {
+		return
+	}
+	out, err := a.shellQuietOutput("ps w 2>/dev/null | grep -c '[u]jail.*-n dnsmasq'")
+	if err != nil {
+		return
+	}
+	n, convErr := strconv.Atoi(strings.TrimSpace(out))
+	if convErr != nil || n <= 0 {
+		return
+	}
+	dnsLogPath = jailedDNSLogPath
+	logf("检测到 dnsmasq 运行在 ujail 沙箱（私有 /tmp），DNS 日志改用 %s", dnsLogPath)
+}
 
 // dnsRecord 一条 DNS 日志记录。
 type dnsRecord struct {
