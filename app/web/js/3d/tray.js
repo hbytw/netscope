@@ -150,12 +150,6 @@ function formatRate(bps) {
   return v.toFixed(0) + ' B/s';
 }
 
-function truncateChars(str, max) {
-  const arr = Array.from(String(str == null ? '' : str));
-  if (arr.length <= max) return arr.join('');
-  return arr.slice(0, max).join('') + '…';
-}
-
 /**
  * 速率 → 视觉柱高（对数刻度）。
  * 线性映射会让「几百 KB/s」和「几 MB/s」的柱子差几十倍、低流量设备全贴地；
@@ -287,7 +281,6 @@ function mulberry32(seed) {
 
 const LABEL_CANVAS_W = 512;
 const LABEL_CANVAS_H = 160;
-const LABEL_NAME_FONT = '700 40px -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif';
 const LABEL_RATE_FONT = '500 26px -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif';
 
 /**
@@ -332,10 +325,27 @@ function drawLabelTexture(key) {
   ctx.strokeStyle = 'rgba(34,211,238,.34)';
   ctx.stroke();
 
-  // 名称
-  ctx.font = LABEL_NAME_FONT;
+  // 名称：自适应字号，保证完整显示（IP 若被截断，192.168.99.x 会全变成一样的
+  // "192.168.99…"；超长主机名也尽量整名展示，实在放不下才加省略号）
+  const maxNameW = LABEL_CANVAS_W - pad * 2 - 14;
+  let nameSize = 40;
+  ctx.font = `700 ${nameSize}px -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif`;
+  const nameW = ctx.measureText(name).width;
+  if (nameW > maxNameW) {
+    // 下限 26px：再小在 3D 里就看不清了；此时走下面的省略号兜底
+    nameSize = Math.max(26, Math.floor((40 * maxNameW) / nameW));
+    ctx.font = `700 ${nameSize}px -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif`;
+  }
   ctx.fillStyle = '#f2f8ff';
-  ctx.fillText(name, LABEL_CANVAS_W / 2, 54);
+  let shownName = name;
+  if (ctx.measureText(shownName).width > maxNameW) {
+    // 极端超长（罕见）：逐字回退到能放下，再加省略号
+    while (shownName.length > 1 && ctx.measureText(shownName + '…').width > maxNameW) {
+      shownName = shownName.slice(0, -1);
+    }
+    shownName += '…';
+  }
+  ctx.fillText(shownName, LABEL_CANVAS_W / 2, 54);
 
   // 速率：下行青色 + 上行紫色
   ctx.font = LABEL_RATE_FONT;
@@ -2672,7 +2682,7 @@ export function createTrayScene(container, options = {}) {
     for (const rec of topoNodes.values()) {
       if (!force && nowMs - rec.lastLabelAt < 900) continue;
       const key =
-        truncateChars(rec.name, 10) +
+        rec.name +
         '\n' +
         formatRate(rec.rxBps) +
         '\n' +
@@ -2895,7 +2905,7 @@ export function createTrayScene(container, options = {}) {
       if (!need) continue;
       const downText = formatRate(dev.cur.down);
       const upText = formatRate(dev.cur.up);
-      const key = truncateChars(dev.name, 10) + '\n' + downText + '\n' + upText;
+      const key = dev.name + '\n' + downText + '\n' + upText;
       if (key === dev.labelKey) {
         dev.lastLabelAt = nowMs;
         continue;
