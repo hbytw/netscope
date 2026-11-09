@@ -449,7 +449,7 @@ PROG="guanlan"
 APP_BIN="/usr/sbin/guanlan"
 # 运行期临时目录固定 tmpfs，重启即失，不占存储
 APP_RUNDIR="/tmp/guanlan"
-DNS_LOG_DIR="/tmp/guanlan"
+DNS_LOG_DIR="/var/run/dnsmasq"
 
 start_service() {
     # 数据根目录每次启动现场解析（procd 拉起时环境是干净的）：

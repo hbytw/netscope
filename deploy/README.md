@@ -125,7 +125,7 @@ start_stop_daemon -x /usr/sbin/guanlan -m -b -p /var/run/guanlan.pid -- \
 
 ```sh
 uci set dhcp.@dnsmasq[0].logqueries='1'
-uci set dhcp.@dnsmasq[0].logfacility='/tmp/guanlan/dnsmasq.log'
+uci set dhcp.@dnsmasq[0].logfacility='/var/run/dnsmasq/guanlan-dns.log'
 uci commit dhcp
 /etc/init.d/dnsmasq stop; sleep 1; /etc/init.d/dnsmasq start
 ```

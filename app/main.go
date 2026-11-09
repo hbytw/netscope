@@ -1463,9 +1463,8 @@ func (a *App) Run() error {
 		}
 	}
 
-	// 先确定 DNS 日志路径：dnsmasq 若跑在 ujail 沙箱里，默认 /tmp/guanlan 在 jail 内不可见，
-	// 必须改用 jail 里 rw 挂载的 /var/run/dnsmasq（见 resolveDNSLogPath）。
-	a.resolveDNSLogPath()
+	// DNS 旁挂的日志路径固定为 /var/run/dnsmasq/（dnsmasq init 启动前会创建该目录），
+	// 不再需要按 ujail 环境检测切换。
 	if a.cfg.Demo && a.demo != nil {
 		a.demo.Init()
 		logf("演示模式：已生成合成设备/策略/域名/历史流量/事件")
@@ -1579,7 +1578,7 @@ func (a *App) Run() error {
 	return nil
 }
 
-// startupDNS 真机启动：确保日志目录、检查旁挂配置（只读，不做任何写操作）。
+// startupDNS 真机启动：确保日志目录、检查旁挂配置，必要时自愈（dnsmasq 未运行则拉起）。
 func (a *App) startupDNS() {
 	settings := a.store.Settings()
 	if !settings.Enabled || !settings.DNSTap {
@@ -1590,18 +1589,24 @@ func (a *App) startupDNS() {
 		logf("创建 DNS 日志目录失败: %v", err)
 	}
 	if a.DNSTapEnabled() {
-		logf("DNS 旁挂已配置：%s", dnsLogPath)
-		return
-	}
-	if os.Getenv("GUANLAN_DNS_TAP_AUTO") == "1" {
-		logf("检测到 DNS 旁挂未配置，按 GUANLAN_DNS_TAP_AUTO=1 自动启用")
-		if err := a.ApplyDNSTap(true); err != nil {
-			logf("自动启用 DNS 旁挂失败: %v", err)
+		// 配置在位但 dnsmasq 没起来（例如上次开机时 dnsmasq 早于本服务启动）→ 拉起
+		if !a.dnsmasqRunning() {
+			logf("DNS 旁挂已配置但 dnsmasq 未运行，正在拉起")
+			if err := a.restartDNSMasq(); err != nil {
+				logf("拉起 dnsmasq 失败: %v", err)
+			}
+		} else {
+			logf("DNS 旁挂已配置：%s", dnsLogPath)
 		}
 		return
 	}
-	logf("提示：DNS 旁挂尚未配置。请在设置页开启 dnsTap（会短暂重启 dnsmasq），" +
-		"或设置环境变量 GUANLAN_DNS_TAP_AUTO=1 允许启动时自动启用")
+	// 设置里 dnsTap=on 但实际未生效（升级换了日志路径 / 有人手工改过 conf /
+	// 上次开机应用失败）→ 自动重新应用，保证「界面状态 == 实际状态」。
+	// ApplyDNSTap 内含健康检查与失败自动回滚，最坏情况只是继续维持原状。
+	logf("设置中 DNS 旁挂为开启但实际未生效，自动重新应用")
+	if err := a.ApplyDNSTap(true); err != nil {
+		logf("自动应用 DNS 旁挂失败（保持原状，仅域名归因受影响）: %v", err)
+	}
 }
 
 // checkSingleInstance 单实例锁（/tmp/guanlan.pid，仅 Linux 真机）。

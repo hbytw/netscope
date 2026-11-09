@@ -45,7 +45,7 @@ DATA_RECORD="${CONF_DIR}/datadir"   # install.sh 写入的数据目录记录
 
 # --- DNS 旁挂（与后端 ApplyDNSTap 一致：改写 /etc/dnsmasq.conf 的 log-facility） ---
 DNS_CONF="/etc/dnsmasq.conf"
-# 原值备份：install.sh 写在持久目录（跨重启保留），后端运行时另存 /tmp/guanlan/logfacility.orig
+# 原值备份：install.sh 写在持久目录（跨重启保留），后端运行时另存 <dataDir>/logfacility.orig
 LOGFAC_ORIG_FILE=""
 LOGFAC_ORIG_TMP="/tmp/${APP_NAME}/logfacility.orig"
 UCI_SECTION="dhcp.@dnsmasq[0]"
@@ -359,8 +359,8 @@ fi
 #
 #   后端开启旁挂时做的是：
 #     uci set dhcp.@dnsmasq[0].logqueries='1' → uci commit dhcp
-#     把 /etc/dnsmasq.conf 的 log-facility 行改成 /tmp/guanlan/dnsmasq.log
-#     （原值备份在 /tmp/guanlan/logfacility.orig）→ stop + start dnsmasq
+#     把 /etc/dnsmasq.conf 的 log-facility 行改成 /var/run/dnsmasq/guanlan-dns.log
+#     （原值备份在 <dataDir>/logfacility.orig）→ stop + start dnsmasq
 #   关闭旁挂时：uci delete logqueries + 把 log-facility 行写回原值 + stop + start。
 #
 #   所以卸载脚本必须还原的是「/etc/dnsmasq.conf 的 log-facility 行」，
@@ -370,7 +370,7 @@ fi
 #
 #   原值来源（优先级从高到低）：
 #     1) $DATA_DIR/logfacility.orig —— install.sh 写入的持久备份
-#     2) /tmp/guanlan/logfacility.orig —— 后端运行时备份（tmpfs，重启即失）
+#     2) <dataDir>/logfacility.orig —— 后端运行时备份（tmpfs，重启即失）
 #     3) /dev/null —— dnsmasq 默认值
 #
 #   只有确实改动过 dnsmasq 配置（log-facility 被改过 / logqueries 仍存在）时才重启 dnsmasq。

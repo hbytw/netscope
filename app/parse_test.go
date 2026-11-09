@@ -589,7 +589,7 @@ func TestDNSTapEnableDryRun(t *testing.T) {
 	cmds := strings.Join(a.recordedCommands(), "\n")
 	for _, want := range []string{
 		"uci set dhcp.@dnsmasq[0].logqueries='1'",
-		"log-facility=/tmp/guanlan/dnsmasq.log",
+		"log-facility=/var/run/dnsmasq/guanlan-dns.log",
 		"/etc/init.d/dnsmasq stop",
 		"/etc/init.d/dnsmasq start",
 	} {

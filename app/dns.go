@@ -2,10 +2,11 @@ package main
 
 // DNS 行为采集（上网行为维度的唯一来源）与域名归因。
 //
-// 数据源：dnsmasq 查询日志 /tmp/guanlan/dnsmasq.log（tmpfs，重启失效）。
+// 数据源：dnsmasq 查询日志 /var/run/dnsmasq/guanlan-dns.log（tmpfs，重启失效；
+// 该目录由 dnsmasq init 在启动前创建，保证开机时日志可写）。
 // 启用方式（实测该固件的正规途径，已由 lead 验证）：
 //   uci set dhcp.@dnsmasq[0].logqueries='1'
-//   uci set dhcp.@dnsmasq[0].logfacility='/tmp/guanlan/dnsmasq.log'
+//   sed -i 's#log-facility=.*#log-facility=/var/run/dnsmasq/guanlan-dns.log#' /etc/dnsmasq.conf
 //   uci commit dhcp
 //   /etc/init.d/dnsmasq stop → sleep 1 → start → 健康检查
 // 禁用：uci delete 两项 + commit + 同样 stop/start。
@@ -27,6 +28,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
@@ -36,57 +38,55 @@ import (
 )
 
 const (
-	// 默认 DNS 查询日志路径（tmpfs，重启即失）。
-	dnsLogPathDefault = "/tmp/guanlan/dnsmasq.log"
-	// jailedDNSLogPath：dnsmasq 被 ujail 沙箱隔离时使用（jail 内私有 /tmp，
-	// 看不到 /tmp/guanlan；/var/run/dnsmasq 在 jail 里仍是 rw 挂载，两端同一路径）。
-	jailedDNSLogPath = "/var/run/dnsmasq/guanlan-dns.log"
-	dnsLogDir        = "/tmp/guanlan"
-	dnsLogMaxBytes   = 32 * 1024 * 1024
-	ipMapTTL         = int64(30 * 60)     // ip→domain 反查 TTL
-	longIPTTL        = int64(6 * 60 * 60) // 长 TTL 反查索引（连接域名回退用）
-	domainStatTTL    = int64(6 * 60 * 60)
-	ipMapCap         = 20000
-	domainIPCap      = 5000
-	domainStatCap    = 5000
-	txtTrackCap      = 2000
-	devRecentTTL     = int64(10 * 60) // 设备最近查询域名的回退有效期（10min）
-	devRecentCap     = 512            // 设备数量上限（超出按最旧淘汰）
+	// DNS 查询日志路径。刻意放在 /var/run/dnsmasq/ 而不是 /tmp/guanlan/：
+	// dnsmasq 的 init 脚本在启动 dnsmasq 之前就会 `mkdir -p /var/run/dnsmasq/`
+	// 并 chown 给 dnsmasq 用户，因此**开机时该目录必然存在且可写**；
+	// 而 /tmp/guanlan 由观澜自己创建（init S99），晚于 dnsmasq（S19），
+	// 一旦重启、tmpfs 清空，dnsmasq 就会因 "cannot open log ... No such file or
+	// directory" 直接 FAILED to start up → DNS 中断（v1.8.2 及以前真实踩过）。
+	// 该目录同时是 ujail 沙箱的 rw 挂载点，dnsmasq 被 sandbox 的固件也能用。
+	dnsLogPath     = "/var/run/dnsmasq/guanlan-dns.log"
+	dnsLogDir      = "/var/run/dnsmasq"
+	dnsLogMaxBytes = 32 * 1024 * 1024
+	ipMapTTL       = int64(30 * 60)     // ip→domain 反查 TTL
+	longIPTTL      = int64(6 * 60 * 60) // 长 TTL 反查索引（连接域名回退用）
+	domainStatTTL  = int64(6 * 60 * 60)
+	ipMapCap       = 20000
+	domainIPCap    = 5000
+	domainStatCap  = 5000
+	txtTrackCap    = 2000
+	devRecentTTL   = int64(10 * 60) // 设备最近查询域名的回退有效期（10min）
+	devRecentCap   = 512            // 设备数量上限（超出按最旧淘汰）
 
 	// dnsmasq 主配置。该固件在 /etc/dnsmasq.conf 硬编码 log-facility=/dev/null，
 	// 与 UCI dhcp.@dnsmasq[0].logfacility 生成的第二个 log-facility 重复，
 	// 导致 dnsmasq 报 "illegal repeated keyword" 启动失败。
 	// 因此本项目不改 UCI logfacility，而是精确替换 /etc/dnsmasq.conf 的
-	// log-facility 行（备份原值到 /tmp/guanlan/logfacility.orig），关闭时还原。
+	// log-facility 行（原值备份到数据目录，见 dnsConfBackupPath），关闭时还原。
 	dnsmasqConfPath = "/etc/dnsmasq.conf"
-	dnsConfBackup   = dnsLogDir + "/logfacility.orig"
+	legacyDnsConfBk = "/tmp/guanlan/logfacility.orig" // 旧版（tmpfs）备份位置，仅用于迁移
+
 )
 
-// dnsLogPath 当前使用的 DNS 日志路径。默认 /tmp/guanlan/dnsmasq.log；
-// 启动时若检测到 dnsmasq 跑在 ujail 里，会切到 jailedDNSLogPath（见 resolveDNSLogPath）。
-var dnsLogPath = dnsLogPathDefault
-
-// resolveDNSLogPath 按运行环境确定 DNS 日志路径（启动时调用一次）。
+// dnsConfBackupPath log-facility 原值的备份文件路径。
 //
-// 背景：部分固件把 dnsmasq 放进 ujail 沙箱（`ujail -n dnsmasq ...`），jail 内 /tmp
-// 是私有 tmpfs（只挂载 dhcp.leases / dnsmasq.d 等白名单条目），宿主机的
-// /tmp/guanlan 在 jail 内不可见 —— dnsmasq 打不开日志文件会直接起不来，
-// 旁挂健康检查失败后整体回滚。这类环境改用 /var/run/dnsmasq/：
-// init 脚本本来就 `procd_add_jail_mount_rw /var/run/dnsmasq/`，两端同路径可写。
-func (a *App) resolveDNSLogPath() {
-	if a.cfg.Demo || a.cfg.DryRun {
-		return
+// 必须放在持久目录：旧版放 /tmp/guanlan（tmpfs），重启后备份丢失，
+// 关闭旁挂/卸载时就无法准确还原原值（v1.8.2 及以前真实踩过）。
+// 数据目录由 install.sh 确定（/mnt/.../guanlan/data），跨重启保留。
+func (a *App) dnsConfBackupPath() string {
+	if a.cfg.DataDir != "" {
+		return filepath.Join(a.cfg.DataDir, "logfacility.orig")
 	}
-	out, err := a.shellQuietOutput("ps w 2>/dev/null | grep -c '[u]jail.*-n dnsmasq'")
+	return legacyDnsConfBk
+}
+
+// dnsmasqRunning 判断 dnsmasq 是否在运行（只读）。
+func (a *App) dnsmasqRunning() bool {
+	out, err := a.shellQuietOutput("pidof dnsmasq 2>/dev/null | wc -w")
 	if err != nil {
-		return
+		return true // 查询失败时不做判断，避免误重启
 	}
-	n, convErr := strconv.Atoi(strings.TrimSpace(out))
-	if convErr != nil || n <= 0 {
-		return
-	}
-	dnsLogPath = jailedDNSLogPath
-	logf("检测到 dnsmasq 运行在 ujail 沙箱（私有 /tmp），DNS 日志改用 %s", dnsLogPath)
+	return strings.TrimSpace(out) != "0"
 }
 
 // dnsRecord 一条 DNS 日志记录。
@@ -1435,11 +1435,17 @@ func (a *App) ensureDnsmasqConfLogQueries() {
 // 若该行存在则 sed 替换；不存在则追加一行（通常不会走到，conf 恒有该行）。
 // 首次替换前把原值备份到 dnsConfBackup（供关闭时还原）。
 func (a *App) dnsConfSetLogFacility(newVal string) error {
+	bak := a.dnsConfBackupPath()
+	// 旧版把备份放在 /tmp/guanlan（tmpfs）；若持久备份还没生成但旧备份在，迁移过来
+	if bak != legacyDnsConfBk {
+		a.shellQuiet("test -s " + bak + " 2>/dev/null || { test -s " + legacyDnsConfBk +
+			" 2>/dev/null && cp -f " + legacyDnsConfBk + " " + bak + "; }")
+	}
 	// 备份原值（仅首次；备份文件存在且非空即视为已备份 —— 备份内容为纯值）
-	if _, err := a.shellQuietOutput("test -s " + dnsConfBackup + " 2>/dev/null"); err != nil {
+	if _, err := a.shellQuietOutput("test -s " + bak + " 2>/dev/null"); err != nil {
 		cur, ok := a.dnsConfLogFacility()
 		if ok && cur != newVal {
-			a.shellQuiet("printf '%s\\n' '" + cur + "' > " + dnsConfBackup)
+			a.shellQuiet("printf '%s\\n' '" + cur + "' > " + bak)
 		}
 	}
 	// 替换 log-facility=<任意> 为 log-facility=<newVal>（容忍行首/等号周围空白；# 作分隔避免路径斜杠问题）
@@ -1463,8 +1469,13 @@ func (a *App) dnsConfSetLogFacility(newVal string) error {
 // dnsConfRestoreLogFacility 还原 log-facility 为备份值（无备份则 /dev/null），并清掉备份文件。
 // 返回 error 以便调用方在关闭开关时能感知还原失败（避免"已关闭但仍写日志"的静默漂移）。
 func (a *App) dnsConfRestoreLogFacility() error {
+	bak := a.dnsConfBackupPath()
 	orig := "/dev/null"
-	if out, err := a.shellQuietOutput("cat " + dnsConfBackup + " 2>/dev/null"); err == nil {
+	if out, err := a.shellQuietOutput("cat " + bak + " 2>/dev/null"); err == nil {
+		if v := strings.TrimSpace(out); v != "" {
+			orig = v
+		}
+	} else if out, lerr := a.shellQuietOutput("cat " + legacyDnsConfBk + " 2>/dev/null"); lerr == nil {
 		if v := strings.TrimSpace(out); v != "" {
 			orig = v
 		}
@@ -1473,7 +1484,6 @@ func (a *App) dnsConfRestoreLogFacility() error {
 		return fmt.Errorf("还原 %s 的 log-facility 失败: %w", dnsmasqConfPath, err)
 	}
 	a.shellQuiet("grep -q '^[[:space:]]*log-facility[[:space:]]*=' " + dnsmasqConfPath + " || echo 'log-facility=" + orig + "' >> " + dnsmasqConfPath)
-	a.shellQuiet("rm -f " + dnsConfBackup)
 	return nil
 }
 
@@ -1507,6 +1517,9 @@ func (a *App) ApplyDNSTap(enabled bool) error {
 		if err := os.MkdirAll(dnsLogDir, 0o755); err != nil {
 			return fmt.Errorf("创建 DNS 日志目录失败: %w", err)
 		}
+		// dnsmasq 以 dnsmasq 用户运行；本目录正常由 dnsmasq init 创建并 chown，
+		// 这里再做一次兜底（我们可能先于 dnsmasq 创建它）。
+		a.shellQuiet("chown dnsmasq:dnsmasq " + dnsLogDir + " 2>/dev/null || chmod 0777 " + dnsLogDir + " 2>/dev/null")
 	}
 	if enabled {
 		a.shellQuiet("uci set dhcp.@dnsmasq[0].logqueries='1'")

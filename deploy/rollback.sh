@@ -427,8 +427,8 @@ fi
 #
 #    后端开启旁挂时做的是：
 #      uci set dhcp.@dnsmasq[0].logqueries='1' + uci commit dhcp
-#      把 /etc/dnsmasq.conf 的 log-facility 行改成 /tmp/guanlan/dnsmasq.log
-#      （原值备份在 /tmp/guanlan/logfacility.orig）→ stop + start dnsmasq
+#      把 /etc/dnsmasq.conf 的 log-facility 行改成 /var/run/dnsmasq/guanlan-dns.log
+#      （原值备份在 <dataDir>/logfacility.orig）→ stop + start dnsmasq
 #    关闭旁挂时：uci delete logqueries + 把 log-facility 行写回原值 + stop + start。
 #
 #    所以要还原的是「/etc/dnsmasq.conf 的 log-facility 行」，
@@ -437,7 +437,7 @@ fi
 #    keyword 启动失败）。
 #
 #    原值来源：$DATA/logfacility.orig（install.sh 持久备份）
-#              → /tmp/guanlan/logfacility.orig（后端运行时备份）
+#              → <dataDir>/logfacility.orig（后端运行时备份）
 #              → /dev/null（dnsmasq 默认值）
 # ---------------------------------------------------------------------------
 say "还原 DNS 旁挂…"

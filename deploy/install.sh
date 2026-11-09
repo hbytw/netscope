@@ -17,8 +17,8 @@
 #
 # DNS 旁挂机制（与后端 app/dns.go ApplyDNSTap 完全一致）：
 #   开启：uci set dhcp.@dnsmasq[0].logqueries=1 → uci commit dhcp
-#         把 /etc/dnsmasq.conf 的 log-facility 行改成 /tmp/guanlan/dnsmasq.log
-#         （原值备份到 /tmp/guanlan/logfacility.orig）→ stop + start dnsmasq
+#         把 /etc/dnsmasq.conf 的 log-facility 行改成 /var/run/dnsmasq/guanlan-dns.log
+#         （原值备份到 $DATA_DIR/logfacility.orig（持久））→ stop + start dnsmasq
 #   关闭：uci delete logqueries + 把 log-facility 行写回原值 → stop + start dnsmasq
 #   该固件 ubus call dnsmasq reload 不存在；/etc/init.d/dnsmasq reload 有 bug
 #   （停得掉起不来 → 全网 DNS 中断），故只用 stop + start。
@@ -58,8 +58,8 @@ DATA_PATH=""
 LOG_DIR=""
 
 # --- DNS 旁挂（与后端 ApplyDNSTap 一致：改写 /etc/dnsmasq.conf 的 log-facility） ---
-DNS_LOG_DIR="/tmp/${APP_NAME}"
-DNS_LOG="${DNS_LOG_DIR}/dnsmasq.log"
+DNS_LOG_DIR="/var/run/dnsmasq"
+DNS_LOG="${DNS_LOG_DIR}/guanlan-dns.log"
 DNS_CONF="/etc/dnsmasq.conf"
 # log-facility 原值的持久备份（卸载/回退时按它还原；/tmp 是 tmpfs，重启即失）
 LOGFAC_ORIG_FILE=""
@@ -533,8 +533,8 @@ fi
 # 2.5 备份 /etc/dnsmasq.conf 的 log-facility 原值（供卸载/回退还原）
 #
 #   后端开启 DNS 旁挂时改写的就是这一行，原值必须留底，否则还原不回来。
-#   /tmp/guanlan/logfacility.orig 是 tmpfs（重启即失），所以这里另存一份到
-#   持久分区 $DATA_DIR/logfacility.orig。
+#   备份放持久分区 $DATA_DIR/logfacility.orig（v1.8.3 起后端也直接写这里，
+#   不再写 /tmp（tmpfs，重启即失））。
 #
 #   只在「还没有备份」且「当前值不是旁挂路径」时写备份：
 #   重装时若 /etc/dnsmasq.conf 已被旁挂改写，绝不能把旁挂路径当成原值。
@@ -825,8 +825,8 @@ run_sh "mv -f $INIT_TMP $INIT_SCRIPT" || die "写入 init 脚本失败"
 #
 #   用户在设置页打开 dnsTap 后，后端才会：
 #     uci set dhcp.@dnsmasq[0].logqueries='1' → uci commit dhcp
-#     把 /etc/dnsmasq.conf 的 log-facility 行改成 /tmp/guanlan/dnsmasq.log
-#     （原值备份到 /tmp/guanlan/logfacility.orig）→ stop + start dnsmasq
+#     把 /etc/dnsmasq.conf 的 log-facility 行改成 /var/run/dnsmasq/guanlan-dns.log
+#     （原值备份到 $DATA_DIR/logfacility.orig（持久））→ stop + start dnsmasq
 #
 #   * 不在 /tmp/dnsmasq.d/ 新增 conf-dir 文件
 #     （conf-dir 里若再写 log-facility → dnsmasq 启动失败 illegal repeated keyword）
