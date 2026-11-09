@@ -546,8 +546,10 @@ elif [ -s "$LOGFAC_ORIG_FILE" ]; then
 else
   CUR_LOGFAC=$(current_logfacility)
   case "$CUR_LOGFAC" in
-    "$DNS_LOG")
-      log "检测到 $DNS_CONF 已被旁挂改写（$DNS_LOG），跳过备份以免覆盖原值"
+    "$DNS_LOG"|"/tmp/guanlan/dnsmasq.log")
+      # 后者是 v1.8.2 及以前的旁挂路径：同样是"我们写过"的值，不能当原值备份
+      # （否则卸载/回退会还原成这个重启即失的路径，dnsmasq 下次开机起不来）
+      log "检测到 $DNS_CONF 已被旁挂改写（$CUR_LOGFAC），跳过备份以免覆盖原值"
       ;;
     ""|*[!A-Za-z0-9_./-]*)
       # 没有该行或取值异常：dnsmasq 默认走 /dev/null

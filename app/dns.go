@@ -65,7 +65,8 @@ const (
 	// log-facility 行（原值备份到数据目录，见 dnsConfBackupPath），关闭时还原。
 	dnsmasqConfPath = "/etc/dnsmasq.conf"
 	legacyDnsConfBk = "/tmp/guanlan/logfacility.orig" // 旧版（tmpfs）备份位置，仅用于迁移
-
+	// legacyDnsLogPath 旧版 DNS 旁挂日志路径（v1.8.2 及以前），仅用于识别/迁移。
+	legacyDnsLogPath = "/tmp/guanlan/dnsmasq.log"
 )
 
 // dnsConfBackupPath log-facility 原值的备份文件路径。
@@ -1444,8 +1445,20 @@ func (a *App) dnsConfSetLogFacility(newVal string) error {
 	// 备份原值（仅首次；备份文件存在且非空即视为已备份 —— 备份内容为纯值）
 	if _, err := a.shellQuietOutput("test -s " + bak + " 2>/dev/null"); err != nil {
 		cur, ok := a.dnsConfLogFacility()
-		if ok && cur != newVal {
+		// 当前值若是本项目自己的路径（新路径或旧版 /tmp/guanlan 路径），说明
+		// 那是我们写进去的、不是固件原值 —— 不能把它记成"原值"（v1.8.3 升级时
+		// 真实踩过：备份被写成 /tmp/guanlan/dnsmasq.log，卸载后会还原成这个
+		// 重启即失的路径，dnsmasq 下次开机又起不来）。这类固件出厂即
+		// log-facility=/dev/null，记为 /dev/null 是安全值。
+		if ok && cur != newVal && cur != dnsLogPath && cur != legacyDnsLogPath {
 			a.shellQuiet("printf '%s\\n' '" + cur + "' > " + bak)
+		} else if ok && (cur == dnsLogPath || cur == legacyDnsLogPath) {
+			a.shellQuiet("printf '%s\\n' '/dev/null' > " + bak)
+		}
+	} else if out, rerr := a.shellQuietOutput("cat " + bak + " 2>/dev/null"); rerr == nil {
+		// 备份文件已存在但内容是我们自己的历史路径 → 修正为 /dev/null
+		if v := strings.TrimSpace(out); v == dnsLogPath || v == legacyDnsLogPath {
+			a.shellQuiet("printf '%s\\n' '/dev/null' > " + bak)
 		}
 	}
 	// 替换 log-facility=<任意> 为 log-facility=<newVal>（容忍行首/等号周围空白；# 作分隔避免路径斜杠问题）
